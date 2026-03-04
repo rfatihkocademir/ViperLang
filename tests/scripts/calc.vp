@@ -1,0 +1,9 @@
+// calc.vp - ViperLang Open Source MVP Test
+// Calculating VAT correctly using strict ViperLang syntax
+
+v price:i = 1500
+v vat = 300
+v total = price + vat
+
+// Terminal should output 1800
+total

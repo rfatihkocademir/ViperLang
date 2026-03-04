@@ -1,0 +1,26 @@
+// fn_test.vp — ViperLang Phase 5: Real Function Calls!
+// LLM-native modular code test
+
+fn add(x, y) {
+    ret x + y
+}
+
+fn multiply(num1, num2) {
+    ret num1 * num2
+}
+
+fn greet(factor) {
+    v result = multiply(factor, 10)
+    pr("Result: ")
+    pr(result)
+    ret result
+}
+
+// Top-level orchestration
+v sum = add(15, 25)
+pr(sum)
+
+v product = multiply(6, 7)
+pr(product)
+
+greet(5)

@@ -1,0 +1,12 @@
+// loop_test.vp - Testing while loops and pr() built-in print
+
+v counter = 0
+v limit = 5
+
+m counter < limit {
+    pr(counter)
+    counter = counter + 1
+}
+
+pr("Loop complete!")
+pr(counter)

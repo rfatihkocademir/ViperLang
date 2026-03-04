@@ -1,0 +1,6 @@
+use "lib.vp"
+
+v x_val = 6
+v y_val = 7
+v res = multiply(x_val, y_val)
+pr("Module test result: ", res)

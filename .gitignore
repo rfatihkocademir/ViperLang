@@ -1,0 +1,17 @@
+# Binaries
+viper
+*.o
+
+# Documentation artifacts
+docs/*.bak
+docs/*.tmp
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db

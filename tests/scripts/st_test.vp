@@ -1,0 +1,8 @@
+st Vec2 { x y }
+
+v myVec = Vec2()
+myVec.x = 10.5
+myVec.y = 20.25
+
+v res = myVec.x + myVec.y
+pr("Result is: ", res)

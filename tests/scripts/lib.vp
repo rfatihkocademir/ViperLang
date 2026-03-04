@@ -1,0 +1,3 @@
+fn multiply(num1, num2) {
+    ret num1 * num2
+}

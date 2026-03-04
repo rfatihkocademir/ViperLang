@@ -1,0 +1,19 @@
+// flow_test.vp - Control Flow and Scoping MVP Test
+
+v num1 = 10
+v num2 = 20
+
+// Test reassignment
+num1 = 50
+
+i num1 < num2 {
+    v message = "A is smaller than B"
+    message
+} e {
+    v message = "A is GREATER than B"
+    message
+}
+
+v result = 100
+// c should be securely evaluated
+result
