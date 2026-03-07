@@ -1,0 +1,122 @@
+// ViperLang Standard Math Library (@std/math)
+// Built using True Dynamic FFI bindings to libm.
+
+pub fn pi() {
+    v ext = load_dl("lib/std/math.so")
+    v _pi = ext.get_fn("math_pi", "->d")
+    ret _pi()
+}
+
+pub fn euler() {
+    v ext = load_dl("lib/std/math.so")
+    v _e = ext.get_fn("math_e", "->d")
+    ret _e()
+}
+
+pub fn sin(x) {
+    v ext = load_dl("lib/std/math.so")
+    v _fn = ext.get_fn("math_sin", "d->d")
+    ret _fn(x)
+}
+
+pub fn cos(x) {
+    v ext = load_dl("lib/std/math.so")
+    v _fn = ext.get_fn("math_cos", "d->d")
+    ret _fn(x)
+}
+
+pub fn tan(x) {
+    v ext = load_dl("lib/std/math.so")
+    v _fn = ext.get_fn("math_tan", "d->d")
+    ret _fn(x)
+}
+
+pub fn asin(x) {
+    v ext = load_dl("lib/std/math.so")
+    v _fn = ext.get_fn("math_asin", "d->d")
+    ret _fn(x)
+}
+
+pub fn acos(x) {
+    v ext = load_dl("lib/std/math.so")
+    v _fn = ext.get_fn("math_acos", "d->d")
+    ret _fn(x)
+}
+
+pub fn atan(x) {
+    v ext = load_dl("lib/std/math.so")
+    v _fn = ext.get_fn("math_atan", "d->d")
+    ret _fn(x)
+}
+
+pub fn atan2(y, x) {
+    v ext = load_dl("lib/std/math.so")
+    v _fn = ext.get_fn("math_atan2", "d,d->d")
+    ret _fn(y, x)
+}
+
+pub fn sinh(x) {
+    v ext = load_dl("lib/std/math.so")
+    v _fn = ext.get_fn("math_sinh", "d->d")
+    ret _fn(x)
+}
+
+pub fn cosh(x) {
+    v ext = load_dl("lib/std/math.so")
+    v _fn = ext.get_fn("math_cosh", "d->d")
+    ret _fn(x)
+}
+
+pub fn tanh(x) {
+    v ext = load_dl("lib/std/math.so")
+    v _fn = ext.get_fn("math_tanh", "d->d")
+    ret _fn(x)
+}
+
+pub fn exp(x) {
+    v ext = load_dl("lib/std/math.so")
+    v _fn = ext.get_fn("math_exp", "d->d")
+    ret _fn(x)
+}
+
+pub fn log(x) {
+    v ext = load_dl("lib/std/math.so")
+    v _fn = ext.get_fn("math_log", "d->d")
+    ret _fn(x)
+}
+
+pub fn log10(x) {
+    v ext = load_dl("lib/std/math.so")
+    v _fn = ext.get_fn("math_log10", "d->d")
+    ret _fn(x)
+}
+
+pub fn pow(base, exponent) {
+    v ext = load_dl("lib/std/math.so")
+    v _fn = ext.get_fn("math_pow", "d,d->d")
+    ret _fn(base, exponent)
+}
+
+pub fn sqrt(x) {
+    v ext = load_dl("lib/std/math.so")
+    v _fn = ext.get_fn("math_sqrt", "d->d")
+    ret _fn(x)
+}
+
+pub fn ceil(x) {
+    v ext = load_dl("lib/std/math.so")
+    v _fn = ext.get_fn("math_ceil", "d->d")
+    ret _fn(x)
+}
+
+pub fn floor(x) {
+    v ext = load_dl("lib/std/math.so")
+    v _fn = ext.get_fn("math_floor", "d->d")
+    ret _fn(x)
+}
+
+pub fn abs(x) {
+    v ext = load_dl("lib/std/math.so")
+    v _fn = ext.get_fn("math_abs", "d->d")
+    ret _fn(x)
+}
