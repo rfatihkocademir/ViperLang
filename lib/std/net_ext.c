@@ -64,6 +64,24 @@ char* net_recv_string(int client_fd) {
     return recv_buf;
 }
 
+int net_http_respond(int client_fd, const char* html) {
+    // Build a proper HTTP/1.1 200 response with real CRLF line endings.
+    // ViperLang strings don't support escape sequences, so \r\n must be
+    // constructed on the C side.
+    int content_length = (int)strlen(html);
+    char header[512];
+    int header_len = snprintf(header, sizeof(header),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        content_length);
+    send(client_fd, header, header_len, 0);
+    send(client_fd, html, content_length, 0);
+    return 0;
+}
+
 void net_close(int fd) {
     close(fd);
 }

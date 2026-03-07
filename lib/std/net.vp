@@ -39,6 +39,12 @@ pub fn recv_string(socket) {
     ret _recv(socket.fd)
 }
 
+pub fn http_respond(socket, html) {
+    v ext = load_dl("lib/std/net.so")
+    v _respond = ext.get_fn("net_http_respond", "i,s->i")
+    ret _respond(socket.fd, html)
+}
+
 pub fn close(socket) {
     v ext = load_dl("lib/std/net.so")
     v _close = ext.get_fn("net_close", "i->v")
