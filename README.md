@@ -1,4 +1,4 @@
-# 🐍 ViperLang v3: The AI-Native Powerhouse
+# 🐍 ViperLang : The AI-Native Powerhouse
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Status: Phase 6 Complete](https://img.shields.io/badge/Status-Phase_6_Complete-brightgreen.svg)]()
