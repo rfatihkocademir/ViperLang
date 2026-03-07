@@ -237,6 +237,14 @@ static Value native_load_dl(int argCount, Value* args) {
     }
     const char* path = AS_STRING(args[0])->chars;
     void* handle = dlopen(path, RTLD_LAZY);
+
+    // Fallback: if path starts with "lib/std/", try system install path
+    if (!handle && strncmp(path, "lib/std/", 8) == 0) {
+        char sys_path[1024];
+        snprintf(sys_path, sizeof(sys_path), "/usr/local/lib/viper/std/%s", path + 8);
+        handle = dlopen(sys_path, RTLD_LAZY);
+    }
+
     if (!handle) {
         printf("Runtime Error: Failed to load library '%s': %s\n", path, dlerror());
         exit(1);

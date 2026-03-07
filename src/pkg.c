@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "pkg.h"
 #include "bytecode.h"
 #include "compiler.h"
@@ -13,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -1444,6 +1446,21 @@ static void print_pkg_usage(void) {
     printf("  viper pkg abi diff <package> <from_version> <to_version> [--fail-on-breaking]\n");
 }
 
+static bool copy_file_if_exists(const char* src, const char* dst) {
+    FILE* in = fopen(src, "rb");
+    if (!in) return false;
+    FILE* out = fopen(dst, "wb");
+    if (!out) { fclose(in); return false; }
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        fwrite(buf, 1, n, out);
+    }
+    fclose(in);
+    fclose(out);
+    return true;
+}
+
 static int cmd_init(const char* project_name) {
     char cwd[MAX_PATH_LEN];
     if (getcwd(cwd, sizeof(cwd)) == NULL) {
@@ -1499,6 +1516,35 @@ static int cmd_init(const char* project_name) {
     }
 
     printf("vpm: initialized package store at .viper/packages\n");
+
+    // Auto-generate LLM_REFERENCE.md for AI assistants
+    char llm_ref_dst[MAX_PATH_LEN];
+    if (join_path(cwd, "LLM_REFERENCE.md", llm_ref_dst, sizeof(llm_ref_dst)) &&
+        !file_exists(llm_ref_dst)) {
+        bool copied = false;
+        // Try 1: system install path
+        copied = copy_file_if_exists("/usr/local/lib/viper/LLM_REFERENCE.md", llm_ref_dst);
+        // Try 2: relative to CWD
+        if (!copied) copied = copy_file_if_exists("docs/LLM_REFERENCE.md", llm_ref_dst);
+        // Try 3: relative to executable
+        if (!copied) {
+            char exe_path[MAX_PATH_LEN];
+            ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+            if (len > 0) {
+                exe_path[len] = '\0';
+                char exe_dir[MAX_PATH_LEN];
+                path_dirname(exe_path, exe_dir, sizeof(exe_dir));
+                char ref_path[MAX_PATH_LEN];
+                if (join_path(exe_dir, "docs/LLM_REFERENCE.md", ref_path, sizeof(ref_path))) {
+                    copied = copy_file_if_exists(ref_path, llm_ref_dst);
+                }
+            }
+        }
+        if (copied) {
+            printf("vpm: created LLM_REFERENCE.md (AI language guide)\n");
+        }
+    }
+
     return 0;
 }
 

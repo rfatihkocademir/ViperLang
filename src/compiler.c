@@ -296,26 +296,30 @@ static void resolve_package_path(const char* raw_path, char* out, size_t out_siz
     // Special case for standard library.
     // e.g., "@std/io" -> "<project_root>/lib/std/io.vp"
     if (strncmp(raw_path, "@std/", 5) == 0) {
-        char std_path[MAX_PATH_LEN];
-        if (!join_path2(project_root_path, "lib/std", std_path, sizeof(std_path))) {
-            printf("Compiler Error: Package path is too long: %s\n", raw_path);
-            exit(1);
-        }
-        
         const char* subpath = raw_path + 5;
         char filename[MAX_PATH_LEN];
         snprintf(filename, sizeof(filename), "%s.vp", subpath);
-        
-        if (!join_path2(std_path, filename, out, out_size)) {
-            printf("Compiler Error: Package path is too long: %s\n", raw_path);
-            exit(1);
+
+        // Try 1: project_root/lib/std/<module>.vp (for development)
+        char std_path[MAX_PATH_LEN];
+        if (join_path2(project_root_path, "lib/std", std_path, sizeof(std_path)) &&
+            join_path2(std_path, filename, out, out_size) &&
+            module_source_exists(out)) {
+            return;
         }
-        
-        if (!module_source_exists(out)) {
-            printf("Compiler Error: Standard library module not found: %s\n", out);
-            exit(1);
+
+        // Try 2: /usr/local/lib/viper/std/<module>.vp (for installed systems)
+        char sys_path[MAX_PATH_LEN];
+        snprintf(sys_path, sizeof(sys_path), "/usr/local/lib/viper/std/%s", filename);
+        if (module_source_exists(sys_path)) {
+            copy_path(out, out_size, sys_path);
+            return;
         }
-        return;
+
+        printf("Compiler Error: Standard library module not found: %s\n", raw_path);
+        printf("  Searched: %s\n", out);
+        printf("  Searched: %s\n", sys_path);
+        exit(1);
     }
 
     const char* slash = strchr(raw_path, '/');
