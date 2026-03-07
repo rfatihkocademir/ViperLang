@@ -1,0 +1,15 @@
+// ViperLang Standard OS Library (@std/os)
+// Built using True Dynamic FFI bindings.
+
+
+pub fn get_env(name) {
+    v libc = load_dl("libc.so.6")
+    v _getenv = libc.get_fn("getenv", "s->s")
+    ret _getenv(name)
+}
+
+pub fn exec(command) {
+    v libc = load_dl("libc.so.6")
+    v _system = libc.get_fn("system", "s->i")
+    ret _system(command)
+}

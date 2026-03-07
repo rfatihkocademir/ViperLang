@@ -1,4 +1,4 @@
-# 🐍 ViperLang : The AI-Native Powerhouse
+# 🐍 ViperLang v3: The AI-Native Powerhouse
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Status: Phase 6 Complete](https://img.shields.io/badge/Status-Phase_6_Complete-brightgreen.svg)]()
@@ -9,89 +9,93 @@
 
 ---
 
-## 🚀 Why ViperLang?
+## 🚀 Getting Started
 
-### 🤖 AI-Native DNA
-ViperLang eliminates the "Token Tax." By using hyper-compressed keywords (`v`, `fn`, `st`, `m`) and the revolutionary `@contract` system, we provide LLMs with a 10x clearer view of your codebase while using 50% fewer tokens.
+You don't need to be a C-compiler expert to use ViperLang! Just follow these exact steps to install the language on your computer and start writing your first program.
 
-### ⚡ Blazing Fast ViperVM
-A custom register-based virtual machine built in pure C99. With 256 general-purpose registers and a 32-bit instruction word, ViperVM delivers speed that rivals native performance for scripted logic.
+### 1️⃣ Installation
 
-### 💎 Deterministic Memory (Zero-GC)
-No more GC pauses. ViperLang uses a high-performance Reference Counting (RC) system with deterministic cleanup. Your memory is freed the millisecond it's no longer needed.
+Open your terminal and paste these commands. This will download and install the `viper` engine to your system:
 
-### 📐 Mathematical Precision
-Native support for non-standard arithmetic. Use `+~` for wrapping additions and `^+` for saturating math — critical for game engines, cryptography, and low-level systems.
+```bash
+git clone https://github.com/YOUR_USERNAME/ViperLang.git
+cd ViperLang
+./install.sh
+```
+
+That's it! You can now type `viper` anywhere in your terminal.
 
 ---
 
-## ✨ Code at a Glance
+## 📦 Creating Your First Project
 
-### Structs & Field Access
-```viper
-// Define sleek data structures
-st Player { id hp score }
+ViperLang comes with **VPM (Viper Package Manager)** built right in. Let's create your first app:
 
-v hero = Player()
-hero.id = 1
-hero.hp = 100
-hero.score = 50.5
+```bash
+# 1. Create a folder for your project
+mkdir my_first_app
+cd my_first_app
 
-pr("Hero Health: ", hero.hp)
+# 2. Initialize it as a Viper project
+viper pkg init
 ```
 
-### High-Power Math & Logic
-```viper
-v level = 255
-v next  = level ^+ 1  // Saturated: Still 255
-v jump  = level +~ 1  // Wrapped: 0
+### 3️⃣ Writing Code
 
-i score > 90 {
-    pr("Legendary!")
-} ei score > 60 {
-    pr("Warrior.")
-} e {
-    pr("Recruit.")
-}
+Create a file named `main.vp` and drop this code inside:
+
+```viper
+// main.vp
+use "@std/net" as net
+use "@std/io" as io
+
+pr("Welcome to ViperLang! 🐍")
+pr("Let me do some math for you:")
+
+v result = 50 * 2
+pr("50 times 2 is: ", result)
 ```
 
-### Modular Mastery
-```viper
-use "math.vp"
-use "physics.vp"
+### 4️⃣ Running Your Code
 
-v force = calculate_force(mass, acceleration)
-pr("Resultant Force: ", force)
+Run it instantly with:
+```bash
+viper main.vp
 ```
 
 ---
 
-## 🛠️ Getting Started in 30 Seconds
+## 🌐 Community Packages (VPM)
 
-1. **Build the Engine:**
-   ```bash
-   make
-   ```
-2. **Run Your First Script:**
-   ```bash
-   ./viper tests/scripts/st_test.vp
-   ```
+Want to do something complex, like build a Web Server or 3D Game? You don't have to reinvent the wheel. You can download code written by other developers straight from GitHub!
+
+Simply run:
+```bash
+viper pkg add github.com/username/cool-viper-package
+```
+
+VPM will automatically download the package, and you can instantly `use` it in your `.vp` files.
 
 ---
 
-## 🗺️ Roadmap: The Path to Absolute Mastery
+## 📚 Standard Library (`@std`)
 
-- [x] **Phase 1-4**: Core VM, Lexer, Parser, and Register Allocation.
-- [x] **Phase 5**: Full Function Call Stack & `@contract` Engine.
-- [x] **Phase 6**: User-Defined Structs (`st`) & Module System (`use`).
-- [ ] **Phase 7**: Native C-FFI Bridge (Hardware & Graphics).
-- [ ] **Phase 8**: Standard Library (@math, @io, @sys, @net).
-- [ ] **The Horizon**: AOT/JIT Compilation & AI Model Integration.
+ViperLang comes fully equipped with the tools you need right out of the box.
+
+* **`@std/io`**: Read and write files easily.
+* **`@std/os`**: Interact with your operating system, read environment variables, or execute bash commands.
+* **`@std/net`**: Need to build an API? We have a built-in asynchronous HTTP TCP server library ready to go!
+
+---
+
+## 🛠️ VS Code Support
+
+To make coding even better, install our official VS Code extension for syntax highlighting. 
+Inside the `ViperLang` folder you downloaded, you will find a `vscode-viperlang` folder. Install its contents in your editor to get beautiful syntax colors!
 
 ---
 
 ## 🤝 Contributing
-ViperLang is an open-source movement to rethink how languages interact with AI. Whether you are a compiler nerd, a VM wizard, or an AI engineer, we want your hands on the code.
 
-**MIT License** | Built with passion by humans and AI.
----
+Love C99 and Virtual Machines? Want to help make ViperLang even faster?
+Check out our `CONTRIBUTING.md` guide and drop a Pull Request! We are completely open source (MIT License).

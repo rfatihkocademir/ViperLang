@@ -50,6 +50,7 @@ typedef enum {
     OP_LOOP,            // LOOP 0, OFFSET_HIGH, OFFSET_LOW (backward jump)
     
     OP_CALL,            // CALL R_FN, ARG_COUNT, R_DEST
+    OP_CALL_NATIVE,     // CALL_NATIVE R_NATIVE_INDEX, ARG_COUNT, R_DEST
     OP_RETURN,          // RETURN R_VAL
     
     OP_STRUCT,          // STRUCT R_DEST, CONST_INDEX (defines struct)
@@ -86,8 +87,7 @@ void write_chunk(Chunk* chunk, Instruction inst);
 int add_constant(Chunk* chunk, Value value);
 
 // ViperVM Runtime
-#define REGISTER_COUNT 256
-#define FRAMES_MAX     64
+#define REGISTER_WINDOW 256
 
 typedef struct {
     struct sObjFunction* function;
@@ -97,9 +97,11 @@ typedef struct {
 } CallFrame;
 
 typedef struct {
-    CallFrame frames[FRAMES_MAX];
+    CallFrame* frames;
     int frame_count;
-    Value registers[REGISTER_COUNT]; // Shared flat register space
+    int frame_capacity;
+    Value* registers; // Shared flat register space, dynamically grown
+    int register_capacity;
 } VM;
 
 void init_vm(VM* vm);

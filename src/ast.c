@@ -86,11 +86,13 @@ AstNode* ast_new_func_decl(Token name, Token* params, int param_count, AstNode* 
     node->data.func_decl.params = params;
     node->data.func_decl.param_count = param_count;
     node->data.func_decl.body = body;
+    node->data.func_decl.is_public = false;
     return node;
 }
 
-AstNode* ast_new_call_expr(Token name, AstNode** args, int arg_count) {
+AstNode* ast_new_call_expr(AstNode* callee, Token name, AstNode** args, int arg_count) {
     AstNode* node = ast_alloc(AST_CALL_EXPR);
+    node->data.call_expr.callee = callee;
     node->data.call_expr.name = name;
     node->data.call_expr.args = args;
     node->data.call_expr.arg_count = arg_count;
@@ -108,12 +110,14 @@ AstNode* ast_new_struct_decl(Token name, Token* fields, int field_count) {
     node->data.struct_decl.name = name;
     node->data.struct_decl.fields = fields;
     node->data.struct_decl.field_count = field_count;
+    node->data.struct_decl.is_public = false;
     return node;
 }
 
-AstNode* ast_new_use_stmt(Token path) {
+AstNode* ast_new_use_stmt(Token path, Token alias) {
     AstNode* node = ast_alloc(AST_USE_STMT);
     node->data.use_stmt.path = path;
+    node->data.use_stmt.alias = alias;
     return node;
 }
 
@@ -168,14 +172,26 @@ void ast_print(AstNode* node, int depth) {
             ast_print(node->data.var_decl.initializer, depth + 1);
             break;
         case AST_FUNC_DECL:
-            printf("Function '%.*s' (%d params)\n", node->data.func_decl.name.length, node->data.func_decl.name.start, node->data.func_decl.param_count);
+            printf("%sFunction '%.*s' (%d params)\n",
+                   node->data.func_decl.is_public ? "Pub " : "",
+                   node->data.func_decl.name.length, node->data.func_decl.name.start,
+                   node->data.func_decl.param_count);
             ast_print(node->data.func_decl.body, depth + 1);
             break;
         case AST_STRUCT_DECL:
-            printf("Struct '%.*s' (%d fields)\n", node->data.struct_decl.name.length, node->data.struct_decl.name.start, node->data.struct_decl.field_count);
+            printf("%sStruct '%.*s' (%d fields)\n",
+                   node->data.struct_decl.is_public ? "Pub " : "",
+                   node->data.struct_decl.name.length, node->data.struct_decl.name.start,
+                   node->data.struct_decl.field_count);
             break;
         case AST_USE_STMT:
-            printf("Use '%.*s'\n", node->data.use_stmt.path.length, node->data.use_stmt.path.start);
+            if (node->data.use_stmt.alias.length > 0) {
+                printf("Use '%.*s' as '%.*s'\n",
+                       node->data.use_stmt.path.length, node->data.use_stmt.path.start,
+                       node->data.use_stmt.alias.length, node->data.use_stmt.alias.start);
+            } else {
+                printf("Use '%.*s'\n", node->data.use_stmt.path.length, node->data.use_stmt.path.start);
+            }
             break;
         case AST_GET_EXPR:
             printf("Get Field '%.*s'\n", node->data.get_expr.name.length, node->data.get_expr.name.start);

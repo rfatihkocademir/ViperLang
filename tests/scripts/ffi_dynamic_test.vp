@@ -1,0 +1,14 @@
+// ffi_dynamic_test.vp
+// Load the standard C math library (libm.so)
+v libc = load_dl("libc.so.6")
+
+v puts = libc.get_fn("puts", "s->i")
+puts("Hello from Libc via True Dynamic FFI!")
+
+v libm = load_dl("libm.so.6")
+
+// Resolve the 'cos' function: double cos(double)
+v cos = libm.get_fn("cos", "d->d")
+
+v result = cos(0)
+pr("Cos(0) = ", result)

@@ -1,16 +1,26 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -std=c99 -Iinclude -O2
+LDFLAGS = -lffi -ldl
 
 SRCS = $(wildcard src/*.c)
 OBJS = $(SRCS:.c=.o)
 TARGET = viper
+TIMEOUT ?= 10
 
-.PHONY: all clean
+EXT_NET = lib/std/net.so
 
-all: $(TARGET)
+.PHONY: all clean test
+
+all: $(TARGET) $(EXT_NET)
+
+$(EXT_NET): lib/std/net_ext.c
+	$(CC) $(CFLAGS) -shared -fPIC -o $@ $<
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+test: $(TARGET)
+	@./tests/run_tests.sh ./$(TARGET) tests/scripts $(TIMEOUT)
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) $(TARGET) $(EXT_NET)

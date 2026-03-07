@@ -1,17 +1,22 @@
-# Binaries
-viper
+# Build artifacts
 *.o
+*.so
+*.dll
+*.dylib
+*.a
+viper
+docs/
+# Viper artifacts
+*.vbb
+*.vbc
+*.vabi
+.viper/
 
-# Documentation artifacts
-docs/*.bak
-docs/*.tmp
+# Logs and tests
+*.log
+tests/dummy_project/
+viper_test_file.txt
 
-# IDEs
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS files
+# OS generated
 .DS_Store
 Thumbs.db

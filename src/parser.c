@@ -11,6 +11,22 @@ typedef struct {
 
 Parser parser;
 
+static void parser_fatal_oom() {
+    printf("Parser Error: Out of memory.\n");
+    exit(1);
+}
+
+static bool ensure_capacity(void** ptr, int* cap, int needed, size_t elem_size) {
+    if (*cap >= needed) return true;
+    int next = (*cap == 0) ? 8 : *cap;
+    while (next < needed) next *= 2;
+    void* grown = realloc(*ptr, (size_t)next * elem_size);
+    if (!grown) return false;
+    *ptr = grown;
+    *cap = next;
+    return true;
+}
+
 static void advance_parser() {
     parser.previous = parser.current;
     for (;;) {
@@ -52,6 +68,7 @@ static AstNode* block() {
 }
 
 static AstNode* expression();
+static AstNode* binary();
 
 static AstNode* if_statement() {
     AstNode* condition = expression();
@@ -91,20 +108,21 @@ static AstNode* primary() {
     if (match_token(TOKEN_PR)) {
         Token prTok = parser.previous;
         consume(TOKEN_LEFT_PAREN, "Expected '(' after 'pr'.");
-        AstNode* args[32];
+        AstNode** args = NULL;
         int arg_count = 0;
+        int arg_cap = 0;
         if (!check(TOKEN_RIGHT_PAREN)) {
             do {
+                if (!ensure_capacity((void**)&args, &arg_cap, arg_count + 1, sizeof(AstNode*))) {
+                    free(args);
+                    parser_fatal_oom();
+                }
                 args[arg_count++] = expression();
             } while (match_token(TOKEN_COMMA));
         }
         consume(TOKEN_RIGHT_PAREN, "Expected ')' after arguments.");
-        AstNode** heapArgs = NULL;
-        if (arg_count > 0) {
-            heapArgs = malloc(sizeof(AstNode*) * arg_count);
-            for (int i = 0; i < arg_count; i++) heapArgs[i] = args[i];
-        }
-        return ast_new_call_expr(prTok, heapArgs, arg_count);
+        AstNode* callee = ast_new_identifier(prTok);
+        return ast_new_call_expr(callee, prTok, args, arg_count);
     }
 
     if (match_token(TOKEN_IDENTIFIER)) {
@@ -132,21 +150,20 @@ static AstNode* call() {
                 name = (Token){TOKEN_ERROR, "anonymous", 9, parser.current.line};
             }
 
-            AstNode* args[32];
+            AstNode** args = NULL;
             int arg_count = 0;
+            int arg_cap = 0;
             if (!check(TOKEN_RIGHT_PAREN)) {
                 do {
+                    if (!ensure_capacity((void**)&args, &arg_cap, arg_count + 1, sizeof(AstNode*))) {
+                        free(args);
+                        parser_fatal_oom();
+                    }
                     args[arg_count++] = expression();
                 } while (match_token(TOKEN_COMMA));
             }
             consume(TOKEN_RIGHT_PAREN, "Expected ')' after function arguments.");
-
-            AstNode** heapArgs = NULL;
-            if (arg_count > 0) {
-                heapArgs = malloc(sizeof(AstNode*) * arg_count);
-                for (int i = 0; i < arg_count; i++) heapArgs[i] = args[i];
-            }
-            expr = ast_new_call_expr(name, heapArgs, arg_count);
+            expr = ast_new_call_expr(expr, name, args, arg_count);
         } else if (match_token(TOKEN_DOT)) {
             consume(TOKEN_IDENTIFIER, "Expected field name after '.'.");
             expr = ast_new_get_expr(expr, parser.previous);
@@ -158,7 +175,7 @@ static AstNode* call() {
 }
 
 static AstNode* assignment() {
-    AstNode* expr = call();
+    AstNode* expr = binary();
 
     if (match_token(TOKEN_EQUAL)) {
         AstNode* value = assignment();
@@ -174,7 +191,7 @@ static AstNode* assignment() {
 }
 
 static AstNode* binary() {
-    AstNode* exp = assignment();
+    AstNode* exp = call();
     while (match_token(TOKEN_PLUS) || match_token(TOKEN_MINUS) || 
            match_token(TOKEN_STAR) || match_token(TOKEN_SLASH) ||
            match_token(TOKEN_EQUAL_EQUAL) || match_token(TOKEN_LESS) ||
@@ -182,14 +199,14 @@ static AstNode* binary() {
            match_token(TOKEN_PLUS_TILDE) || match_token(TOKEN_CARET_PLUS) ||
            match_token(TOKEN_PIPE_GREATER) || match_token(TOKEN_PIPE_QUESTION)) {
         Token op = parser.previous;
-        AstNode* right = assignment();
+        AstNode* right = call();
         exp = ast_new_binary(exp, op, right);
     }
     return exp;
 }
 
 static AstNode* expression() {
-    return binary();
+    return assignment();
 }
 
 static AstNode* var_declaration() {
@@ -209,7 +226,13 @@ static AstNode* var_declaration() {
 
 static AstNode* use_statement() {
     consume(TOKEN_STRING, "Expected module path (string) after 'use'.");
-    return ast_new_use_stmt(parser.previous);
+    Token path = parser.previous;
+    Token alias = (Token){0};
+    if (match_token(TOKEN_AS)) {
+        consume(TOKEN_IDENTIFIER, "Expected namespace alias after 'as'.");
+        alias = parser.previous;
+    }
+    return ast_new_use_stmt(path, alias);
 }
 
 static AstNode* while_statement() {
@@ -223,45 +246,59 @@ static AstNode* func_declaration() {
     consume(TOKEN_IDENTIFIER, "Expected function name.");
     Token name = parser.previous;
     consume(TOKEN_LEFT_PAREN, "Expected '(' after function name.");
-    Token params[32];
+    Token* params = NULL;
     int param_count = 0;
+    int param_cap = 0;
     if (!check(TOKEN_RIGHT_PAREN)) {
         do {
             consume(TOKEN_IDENTIFIER, "Expected parameter name.");
+            if (!ensure_capacity((void**)&params, &param_cap, param_count + 1, sizeof(Token))) {
+                free(params);
+                parser_fatal_oom();
+            }
             params[param_count++] = parser.previous;
         } while (match_token(TOKEN_COMMA));
     }
     consume(TOKEN_RIGHT_PAREN, "Expected ')' after parameters.");
     consume(TOKEN_LEFT_BRACE, "Expected '{' before function body.");
     AstNode* body = block();
-    Token* heapParams = NULL;
-    if (param_count > 0) {
-        heapParams = malloc(sizeof(Token) * param_count);
-        for (int i = 0; i < param_count; i++) heapParams[i] = params[i];
-    }
-    return ast_new_func_decl(name, heapParams, param_count, body);
+    return ast_new_func_decl(name, params, param_count, body);
 }
 
 static AstNode* struct_declaration() {
     consume(TOKEN_IDENTIFIER, "Expected struct name.");
     Token name = parser.previous;
     consume(TOKEN_LEFT_BRACE, "Expected '{' after struct name.");
-    Token fields[64];
+    Token* fields = NULL;
     int field_count = 0;
+    int field_cap = 0;
     while (!check(TOKEN_RIGHT_BRACE) && !check(TOKEN_EOF)) {
         consume(TOKEN_IDENTIFIER, "Expected field name.");
+        if (!ensure_capacity((void**)&fields, &field_cap, field_count + 1, sizeof(Token))) {
+            free(fields);
+            parser_fatal_oom();
+        }
         fields[field_count++] = parser.previous;
     }
     consume(TOKEN_RIGHT_BRACE, "Expected '}' at end of struct declaration.");
-    Token* heapFields = NULL;
-    if (field_count > 0) {
-        heapFields = malloc(sizeof(Token) * field_count);
-        for (int i = 0; i < field_count; i++) heapFields[i] = fields[i];
-    }
-    return ast_new_struct_decl(name, heapFields, field_count);
+    return ast_new_struct_decl(name, fields, field_count);
 }
 
 static AstNode* statement() {
+    if (match_token(TOKEN_PUB)) {
+        if (match_token(TOKEN_FN)) {
+            AstNode* fn = func_declaration();
+            fn->data.func_decl.is_public = true;
+            return fn;
+        }
+        if (match_token(TOKEN_ST)) {
+            AstNode* st = struct_declaration();
+            st->data.struct_decl.is_public = true;
+            return st;
+        }
+        printf("Syntax Error on line %d: Expected 'fn' or 'st' after 'pub'.\n", parser.current.line);
+        parser.hadError = true;
+    }
     if (match_token(TOKEN_LEFT_BRACE)) {
         return block();
     }

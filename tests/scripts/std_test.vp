@@ -1,0 +1,23 @@
+// Test for ViperLang Standard Library (@std/io and @std/os)
+
+use "@std/io" as io
+use "@std/os" as os
+
+// Test OS get_env
+v user = os.get_env("USER")
+pr("Current USER environment variable:", user)
+
+// Test OS exec
+pr("Running 'echo Hello World!' via os.exec():")
+os.exec("echo Hello World!")
+
+// Test IO write
+v test_file = "viper_test_file.txt"
+v file_req = io.open(test_file, "w")
+io.write_text(file_req, "Writing to a dynamically managed file using True FFI in ViperLang!\n")
+io.close(file_req)
+pr("Successfully wrote to", test_file)
+
+// Clean up
+io.remove_file(test_file)
+pr("Cleaned up", test_file)

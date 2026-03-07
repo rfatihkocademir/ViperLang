@@ -1,0 +1,19 @@
+// Test FFI passing C-structs
+
+v lib = load_dl("./struct_test.so")
+v mutate = lib.get_fn("mutate_struct", "{i,d}->{i,d}")
+
+// Define a matching struct in Viper
+st MyStruct {
+    id
+    value
+}
+
+v input = MyStruct(42, 3.14)
+pr("Viper: Calling mutate_struct with", input)
+
+v output = mutate(input)
+
+pr("Viper: Received back", output)
+pr("Result ID:", output.f0)
+pr("Result Value:", output.f1)

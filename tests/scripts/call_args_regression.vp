@@ -1,0 +1,12 @@
+fn sum3(a, b, c) {
+    ret a + b + c
+}
+
+v total = sum3(1 + 2, 3 + 4, 5 + 6)
+
+i total == 21 {
+    pr("call args ok")
+} e {
+    v crash = 1 / 0
+    pr(crash)
+}

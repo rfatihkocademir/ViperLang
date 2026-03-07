@@ -1,0 +1,3 @@
+pr("Hello from Native FFI!")
+v t = clock()
+pr("Time is: ", t)

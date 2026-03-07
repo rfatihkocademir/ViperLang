@@ -1,0 +1,30 @@
+// Test the @std/net Standard Library
+use "@std/net" as net
+use "@std/io" as io
+
+pr("Starting ViperLang Web Server on port 8080...")
+
+v server = net.serve(8080)
+i (server.fd == 0) {
+    pr("Failed to bind server.")
+    ret 0
+}
+
+pr("Listening for incoming connections...")
+
+// In a real server this would be a loop, but for testing we accept one connection
+v client = net.accept(server)
+pr("Client connected!")
+
+v request = net.recv_string(client)
+pr("Received request from client:")
+pr(request)
+
+// Send a basic HTTP response
+v response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nHello from ViperLang True FFI Network!\n"
+net.send(client, response)
+pr("Sent response.")
+
+net.close(client)
+net.close(server)
+pr("Server shut down cleanly.")

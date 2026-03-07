@@ -1,0 +1,33 @@
+name: ViperLang CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc make libffi-dev
+
+    - name: Build ViperLang
+      run: make
+    
+    - name: Run Core Tests
+      run: make test
+
+    - name: Run Standard Library Tests
+      run: |
+        ./viper tests/scripts/std_test.vp
+        ./viper tests/scripts/net_test.vp
+        ./viper tests/scripts/ffi_dynamic_test.vp
+        gcc -shared -fPIC -o struct_test.so tests/scripts/struct_test.c
+        ./viper tests/scripts/struct_test.vp

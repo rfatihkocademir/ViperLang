@@ -56,6 +56,7 @@ typedef struct AstNode {
         } expr_stmt;
         struct {
             Token path; // For AST_USE_STMT
+            Token alias;
         } use_stmt;
         struct {
             struct AstNode** statements;
@@ -76,8 +77,10 @@ typedef struct AstNode {
             Token* params;
             int param_count;
             struct AstNode* body;
+            bool is_public;
         } func_decl;
         struct {
+            struct AstNode* callee;
             Token name;
             struct AstNode** args;
             int arg_count;
@@ -89,6 +92,7 @@ typedef struct AstNode {
             Token name;
             int field_count;
             Token* fields;
+            bool is_public;
         } struct_decl;
         struct {
             struct AstNode* obj;
@@ -113,10 +117,10 @@ AstNode* ast_new_block_stmt();
 AstNode* ast_new_if_stmt(AstNode* condition, AstNode* then_branch, AstNode* else_branch);
 AstNode* ast_new_while_stmt(AstNode* condition, AstNode* body);
 AstNode* ast_new_func_decl(Token name, Token* params, int param_count, AstNode* body);
-AstNode* ast_new_call_expr(Token name, AstNode** args, int arg_count);
+AstNode* ast_new_call_expr(AstNode* callee, Token name, AstNode** args, int arg_count);
 AstNode* ast_new_return_stmt(AstNode* value);
 AstNode* ast_new_struct_decl(Token name, Token* fields, int field_count);
-AstNode* ast_new_use_stmt(Token path);
+AstNode* ast_new_use_stmt(Token path, Token alias);
 AstNode* ast_new_get_expr(AstNode* obj, Token name);
 AstNode* ast_new_set_expr(AstNode* obj, Token name, AstNode* value);
 AstNode* ast_new_program();

@@ -1,0 +1,28 @@
+{
+  "name": "vscode-viperlang",
+  "displayName": "ViperLang Support",
+  "description": "Syntax highlighting for ViperLang",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "viper",
+        "aliases": ["ViperLang", "viper"],
+        "extensions": [".vp", ".vpmod"]
+      }
+    ],
+    "grammars": [
+      {
+        "language": "viper",
+        "scopeName": "source.viper",
+        "path": "./syntaxes/viper.tmLanguage.json"
+      }
+    ]
+  }
+}

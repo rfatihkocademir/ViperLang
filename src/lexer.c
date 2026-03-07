@@ -136,6 +136,7 @@ static TokenType identifier_type() {
     
     // Two letter keywords
     if (len == 2) {
+        if (memcmp(lexer.start, "as", 2) == 0) return TOKEN_AS;
         if (memcmp(lexer.start, "fn", 2) == 0) return TOKEN_FN;
         if (memcmp(lexer.start, "ei", 2) == 0) return TOKEN_EI;
         if (memcmp(lexer.start, "st", 2) == 0) return TOKEN_ST;

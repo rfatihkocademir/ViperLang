@@ -1,0 +1,38 @@
+// ViperLang Standard IO Library (@std/io)
+// Built using True Dynamic FFI bindings.
+
+
+st File {
+    handle
+}
+
+pub fn open(path, mode) {
+    v libc = load_dl("libc.so.6")
+    v _fopen = libc.get_fn("fopen", "s,s->p")
+    v handle = _fopen(path, mode)
+    // NOTE: In the future, we would check for NULL points here
+    // but FFI pointer handling currently assumes strings or generic pointers.
+    // For now, if handle is 0/null it will crash natively if used, which mimics C.
+    
+    v file_obj = File()
+    file_obj.handle = handle
+    ret file_obj
+}
+
+pub fn close(file) {
+    v libc = load_dl("libc.so.6")
+    v _fclose = libc.get_fn("fclose", "p->i")
+    _fclose(file.handle)
+}
+
+pub fn write_text(file, text) {
+    v libc = load_dl("libc.so.6")
+    v _fputs = libc.get_fn("fputs", "s,p->i")
+    _fputs(text, file.handle)
+}
+
+pub fn remove_file(path) {
+    v libc = load_dl("libc.so.6")
+    v _remove = libc.get_fn("remove", "s->i")
+    _remove(path)
+}

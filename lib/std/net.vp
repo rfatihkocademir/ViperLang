@@ -1,0 +1,46 @@
+// ViperLang Standard Network Library (@std/net)
+// Provides a TCP socket API wrapping the C network extension.
+
+st Socket { fd }
+
+pub fn serve(port) {
+    v ext = load_dl("lib/std/net.so")
+    v _server = ext.get_fn("net_tcp_server", "i->i")
+    
+    v fd = _server(port)
+    i (fd < 0) {
+        // Return 0 for failure temporarily until Option/Result types
+        ret 0
+    }
+    ret Socket(fd)
+}
+
+pub fn accept(server) {
+    v ext = load_dl("lib/std/net.so")
+    v _accept = ext.get_fn("net_accept", "i->i")
+    
+    v client_fd = _accept(server.fd)
+    i (client_fd < 0) {
+        ret 0
+    }
+    ret Socket(client_fd)
+}
+
+pub fn send(socket, message) {
+    v ext = load_dl("lib/std/net.so")
+    v _send = ext.get_fn("net_send", "i,s->i")
+    
+    ret _send(socket.fd, message)
+}
+
+pub fn recv_string(socket) {
+    v ext = load_dl("lib/std/net.so")
+    v _recv = ext.get_fn("net_recv_string", "i->s")
+    ret _recv(socket.fd)
+}
+
+pub fn close(socket) {
+    v ext = load_dl("lib/std/net.so")
+    v _close = ext.get_fn("net_close", "i->v")
+    _close(socket.fd)
+}

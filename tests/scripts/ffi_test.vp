@@ -1,0 +1,9 @@
+v start = clock()
+v counter = 0
+m counter < 1000000 {
+    counter = counter + 1
+}
+v end = clock()
+pr("Finished 1,000,000 iterations.")
+v duration = end - start
+pr("Duration: ", duration, " seconds.")

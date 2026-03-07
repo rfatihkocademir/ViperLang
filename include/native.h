@@ -16,6 +16,9 @@ typedef struct sObjArray ObjArray;
 typedef struct sObjFunction ObjFunction;
 typedef struct sObjStruct ObjStruct;
 typedef struct sObjInstance ObjInstance;
+typedef struct sObjDlHandle ObjDlHandle;
+typedef struct sObjDynamicFunction ObjDynamicFunction;
+typedef struct sObjPointer ObjPointer;
 
 // String Object
 struct sObjString {
@@ -57,18 +60,45 @@ struct sObjInstance {
     Value* fields; // Array of values matching klass->field_count
 };
 
+struct sObjDlHandle {
+    Obj obj;
+    void* handle;
+};
+
+struct sObjPointer {
+    Obj obj;
+    void* ptr;
+};
+
+struct sObjDynamicFunction {
+    Obj obj;
+    void* fn_ptr;
+    const char* signature;
+    int sig_len;
+    void* cif;           // ffi_cif* point (cast to void* in header to avoid ffi.h include here)
+    void** arg_types;    // ffi_type** array
+    void* return_type;   // ffi_type*
+};
+
 // Object type constants
-#define OBJ_STRING   1
-#define OBJ_ARRAY    2
-#define OBJ_FUNCTION 3
-#define OBJ_STRUCT   4
-#define OBJ_INSTANCE 5
+#define OBJ_STRING        1
+#define OBJ_ARRAY         2
+#define OBJ_FUNCTION      3
+#define OBJ_STRUCT        4
+#define OBJ_INSTANCE      5
+#define OBJ_NATIVE        6
+#define OBJ_DL_HANDLE     7
+#define OBJ_DYNAMIC_FUNC  8
+#define OBJ_POINTER       9
 
 // String methods
 ObjString* copy_string(const char* chars, int length);
 ObjFunction* new_function(const char* name, int name_len, int arity);
 ObjStruct* new_struct(const char* name, int name_len, int field_count, const char** fields, int* field_lens);
 ObjInstance* new_instance(ObjStruct* klass);
+ObjDlHandle* new_dl_handle(void* handle);
+ObjDynamicFunction* new_dynamic_function(void* fn_ptr, const char* signature, int sig_len, void* cif, void** arg_types, void* return_type);
+ObjPointer* new_pointer(void* ptr);
 void print_value(Value value);
 
 // Native Function Signature
@@ -76,6 +106,10 @@ typedef Value (*NativeFn)(int argCount, Value* args);
 
 void init_native_core();
 void push_native(const char* name, NativeFn function);
+int find_native_index(const char* name, int length);
+NativeFn get_native_by_index(int index);
+const char* get_native_name(int index);
+int native_count();
 
 // Memory Management (Reference Counting Core)
 void retain_obj(Obj* obj);
