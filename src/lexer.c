@@ -5,6 +5,7 @@ typedef struct {
     const char* start;
     const char* current;
     int line;
+    TokenType last_type;
 } Lexer;
 
 Lexer lexer;
@@ -13,6 +14,7 @@ void init_lexer(const char* source) {
     lexer.start = source;
     lexer.current = source;
     lexer.line = 1;
+    lexer.last_type = TOKEN_EOF;
 }
 
 static bool is_at_end() {
@@ -41,6 +43,7 @@ static bool match(char expected) {
 }
 
 static Token make_token(TokenType type) {
+    lexer.last_type = type;
     Token token;
     token.type = type;
     token.start = lexer.start;
@@ -146,6 +149,7 @@ static TokenType identifier_type() {
         if (memcmp(lexer.start, "in", 2) == 0) return TOKEN_IN;
         if (memcmp(lexer.start, "u8", 2) == 0) return TOKEN_TYPE_U8;
         if (memcmp(lexer.start, "pr", 2) == 0) return TOKEN_PR;
+        if (memcmp(lexer.start, "db", 2) == 0) return TOKEN_DB;
     }
 
     if (len == 3) {
@@ -163,19 +167,80 @@ static TokenType identifier_type() {
                 }
             }
             break;
-        case 'f': return check_keyword(1, 4, "alse", TOKEN_FALSE);
-        case 'i': return check_keyword(1, 3, "mpl", TOKEN_IMPL);
-        case 'm': return check_keyword(1, 2, "ut", TOKEN_MUT);
+        case 'c': return check_keyword(1, 4, "lone", TOKEN_CLONE);
+        case 'e':
+            if (len > 1) {
+                switch(lexer.start[1]) {
+                    case 'l': return check_keyword(2, 2, "se", TOKEN_ELSE);
+                    case 'v': return check_keyword(2, 2, "al", TOKEN_EVAL);
+                }
+            }
+            break;
+        case 'f':
+            if (len > 1) {
+                switch(lexer.start[1]) {
+                    case 'a': return check_keyword(2, 3, "lse", TOKEN_FALSE);
+                    case 'n': return check_keyword(2, 0, "", TOKEN_FN);
+                }
+            }
+            break;
+        case 'h':
+            return check_keyword(1, 2, "as", TOKEN_HAS);
+        case 'i':
+            if (len > 1) {
+                switch(lexer.start[1]) {
+                    case 'm': return check_keyword(2, 2, "pl", TOKEN_IMPL);
+                    case 'n': return check_keyword(2, 0, "", TOKEN_IN);
+                }
+            }
+            break;
+        case 'j': return check_keyword(1, 3, "son", TOKEN_JSON);
+        case 'k': return check_keyword(1, 3, "eys", TOKEN_KEYS);
+        case 'm': 
+            if (len > 1) {
+                switch(lexer.start[1]) {
+                    case 'u': return check_keyword(2, 1, "t", TOKEN_MUT);
+                    case 'a': return check_keyword(2, 3, "tch", TOKEN_MATCH);
+                }
+            }
+            break;
         case 'n': return check_keyword(1, 2, "il", TOKEN_NIL);
         case 'p': 
             if (len > 1) {
                 switch(lexer.start[1]) {
                     case 'u': return check_keyword(2, 1, "b", TOKEN_PUB);
+                    case 'a': return check_keyword(2, 3, "nic", TOKEN_PANIC);
                 }
             }
             break;
-        case 's': return check_keyword(1, 4, "pawn", TOKEN_SPAWN);
-        case 't': return check_keyword(1, 3, "rue", TOKEN_TRUE);
+        case 'q': break;
+        case 'r':
+            if (len > 1) {
+                if (lexer.start[1] == 'e') {
+                    if (len == 3) return check_keyword(2, 1, "t", TOKEN_RET);
+                    return check_keyword(2, 5, "cover", TOKEN_RECOVER);
+                }
+            }
+            break;
+        case 's':
+            if (len > 1) {
+                switch(lexer.start[1]) {
+                    case 'p': return check_keyword(2, 3, "awn", TOKEN_SPAWN);
+                    case 'y': return check_keyword(2, 2, "nc", TOKEN_SYNC);
+                }
+            }
+            break;
+        case 't': 
+            if (len > 1) {
+                switch(lexer.start[1]) {
+                    case 'r': 
+                        if (len == 3) return check_keyword(2, 1, "y", TOKEN_TRY);
+                        if (len == 4) return check_keyword(2, 2, "ue", TOKEN_TRUE);
+                        break;
+                    case 'y': return check_keyword(2, 4, "peof", TOKEN_TYPEOF);
+                }
+            }
+            break;
         case 'u': return check_keyword(1, 2, "se", TOKEN_USE);
     }
     return TOKEN_IDENTIFIER;
@@ -200,7 +265,7 @@ static Token number() {
 }
 
 static Token string() {
-    while (peek() != '"' && !is_at_end()) {
+    while ((peek() != '"' || (lexer.current > lexer.start && *(lexer.current - 1) == '\\')) && !is_at_end()) {
         if (peek() == '\n') lexer.line++;
         advance();
     }
@@ -208,6 +273,18 @@ static Token string() {
     if (is_at_end()) return error_token("Unterminated string.");
     advance(); // The closing quote.
     return make_token(TOKEN_STRING);
+}
+
+static Token regex() {
+    while (peek() != '/' && !is_at_end()) {
+        if (peek() == '\\') advance(); // skip escaped char
+        if (peek() == '\n') lexer.line++;
+        advance();
+    }
+
+    if (is_at_end()) return error_token("Unterminated regex.");
+    advance(); // The closing slash.
+    return make_token(TOKEN_REGEX);
 }
 
 Token scan_token() {
@@ -230,6 +307,10 @@ Token scan_token() {
         case ']': return make_token(TOKEN_RIGHT_BRACKET);
         case ';': return make_token(TOKEN_SEMICOLON);
         case ',': return make_token(TOKEN_COMMA);
+        case '?':
+            if (match('?')) return make_token(TOKEN_QUESTION_QUESTION);
+            if (match('.')) return make_token(TOKEN_QUESTION_DOT);
+            return make_token(TOKEN_QUESTION);
         case ':': return make_token(TOKEN_COLON);
         case '@': return make_token(TOKEN_AT);
         case '#': return make_token(TOKEN_HASH);
@@ -237,7 +318,16 @@ Token scan_token() {
         
         // Multi-character operators
         case '-': return make_token(TOKEN_MINUS);
-        case '/': return make_token(TOKEN_SLASH);
+        case '/':
+            // Heuristic for regex: if it's after an operator or at start of expression
+            if (lexer.last_type == TOKEN_EQUAL || lexer.last_type == TOKEN_LEFT_PAREN  ||
+                lexer.last_type == TOKEN_COMMA || lexer.last_type == TOKEN_COLON      ||
+                lexer.last_type == TOKEN_BANG  || lexer.last_type == TOKEN_AMPERSAND  ||
+                lexer.last_type == TOKEN_PIPE  || lexer.last_type == TOKEN_EOF        ||
+                lexer.last_type == TOKEN_MATCH) {
+                return regex();
+            }
+            return make_token(TOKEN_SLASH);
         case '%': return make_token(TOKEN_PERCENT);
         
         case '*': return make_token(TOKEN_STAR);
@@ -271,9 +361,6 @@ Token scan_token() {
             if (match('|')) return make_token(TOKEN_PIPE); // ||
             return make_token(TOKEN_PIPE);
 
-        case '?':
-            return make_token(match('.') ? TOKEN_QUESTION_DOT : TOKEN_QUESTION);
-            
         case '"': return string();
     }
 

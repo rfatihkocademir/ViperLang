@@ -1,15 +1,54 @@
 // ViperLang Standard OS Library (@std/os)
-// Built using True Dynamic FFI bindings.
 
-
-pub fn get_env(name) {
-    v libc = load_dl("libc.so.6")
-    v _getenv = libc.get_fn("getenv", "s->s")
-    ret _getenv(name)
+pub fn sh(command) {
+    ret os_sh(command)
 }
 
+pub fn env(key) {
+    ret os_env(key)
+}
+
+pub fn setenv(key, val) {
+    ret os_setenv(key, val)
+}
+
+pub fn args() {
+    ret os_args()
+}
+
+pub fn exit(code) {
+    ret os_exit(code)
+}
+
+pub fn cwd() {
+    ret os_cwd()
+}
+
+pub fn pid() {
+    ret os_pid()
+}
+
+pub fn kill(target_pid, signal_no) {
+    ret os_kill(target_pid, signal_no)
+}
+
+pub fn sleep(ms) {
+    ret os_sleep(ms)
+}
+
+pub fn info() {
+    ret os_info()
+}
+
+pub fn cron(spec, callback_fn) {
+    ret os_cron(spec, callback_fn)
+}
+
+// Backward compatible aliases
 pub fn exec(command) {
-    v libc = load_dl("libc.so.6")
-    v _system = libc.get_fn("system", "s->i")
-    ret _system(command)
+    ret os_sh(command)
+}
+
+pub fn get_env(key) {
+    ret os_env(key)
 }

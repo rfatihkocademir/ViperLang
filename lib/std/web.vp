@@ -1,0 +1,69 @@
+// ViperLang Standard Web Library (@std/web)
+
+pub fn serve(port, handler_fn) {
+    ret web_serve(port, handler_fn)
+}
+
+pub fn route(path, method, handler_fn) {
+    ret web_route(path, method, handler_fn)
+}
+
+pub fn middleware(handler_fn) {
+    ret web_middleware(handler_fn)
+}
+
+pub fn static(path, dir_path) {
+    ret web_static(path, dir_path)
+}
+
+pub fn cors(options) {
+    ret web_cors(options)
+}
+
+pub fn jwt_sign(payload, secret) {
+    ret web_jwt_sign(payload, secret)
+}
+
+pub fn jwt_verify(token, secret) {
+    ret web_jwt_verify(token, secret)
+}
+
+pub fn hash(input, algo) {
+    ret web_hash(input, algo)
+}
+
+pub fn fetch(url) {
+    ret web_fetch(url)
+}
+
+pub fn post(url, data) {
+    ret web_post(url, data)
+}
+
+pub fn put(url, data) {
+    ret web_put(url, data)
+}
+
+pub fn patch(url, data) {
+    ret web_patch(url, data)
+}
+
+pub fn delete(url) {
+    ret web_delete(url)
+}
+
+pub fn ws_serve(port, on_msg_fn) {
+    ret web_ws_serve(port, on_msg_fn)
+}
+
+pub fn ws_send(client_id, msg) {
+    ret web_ws_send(client_id, msg)
+}
+
+pub fn download(url, file_path) {
+    ret web_download(url, file_path)
+}
+
+pub fn upload(url, file_path) {
+    ret web_upload(url, file_path)
+}

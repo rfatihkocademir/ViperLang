@@ -1,0 +1,17 @@
+// ViperLang Standard Time Library (@std/time)
+
+pub fn now() {
+    ret time_now()
+}
+
+pub fn format(timestamp, pattern) {
+    ret time_format(timestamp, pattern)
+}
+
+pub fn parse(date_text, pattern) {
+    ret time_parse(date_text, pattern)
+}
+
+pub fn add(timestamp, spec) {
+    ret time_add(timestamp, spec)
+}

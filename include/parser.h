@@ -5,5 +5,6 @@
 #include "ast.h"
 
 AstNode* parse(const char* source);
+bool parser_had_error();
 
 #endif // VIPER_PARSER_H

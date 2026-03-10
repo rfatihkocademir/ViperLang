@@ -120,3 +120,19 @@ pub fn abs(x) {
     v _fn = ext.get_fn("math_abs", "d->d")
     ret _fn(x)
 }
+
+pub fn rand(min, max) {
+    ret math_rand(min, max)
+}
+
+pub fn uuid() {
+    ret math_uuid()
+}
+
+pub fn round(num, decimals) {
+    ret math_round(num, decimals)
+}
+
+pub fn hash(data) {
+    ret math_hash(data)
+}

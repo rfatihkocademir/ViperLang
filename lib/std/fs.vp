@@ -1,0 +1,53 @@
+// ViperLang Standard FS Library (@std/fs)
+
+pub fn read(path) {
+    ret fs_read(path)
+}
+
+pub fn read_bytes(path) {
+    ret fs_read_bytes(path)
+}
+
+pub fn write(path, content) {
+    ret fs_write(path, content)
+}
+
+pub fn append(path, content) {
+    ret fs_append(path, content)
+}
+
+pub fn delete(path) {
+    ret fs_delete(path)
+}
+
+pub fn copy(src, dest) {
+    ret fs_copy(src, dest)
+}
+
+pub fn move(src, dest) {
+    ret fs_move(src, dest)
+}
+
+pub fn exists(path) {
+    ret fs_exists(path)
+}
+
+pub fn is_dir(path) {
+    ret fs_is_dir(path)
+}
+
+pub fn mkdir(path) {
+    ret fs_mkdir(path)
+}
+
+pub fn ls(path) {
+    ret fs_ls(path)
+}
+
+pub fn watch(path, on_change_fn) {
+    ret fs_watch(path, on_change_fn)
+}
+
+pub fn stream_read(path, on_chunk_fn) {
+    ret fs_stream_read(path, on_chunk_fn)
+}

@@ -16,10 +16,13 @@ AstNode* ast_new_number(double val) {
 
 AstNode* ast_new_string(Token str_token) {
     AstNode* node = ast_alloc(AST_STRING);
-    // remove quotes
     node->data.str_val.name = str_token.start + 1;
     node->data.str_val.length = str_token.length - 2;
     return node;
+}
+
+AstNode* ast_new_nil() {
+    return ast_alloc(AST_NIL);
 }
 
 AstNode* ast_new_identifier(Token name) {
@@ -80,6 +83,12 @@ AstNode* ast_new_while_stmt(AstNode* condition, AstNode* body) {
     return node;
 }
 
+AstNode* ast_new_sync_stmt(AstNode* body) {
+    AstNode* node = ast_alloc(AST_SYNC_STMT);
+    node->data.sync_stmt.body = body;
+    return node;
+}
+
 AstNode* ast_new_func_decl(Token name, Token* params, int param_count, AstNode* body) {
     AstNode* node = ast_alloc(AST_FUNC_DECL);
     node->data.func_decl.name = name;
@@ -128,11 +137,105 @@ AstNode* ast_new_get_expr(AstNode* obj, Token name) {
     return node;
 }
 
+AstNode* ast_new_safe_get_expr(AstNode* obj, Token name) {
+    AstNode* node = ast_alloc(AST_SAFE_GET_EXPR);
+    node->data.get_expr.obj = obj;
+    node->data.get_expr.name = name;
+    return node;
+}
+
 AstNode* ast_new_set_expr(AstNode* obj, Token name, AstNode* value) {
     AstNode* node = ast_alloc(AST_SET_EXPR);
     node->data.set_expr.obj = obj;
     node->data.set_expr.name = name;
     node->data.set_expr.value = value;
+    return node;
+}
+
+AstNode* ast_new_spawn_expr(AstNode* expr) {
+    AstNode* node = ast_alloc(AST_SPAWN_EXPR);
+    node->data.spawn_expr.expr = expr;
+    return node;
+}
+
+AstNode* ast_new_await_expr(AstNode* expr) {
+    AstNode* node = ast_alloc(AST_AWAIT_EXPR);
+    node->data.await_expr.expr = expr;
+    return node;
+}
+
+AstNode* ast_new_typeof_expr(AstNode* expr) {
+    AstNode* node = ast_alloc(AST_TYPEOF_EXPR);
+    node->data.typeof_expr.expr = expr;
+    return node;
+}
+
+AstNode* ast_new_array_expr(AstNode** elements, int count) {
+    AstNode* node = ast_alloc(AST_ARRAY_EXPR);
+    node->data.array_expr.elements = elements;
+    node->data.array_expr.count = count;
+    return node;
+}
+
+AstNode* ast_new_has_expr(AstNode* obj, AstNode* prop) {
+    AstNode* node = ast_alloc(AST_HAS_EXPR);
+    node->data.has_expr.obj = obj;
+    node->data.has_expr.prop = prop;
+    return node;
+}
+
+AstNode* ast_new_index_expr(AstNode* target, AstNode* index) {
+    AstNode* node = ast_alloc(AST_INDEX_EXPR);
+    node->data.index_expr.target = target;
+    node->data.index_expr.index = index;
+    node->data.index_expr.value = NULL;
+    return node;
+}
+
+AstNode* ast_new_set_index_expr(AstNode* target, AstNode* index, AstNode* value) {
+    AstNode* node = ast_alloc(AST_INDEX_EXPR);
+    node->data.index_expr.target = target;
+    node->data.index_expr.index = index;
+    node->data.index_expr.value = value;
+    return node;
+}
+
+AstNode* ast_new_regex(Token token) {
+    AstNode* node = ast_alloc(AST_REGEX);
+    node->data.regex.pattern = token.start + 1;
+    node->data.regex.length = token.length - 2;
+    return node;
+}
+
+AstNode* ast_new_match_expr(AstNode* left, AstNode* right) {
+    AstNode* node = ast_alloc(AST_MATCH_EXPR);
+    node->data.match_expr.left = left;
+    node->data.match_expr.right = right;
+    return node;
+}
+
+AstNode* ast_new_clone_expr(AstNode* expr) {
+    AstNode* node = ast_alloc(AST_CLONE_EXPR);
+    node->data.clone_expr.expr = expr;
+    return node;
+}
+
+AstNode* ast_new_keys_expr(AstNode* expr) {
+    AstNode* node = ast_alloc(AST_KEYS_EXPR);
+    node->data.clone_expr.expr = expr;
+    return node;
+}
+
+AstNode* ast_new_eval_expr(AstNode* expr) {
+    AstNode* node = ast_alloc(AST_EVAL_EXPR);
+    node->data.clone_expr.expr = expr;
+    return node;
+}
+
+AstNode* ast_new_try_expr(AstNode* try_block, AstNode* catch_block) {
+    AstNode* node = ast_alloc(AST_TRY_EXPR);
+    node->data.try_expr.try_block = try_block;
+    node->data.try_expr.catch_block = catch_block;
     return node;
 }
 
@@ -194,13 +297,58 @@ void ast_print(AstNode* node, int depth) {
             }
             break;
         case AST_GET_EXPR:
-            printf("Get Field '%.*s'\n", node->data.get_expr.name.length, node->data.get_expr.name.start);
+            printf("Get (%.*s):\n", node->data.get_expr.name.length, node->data.get_expr.name.start);
+            ast_print(node->data.get_expr.obj, depth + 1);
+            break;
+        case AST_SAFE_GET_EXPR:
+            printf("SafeGet (%.*s):\n", node->data.get_expr.name.length, node->data.get_expr.name.start);
             ast_print(node->data.get_expr.obj, depth + 1);
             break;
         case AST_SET_EXPR:
             printf("Set Field '%.*s'\n", node->data.set_expr.name.length, node->data.set_expr.name.start);
             ast_print(node->data.set_expr.obj, depth + 1);
             ast_print(node->data.set_expr.value, depth + 1);
+            break;
+        case AST_SPAWN_EXPR:
+            printf("Spawn:\n");
+            ast_print(node->data.spawn_expr.expr, depth + 1);
+            break;
+        case AST_AWAIT_EXPR:
+            printf("Await:\n");
+            ast_print(node->data.await_expr.expr, depth + 1);
+            break;
+        case AST_TYPEOF_EXPR:
+            printf("Typeof:\n");
+            ast_print(node->data.typeof_expr.expr, depth + 1);
+            break;
+        case AST_ARRAY_EXPR:
+            printf("Array [%d elements]:\n", node->data.array_expr.count);
+            for(int i=0; i<node->data.array_expr.count; i++) {
+                ast_print(node->data.array_expr.elements[i], depth + 1);
+            }
+            break;
+        case AST_TRY_EXPR:
+            printf("Try:\n");
+            ast_print(node->data.try_expr.try_block, depth + 1);
+            printf("Else:\n");
+            ast_print(node->data.try_expr.catch_block, depth + 1);
+            break;
+        case AST_CLONE_EXPR:
+            printf("Clone:\n");
+            ast_print(node->data.clone_expr.expr, depth + 1);
+            break;
+        case AST_EVAL_EXPR:
+            printf("Eval:\n");
+            ast_print(node->data.clone_expr.expr, depth + 1);
+            break;
+        case AST_KEYS_EXPR:
+            printf("Keys:\n");
+            ast_print(node->data.clone_expr.expr, depth + 1);
+            break;
+        case AST_HAS_EXPR:
+            printf("Has:\n");
+            ast_print(node->data.has_expr.obj, depth + 1);
+            ast_print(node->data.has_expr.prop, depth + 1);
             break;
         case AST_ASSIGN_EXPR:
             printf("Assign(%.*s):\n", node->data.assign.name.length, node->data.assign.name.start);
@@ -222,6 +370,15 @@ void ast_print(AstNode* node, int depth) {
                 ast_print(node->data.if_stmt.else_branch, depth + 1);
             }
             break;
+        case AST_WHILE_STMT:
+            printf("While:\n");
+            ast_print(node->data.while_stmt.condition, depth + 1);
+            ast_print(node->data.while_stmt.body, depth + 1);
+            break;
+        case AST_SYNC_STMT:
+            printf("Sync:\n");
+            ast_print(node->data.sync_stmt.body, depth + 1);
+            break;
         case AST_EXPR_STMT:
             printf("ExprStmt:\n");
             ast_print(node->data.expr_stmt.expr, depth + 1);
@@ -235,10 +392,30 @@ void ast_print(AstNode* node, int depth) {
             printf("Number(%.2f)\n", node->data.number_val);
             break;
         case AST_STRING:
-            printf("String(\"%.*s\")\n", node->data.str_val.length, node->data.str_val.name);
+            printf("String(%.*s)\n", node->data.str_val.length, node->data.str_val.name);
+            break;
+        case AST_NIL:
+            printf("Nil\n");
             break;
         case AST_IDENTIFIER:
             printf("Id(%.*s)\n", node->data.identifier.name.length, node->data.identifier.name.start);
+            break;
+        case AST_INDEX_EXPR:
+            printf("Index:\n");
+            ast_print(node->data.index_expr.target, depth + 1);
+            ast_print(node->data.index_expr.index, depth + 1);
+            if (node->data.index_expr.value) {
+                printf(" (Set)\n");
+                ast_print(node->data.index_expr.value, depth + 1);
+            }
+            break;
+        case AST_REGEX:
+            printf("Regex(/%.*s/)\n", node->data.regex.length, node->data.regex.pattern);
+            break;
+        case AST_MATCH_EXPR:
+            printf("Match:\n");
+            ast_print(node->data.match_expr.left, depth + 1);
+            ast_print(node->data.match_expr.right, depth + 1);
             break;
         default:
             printf("Unknown Node\n");

@@ -1,0 +1,29 @@
+// ViperLang Standard AI Library (@std/ai)
+
+pub fn config(provider, key) {
+    ret ai_config(provider, key)
+}
+
+pub fn ask(prompt) {
+    ret ai_ask(prompt)
+}
+
+pub fn chat(messages) {
+    ret ai_chat(messages)
+}
+
+pub fn embed(text) {
+    ret ai_embed(text)
+}
+
+pub fn extract(text, schema) {
+    ret ai_extract(text, schema)
+}
+
+pub fn vision(image_path, prompt) {
+    ret ai_vision(image_path, prompt)
+}
+
+pub fn tool(fn_reference) {
+    ret ai_tool(fn_reference)
+}

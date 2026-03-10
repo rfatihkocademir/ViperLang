@@ -3,6 +3,7 @@
 
 #include "vm.h"
 #include <stdbool.h>
+#include <pthread.h>
 
 // The base object for GC / Reference Counting
 struct sObj {
@@ -19,6 +20,7 @@ typedef struct sObjInstance ObjInstance;
 typedef struct sObjDlHandle ObjDlHandle;
 typedef struct sObjDynamicFunction ObjDynamicFunction;
 typedef struct sObjPointer ObjPointer;
+typedef struct sObjThread ObjThread;
 
 // String Object
 struct sObjString {
@@ -80,6 +82,14 @@ struct sObjDynamicFunction {
     void* return_type;   // ffi_type*
 };
 
+struct sObjThread {
+    Obj obj;
+    pthread_t thread;
+    Value result;
+    bool finished;     // True if the thread has completed
+    bool joined;       // True if another thread has already awaited this
+};
+
 // Object type constants
 #define OBJ_STRING        1
 #define OBJ_ARRAY         2
@@ -90,6 +100,7 @@ struct sObjDynamicFunction {
 #define OBJ_DL_HANDLE     7
 #define OBJ_DYNAMIC_FUNC  8
 #define OBJ_POINTER       9
+#define OBJ_THREAD        10
 
 // String methods
 ObjString* copy_string(const char* chars, int length);
@@ -99,6 +110,9 @@ ObjInstance* new_instance(ObjStruct* klass);
 ObjDlHandle* new_dl_handle(void* handle);
 ObjDynamicFunction* new_dynamic_function(void* fn_ptr, const char* signature, int sig_len, void* cif, void** arg_types, void* return_type);
 ObjPointer* new_pointer(void* ptr);
+ObjThread* new_thread(pthread_t thread);
+ObjArray* new_array();
+void array_append(ObjArray* array, Value value);
 void print_value(Value value);
 
 // Native Function Signature
@@ -116,8 +130,11 @@ void retain_obj(Obj* obj);
 void release_obj(Obj* obj);
 
 #define IS_OBJ(value)     ((value).type == VAL_OBJ)
+#define IS_NUMBER(value)  ((value).type == VAL_NUMBER)
+#define IS_BOOL(value)    ((value).type == VAL_BOOL)
 #define AS_OBJ(value)     ((value).as.obj)
 #define AS_STRING(value)  ((ObjString*)AS_OBJ(value))
 #define AS_FUNCTION(value)((ObjFunction*)AS_OBJ(value))
+#define AS_ARRAY(value)   ((ObjArray*)AS_OBJ(value))
 
 #endif // VIPER_NATIVE_H

@@ -3,12 +3,108 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ffi.h>
+#include "ffi.h"
+#include <pthread.h>
+#include "compiler.h"
+#include "parser.h"
+#include <regex.h>
+
+static __thread VM* current_vm = NULL;
+static bool ensure_frame_capacity(VM* vm, int needed);
+static bool ensure_register_capacity(VM* vm, int needed);
+static bool ensure_register_capacity(VM* vm, int needed);
+static void vm_fatal_oom(void);
+static Value deep_clone_value(Value value);
+
+// Thread runner struct
+typedef struct {
+    ObjFunction* fn;
+    int argCount;
+    Value* args;
+    ObjThread* thread_obj;
+    VM* parent_vm;
+} ThreadPayload;
+
+static void* spawn_runner(void* arg) {
+    ThreadPayload* payload = (ThreadPayload*)arg;
+    
+    VM child_vm;
+    init_vm(&child_vm);
+    
+    // Set this thread's thread-local pointer
+    current_vm = &child_vm;
+    
+    // Share global memory
+    child_vm.global_names = payload->parent_vm->global_names;
+    child_vm.global_values = payload->parent_vm->global_values;
+    child_vm.global_count = payload->parent_vm->global_count;
+    child_vm.global_capacity = payload->parent_vm->global_capacity;
+    
+    // Share the same mutex
+    if (child_vm.global_mutex) free(child_vm.global_mutex); // Free newly allocated one
+    child_vm.global_mutex = payload->parent_vm->global_mutex; 
+    
+    Value result = call_viper_function(payload->fn, payload->argCount, payload->args);
+    
+    payload->thread_obj->result = result;
+    payload->thread_obj->finished = true;
+    
+    if (payload->args) free(payload->args);
+    free(payload);
+    
+    // Teardown child VM execution memory
+    free(child_vm.frames);
+    free(child_vm.registers);
+    
+    return NULL;
+}
+
+Value call_viper_function(ObjFunction* fn, int argCount, Value* args) {
+    if (!current_vm) return (Value){VAL_NIL, {.number = 0}};
+    
+    // Push new frame
+    if (!ensure_frame_capacity(current_vm, current_vm->frame_count + 1)) {
+         vm_fatal_oom();
+    }
+    
+    int base = 0;
+    if (current_vm->frame_count > 0) {
+        CallFrame* last_frame = &current_vm->frames[current_vm->frame_count - 1];
+        base = last_frame->base + REGISTER_WINDOW;
+    }
+
+    if (!ensure_register_capacity(current_vm, base + REGISTER_WINDOW)) {
+        vm_fatal_oom();
+    }
+    
+    // Result dest
+    int dest = base + 255; 
+
+    // Put fn itself in base
+    current_vm->registers[base] = (Value){VAL_OBJ, {.obj = (Obj*)fn}};
+    // Put args in base + 1...
+    for (int i=0; i<argCount; i++) {
+        current_vm->registers[base + 1 + i] = args[i];
+    }
+    
+    CallFrame* frame = &current_vm->frames[current_vm->frame_count++];
+    frame->function = fn;
+    frame->ip = 0;
+    frame->base = base;
+    frame->return_dest = dest;
+
+    // Run VM until this frame is popped
+    interpret(current_vm, NULL); // NULL means continue with existing frames
+    
+    return current_vm->registers[dest];
+}
 
 static void vm_fatal_oom(void) {
     printf("VM Panic: Out of memory.\n");
     exit(1);
 }
+
+extern __thread const char* last_panic_msg;
 
 static bool ensure_frame_capacity(VM* vm, int needed) {
     if (vm->frame_capacity >= needed) return true;
@@ -65,16 +161,21 @@ int add_constant(Chunk* chunk, Value value) {
 }
 
 void init_vm(VM* vm) {
-    vm->frames = NULL;
-    vm->registers = NULL;
+    vm->frame_capacity = 64;
+    vm->frames = malloc(sizeof(CallFrame) * vm->frame_capacity);
     vm->frame_count = 0;
-    vm->frame_capacity = 0;
-    vm->register_capacity = 0;
-
-    if (!ensure_frame_capacity(vm, 64) ||
-        !ensure_register_capacity(vm, REGISTER_WINDOW)) {
-        vm_fatal_oom();
-    }
+    
+    vm->register_capacity = 1024;
+    vm->registers = malloc(sizeof(Value) * vm->register_capacity);
+    
+    vm->global_capacity = 64;
+    vm->global_names = malloc(sizeof(ObjString*) * vm->global_capacity);
+    vm->global_values = malloc(sizeof(Value) * vm->global_capacity);
+    vm->global_count = 0;
+    
+    vm->catch_count = 0;
+    vm->global_mutex = (pthread_mutex_t*)malloc(sizeof(pthread_mutex_t));
+    pthread_mutex_init(vm->global_mutex, NULL);
 }
 
 // Helper: get register from current frame's base
@@ -158,23 +259,67 @@ static Value read_ffi_value(void* src, ffi_type* f_type, char ret_char) {
     }
 }
 
-void interpret(VM* vm, ObjFunction* main_fn) {
-    if (!ensure_frame_capacity(vm, vm->frame_count + 1) ||
-        !ensure_register_capacity(vm, REGISTER_WINDOW)) {
-        vm_fatal_oom();
+static Value deep_clone_value(Value value) {
+    if (!IS_OBJ(value)) return value;
+
+    Obj* obj = AS_OBJ(value);
+    switch (obj->type) {
+        case OBJ_STRING: {
+            ObjString* s = (ObjString*)obj;
+            ObjString* copy = copy_string(s->chars, s->length);
+            return (Value){VAL_OBJ, {.obj = (Obj*)copy}};
+        }
+        case OBJ_ARRAY: {
+            ObjArray* src = (ObjArray*)obj;
+            ObjArray* out = new_array();
+            for (int i = 0; i < src->count; i++) {
+                array_append(out, deep_clone_value(src->elements[i]));
+            }
+            return (Value){VAL_OBJ, {.obj = (Obj*)out}};
+        }
+        case OBJ_INSTANCE: {
+            ObjInstance* src = (ObjInstance*)obj;
+            ObjInstance* out = new_instance(src->klass);
+            for (int i = 0; i < src->klass->field_count; i++) {
+                out->fields[i] = deep_clone_value(src->fields[i]);
+            }
+            return (Value){VAL_OBJ, {.obj = (Obj*)out}};
+        }
+        default:
+            // Non-data objects are shared by reference.
+            return value;
+    }
+}
+
+void interpret(VM* vm, struct sObjFunction* main_fn) {
+    current_vm = vm;
+    int stop_count = vm->frame_count > 0 ? vm->frame_count - 1 : 0;
+
+    if (main_fn) {
+        vm->frame_count = 0;
+        stop_count = 0;
+        if (!ensure_frame_capacity(vm, 1) || !ensure_register_capacity(vm, REGISTER_WINDOW)) {
+             vm_fatal_oom();
+        }
+        CallFrame* frame = &vm->frames[vm->frame_count++];
+        frame->function = main_fn;
+        frame->ip = 0;
+        frame->base = 0;
+        frame->return_dest = 0;
     }
 
-    CallFrame* frame = &vm->frames[vm->frame_count++];
-    frame->function = main_fn;
-    frame->ip = 0;
-    frame->base = 0; // top-level uses registers from 0
-    frame->return_dest = 0;
+    if (vm->frame_count == 0) return;
+    CallFrame* frame = &vm->frames[vm->frame_count - 1];
 
     for (;;) {
+        if (vm->frame_count <= stop_count) return; // Callback finished
+        frame = &vm->frames[vm->frame_count - 1]; // Refresh frame in case of stack changes
+        
         if (frame->ip >= (uint32_t)frame->function->chunk.count) {
             printf("VM Panic: IP out of bounds.\n");
             exit(1);
         }
+
         if (!ensure_register_capacity(vm, frame->base + REGISTER_WINDOW)) {
             vm_fatal_oom();
         }
@@ -193,11 +338,37 @@ void interpret(VM* vm, ObjFunction* main_fn) {
             case OP_LOAD_CONST:
                 FRAME_REG(frame, rA) = frame->function->chunk.constants[rB];
                 break;
-            case OP_ADD:
-                if (FRAME_REG(frame, rB).type == VAL_NUMBER && FRAME_REG(frame, rC).type == VAL_NUMBER) {
-                    FRAME_REG(frame, rA) = (Value){VAL_NUMBER, {.number = FRAME_REG(frame, rB).as.number + FRAME_REG(frame, rC).as.number}};
+            case OP_ADD: {
+                Value b = FRAME_REG(frame, rB);
+                Value c = FRAME_REG(frame, rC);
+                if (b.type == VAL_NUMBER && c.type == VAL_NUMBER) {
+                    FRAME_REG(frame, rA) = (Value){VAL_NUMBER, {.number = b.as.number + c.as.number}};
+                } else if (IS_OBJ(b) && AS_OBJ(b)->type == OBJ_STRING) {
+                    ObjString* sB = AS_STRING(b);
+                    char buf[1024];
+                    int len = 0;
+                    if (IS_OBJ(c) && AS_OBJ(c)->type == OBJ_STRING) {
+                        ObjString* sC = AS_STRING(c);
+                        len = snprintf(buf, sizeof(buf), "%s%s", sB->chars, sC->chars);
+                    } else if (c.type == VAL_NUMBER) {
+                        len = snprintf(buf, sizeof(buf), "%s%g", sB->chars, c.as.number);
+                    } else {
+                        len = snprintf(buf, sizeof(buf), "%s<obj>", sB->chars);
+                    }
+                    FRAME_REG(frame, rA) = (Value){VAL_OBJ, {.obj = (Obj*)copy_string(buf, len)}};
+                } else if (IS_OBJ(c) && AS_OBJ(c)->type == OBJ_STRING) {
+                    ObjString* sC = AS_STRING(c);
+                    char buf[1024];
+                    int len = 0;
+                    if (b.type == VAL_NUMBER) {
+                        len = snprintf(buf, sizeof(buf), "%g%s", b.as.number, sC->chars);
+                    } else {
+                        len = snprintf(buf, sizeof(buf), "<obj>%s", sC->chars);
+                    }
+                    FRAME_REG(frame, rA) = (Value){VAL_OBJ, {.obj = (Obj*)copy_string(buf, len)}};
                 }
                 break;
+            }
             case OP_SUB:
                 if (FRAME_REG(frame, rB).type == VAL_NUMBER && FRAME_REG(frame, rC).type == VAL_NUMBER) {
                     FRAME_REG(frame, rA) = (Value){VAL_NUMBER, {.number = FRAME_REG(frame, rB).as.number - FRAME_REG(frame, rC).as.number}};
@@ -224,11 +395,35 @@ void interpret(VM* vm, ObjFunction* main_fn) {
                     FRAME_REG(frame, rA) = (Value){VAL_NUMBER, {.number = FRAME_REG(frame, rB).as.number + FRAME_REG(frame, rC).as.number}};
                 }
                 break;
-            case OP_EQUAL:
-                if (FRAME_REG(frame, rB).type == VAL_NUMBER && FRAME_REG(frame, rC).type == VAL_NUMBER) {
-                    FRAME_REG(frame, rA) = (Value){VAL_BOOL, {.boolean = FRAME_REG(frame, rB).as.number == FRAME_REG(frame, rC).as.number}};
+            case OP_EQUAL: {
+                Value b = FRAME_REG(frame, rB);
+                Value c = FRAME_REG(frame, rC);
+                bool result = false;
+                if (b.type == c.type) {
+                    switch (b.type) {
+                        case VAL_NIL:    result = true; break;
+                        case VAL_BOOL:   result = b.as.boolean == c.as.boolean; break;
+                        case VAL_NUMBER: result = b.as.number == c.as.number; break;
+                        case VAL_OBJ: {
+                            Obj* objB = AS_OBJ(b);
+                            Obj* objC = AS_OBJ(c);
+                            if (objB->type == objC->type) {
+                                if (objB->type == OBJ_STRING) {
+                                    ObjString* sB = (ObjString*)objB;
+                                    ObjString* sC = (ObjString*)objC;
+                                    result = (sB->length == sC->length && 
+                                              memcmp(sB->chars, sC->chars, sB->length) == 0);
+                                } else {
+                                    result = (objB == objC);
+                                }
+                            }
+                            break;
+                        }
+                    }
                 }
+                FRAME_REG(frame, rA) = (Value){VAL_BOOL, {.boolean = result}};
                 break;
+            }
             case OP_LESS:
                 if (FRAME_REG(frame, rB).type == VAL_NUMBER && FRAME_REG(frame, rC).type == VAL_NUMBER) {
                     FRAME_REG(frame, rA) = (Value){VAL_BOOL, {.boolean = FRAME_REG(frame, rB).as.number < FRAME_REG(frame, rC).as.number}};
@@ -256,6 +451,16 @@ void interpret(VM* vm, ObjFunction* main_fn) {
                 if (cond.type == VAL_NIL) isFalse = true;
                 if (cond.type == VAL_NUMBER && cond.as.number == 0) isFalse = true;
                 if (isFalse) { uint16_t offset = (rB << 8) | rC; frame->ip += offset; }
+                break;
+            }
+            case OP_JUMP_IF_NIL: {
+                Value val = FRAME_REG(frame, rA);
+                if (val.type == VAL_NIL) { uint16_t offset = (rB << 8) | rC; frame->ip += offset; }
+                break;
+            }
+            case OP_JUMP_IF_NOT_NIL: {
+                Value val = FRAME_REG(frame, rA);
+                if (val.type != VAL_NIL) { uint16_t offset = (rB << 8) | rC; frame->ip += offset; }
                 break;
             }
             case OP_JUMP: {
@@ -300,8 +505,8 @@ void interpret(VM* vm, ObjFunction* main_fn) {
                         frame = next;
                     } else if (AS_OBJ(callee)->type == OBJ_STRUCT) {
                         ObjStruct* st = (ObjStruct*)AS_OBJ(callee);
-                        if (rB != st->field_count) {
-                            printf("Runtime Error: Expected %d fields for struct %s, got %d.\n", st->field_count, st->name, rB);
+                        if (rB > st->field_count) {
+                            printf("Runtime Error: Expected at most %d fields for struct %s, got %d.\n", st->field_count, st->name, rB);
                             exit(1);
                         }
                         ObjInstance* instance = new_instance(st);
@@ -415,7 +620,176 @@ void interpret(VM* vm, ObjFunction* main_fn) {
                 // Arguments are packed right before destination register.
                 Value* args = &vm->registers[frame->base + rC - rB];
                 Value result = native(rB, args);
+                
+                if (last_panic_msg != NULL) {
+                    if (vm->catch_count > 0) {
+                        CatchHandler* handler = &vm->catch_stack[--vm->catch_count];
+                        vm->frame_count = handler->frame_count;
+                        frame = &vm->frames[vm->frame_count - 1]; // Restore caught frame
+                        frame->ip = handler->catch_ip;            // Jump exactly to "else" branch
+                        continue; // Jump loop!
+                    } else {
+                        printf("Panic: %s\n", last_panic_msg);
+                        exit(1);
+                    }
+                }
+                
                 FRAME_REG(frame, rC) = result;
+                break;
+            }
+            case OP_GET_INDEX: {
+                Value target = FRAME_REG(frame, rB);
+                Value index = FRAME_REG(frame, rC);
+                if (IS_OBJ(target) && AS_OBJ(target)->type == OBJ_ARRAY) {
+                    if (!IS_NUMBER(index)) {
+                        printf("Runtime Error: Array index must be a number.\n");
+                        exit(1);
+                    }
+                    ObjArray* array = (ObjArray*)AS_OBJ(target);
+                    int idx = (int)index.as.number;
+                    if (idx < 0 || idx >= array->count) {
+                        printf("Runtime Error: Array index out of bounds.\n");
+                        exit(1);
+                    }
+                    FRAME_REG(frame, rA) = array->elements[idx];
+                } else if (IS_OBJ(target) && AS_OBJ(target)->type == OBJ_INSTANCE) {
+                    if (!IS_OBJ(index) || AS_OBJ(index)->type != OBJ_STRING) {
+                        printf("Runtime Error: Instance property index must be a string.\n");
+                        exit(1);
+                    }
+                    ObjInstance* instance = (ObjInstance*)AS_OBJ(target);
+                    ObjString* fieldName = AS_STRING(index);
+                    int idx = -1;
+                    for (int i = 0; i < instance->klass->field_count; i++) {
+                        if (instance->klass->field_name_lens[i] == fieldName->length &&
+                            memcmp(instance->klass->field_names[i], fieldName->chars, fieldName->length) == 0) {
+                            idx = i;
+                            break;
+                        }
+                    }
+                    if (idx == -1) {
+                        printf("Runtime Error: Undefined field '%.*s'\n", fieldName->length, fieldName->chars);
+                        exit(1);
+                    }
+                    FRAME_REG(frame, rA) = instance->fields[idx];
+                } else {
+                    printf("Runtime Error: Only arrays and instances support indexing.\n");
+                    exit(1);
+                }
+                break;
+            }
+            case OP_SET_INDEX: {
+                Value target = FRAME_REG(frame, rA);
+                Value index = FRAME_REG(frame, rB);
+                Value value = FRAME_REG(frame, rC);
+                if (IS_OBJ(target) && AS_OBJ(target)->type == OBJ_ARRAY) {
+                    if (!IS_NUMBER(index)) {
+                        printf("Runtime Error: Array index must be a number.\n");
+                        exit(1);
+                    }
+                    ObjArray* array = (ObjArray*)AS_OBJ(target);
+                    int idx = (int)index.as.number;
+                    if (idx < 0 || idx >= array->count) {
+                        printf("Runtime Error: Array index out of bounds.\n");
+                        exit(1);
+                    }
+                    array->elements[idx] = value;
+                } else if (IS_OBJ(target) && AS_OBJ(target)->type == OBJ_INSTANCE) {
+                    if (!IS_OBJ(index) || AS_OBJ(index)->type != OBJ_STRING) {
+                        printf("Runtime Error: Instance property index must be a string.\n");
+                        exit(1);
+                    }
+                    ObjInstance* instance = (ObjInstance*)AS_OBJ(target);
+                    ObjString* fieldName = AS_STRING(index);
+                    int idx = -1;
+                    for (int i = 0; i < instance->klass->field_count; i++) {
+                        if (instance->klass->field_name_lens[i] == fieldName->length &&
+                            memcmp(instance->klass->field_names[i], fieldName->chars, fieldName->length) == 0) {
+                            idx = i;
+                            break;
+                        }
+                    }
+                    if (idx == -1) {
+                        printf("Runtime Error: Undefined field '%.*s'\n", fieldName->length, fieldName->chars);
+                        exit(1);
+                    }
+                    instance->fields[idx] = value;
+                } else {
+                    printf("Runtime Error: Only arrays and instances support indexing.\n");
+                    exit(1);
+                }
+                break;
+            }
+            case OP_MATCH: {
+                Value target = FRAME_REG(frame, rB);
+                Value pattern = FRAME_REG(frame, rC);
+                if (!IS_OBJ(target) || AS_OBJ(target)->type != OBJ_STRING ||
+                    !IS_OBJ(pattern) || AS_OBJ(pattern)->type != OBJ_STRING) {
+                    FRAME_REG(frame, rA) = (Value){VAL_BOOL, {.boolean = false}};
+                    break;
+                }
+                
+                regex_t regex;
+                int ret = regcomp(&regex, AS_STRING(pattern)->chars, REG_EXTENDED);
+                if (ret) {
+                    FRAME_REG(frame, rA) = (Value){VAL_BOOL, {.boolean = false}};
+                    break;
+                }
+                
+                ret = regexec(&regex, AS_STRING(target)->chars, 0, NULL, 0);
+                regfree(&regex);
+                
+                FRAME_REG(frame, rA) = (Value){VAL_BOOL, {.boolean = (ret == 0)}};
+                break;
+            }
+            case OP_SPAWN: {
+                Value callee = FRAME_REG(frame, rB);
+                if (!IS_OBJ(callee) || AS_OBJ(callee)->type != OBJ_FUNCTION) {
+                    printf("Runtime Error: Can only spawn functions.\n");
+                    exit(1);
+                }
+                
+                ObjFunction* fn = (ObjFunction*)AS_OBJ(callee);
+                if (rC != fn->arity) {
+                    printf("Runtime Error: Spawn expected %d args, got %d.\n", fn->arity, rC);
+                    exit(1);
+                }
+                
+                ThreadPayload* payload = malloc(sizeof(ThreadPayload));
+                payload->fn = fn;
+                payload->argCount = rC;
+                payload->args = NULL;
+                if (rC > 0) {
+                    payload->args = malloc(sizeof(Value) * rC);
+                    for(int i=0; i<rC; i++) {
+                        payload->args[i] = vm->registers[frame->base + rB + 1 + i];
+                    }
+                }
+                
+                ObjThread* t = new_thread(0); 
+                payload->thread_obj = t;
+                payload->parent_vm = vm;
+                
+                if (pthread_create(&t->thread, NULL, spawn_runner, payload) != 0) {
+                    printf("Runtime Error: Failed to spawn thread.\n");
+                    exit(1);
+                }
+                
+                FRAME_REG(frame, rA) = (Value){VAL_OBJ, {.obj = (Obj*)t}};
+                break;
+            }
+            case OP_AWAIT: {
+                Value th = FRAME_REG(frame, rB);
+                if (!IS_OBJ(th) || AS_OBJ(th)->type != OBJ_THREAD) {
+                    printf("Runtime Error: Can only await Thread objects.\n");
+                    exit(1);
+                }
+                ObjThread* t = (ObjThread*)AS_OBJ(th);
+                if (!t->joined) {
+                    pthread_join(t->thread, NULL);
+                    t->joined = true;
+                }
+                FRAME_REG(frame, rA) = t->result;
                 break;
             }
             case OP_RETURN: {
@@ -423,13 +797,189 @@ void interpret(VM* vm, ObjFunction* main_fn) {
                 int dest     = frame->return_dest;
 
                 vm->frame_count--;
-                if (vm->frame_count == 0) return; // main returned
-
-                frame = &vm->frames[vm->frame_count - 1];
+                
+                // Ensure the return destination exists and store the result
                 if (!ensure_register_capacity(vm, dest + 1)) {
                     vm_fatal_oom();
                 }
                 vm->registers[dest] = retVal;
+
+                if (vm->frame_count == 0) return; // End of execution or top level return
+                frame = &vm->frames[vm->frame_count - 1];
+                break;
+            }
+            case OP_TYPEOF: {
+                Value val = FRAME_REG(frame, rB);
+                const char* type_str = "unknown";
+                
+                switch (val.type) {
+                    case VAL_NUMBER: type_str = "number"; break;
+                    case VAL_BOOL:   type_str = "bool"; break;
+                    case VAL_NIL:    type_str = "nil"; break;
+                    case VAL_OBJ:
+                        switch (AS_OBJ(val)->type) {
+                            case OBJ_STRING:       type_str = "string"; break;
+                            case OBJ_ARRAY:        type_str = "array"; break;
+                            case OBJ_FUNCTION:     type_str = "function"; break;
+                            case OBJ_STRUCT:       type_str = "struct"; break;
+                            case OBJ_INSTANCE:     type_str = "instance"; break;
+                            case OBJ_NATIVE:       type_str = "native"; break;
+                            case OBJ_DL_HANDLE:    type_str = "dl_handle"; break;
+                            case OBJ_DYNAMIC_FUNC: type_str = "dynamic_fn"; break;
+                            case OBJ_POINTER:      type_str = "pointer"; break;
+                            case OBJ_THREAD:       type_str = "thread"; break;
+                        }
+                        break;
+                }
+                
+                ObjString* strObj = copy_string(type_str, strlen(type_str));
+                FRAME_REG(frame, rA) = (Value){VAL_OBJ, {.obj = (Obj*)strObj}};
+                break;
+            }
+            case OP_CLONE: {
+                FRAME_REG(frame, rA) = deep_clone_value(FRAME_REG(frame, rB));
+                break;
+            }
+            case OP_ARRAY: {
+                int count = rB;
+                int startReg = rC;
+                
+                ObjArray* arr = new_array();
+                for (int i = 0; i < count; i++) {
+                    array_append(arr, FRAME_REG(frame, startReg + i));
+                }
+                
+                FRAME_REG(frame, rA) = (Value){VAL_OBJ, {.obj = (Obj*)arr}};
+                break;
+            }
+            case OP_SETUP_TRY: {
+                uint32_t current_ip = (frame->ip - 1); // Point back to start of instruction
+                uint16_t offset = (DECODE_B(inst) << 8) | DECODE_C(inst);
+                
+                if (vm->catch_count >= MAX_CATCH_HANDLERS) {
+                    printf("Runtime Error: Exceeded maximum nested try blocks.\n");
+                    exit(1);
+                }
+                
+                CatchHandler* handler = &vm->catch_stack[vm->catch_count++];
+                handler->catch_ip = current_ip + offset;
+                handler->target_vp = frame->base + rA;
+                handler->frame_count = vm->frame_count;
+                break;
+            }
+            case OP_TEARDOWN_TRY: {
+                vm->catch_count--;
+                break;
+            }
+            case OP_HAS: {
+                Value valObj = FRAME_REG(frame, rB);
+                Value valProp = FRAME_REG(frame, rC);
+                if (!IS_OBJ(valObj) || AS_OBJ(valObj)->type != OBJ_INSTANCE) {
+                    FRAME_REG(frame, rA) = (Value){VAL_BOOL, {.boolean = false}};
+                    break;
+                }
+                if (!IS_OBJ(valProp) || AS_OBJ(valProp)->type != OBJ_STRING) {
+                    FRAME_REG(frame, rA) = (Value){VAL_BOOL, {.boolean = false}};
+                    break;
+                }
+                ObjInstance* instance = (ObjInstance*)AS_OBJ(valObj);
+                ObjString* propName = AS_STRING(valProp);
+                bool found = false;
+                for (int i = 0; i < instance->klass->field_count; i++) {
+                    if (instance->klass->field_name_lens[i] == propName->length &&
+                        memcmp(instance->klass->field_names[i], propName->chars, propName->length) == 0) {
+                        found = true;
+                        break;
+                    }
+                }
+                FRAME_REG(frame, rA) = (Value){VAL_BOOL, {.boolean = found}};
+                break;
+            }
+            case OP_KEYS: {
+                Value valObj = FRAME_REG(frame, rB);
+                if (!IS_OBJ(valObj) || AS_OBJ(valObj)->type != OBJ_INSTANCE) {
+                    FRAME_REG(frame, rA) = (Value){VAL_OBJ, {.obj = (Obj*)new_array()}};
+                    break;
+                }
+                ObjInstance* instance = (ObjInstance*)AS_OBJ(valObj);
+                ObjArray* keys = new_array();
+                for (int i = 0; i < instance->klass->field_count; i++) {
+                    ObjString* s = copy_string(instance->klass->field_names[i], instance->klass->field_name_lens[i]);
+                    array_append(keys, (Value){VAL_OBJ, {.obj = (Obj*)s}});
+                }
+                FRAME_REG(frame, rA) = (Value){VAL_OBJ, {.obj = (Obj*)keys}};
+                break;
+            }
+            case OP_EVAL: {
+                Value valCode = FRAME_REG(frame, rB);
+                if (!IS_OBJ(valCode) || AS_OBJ(valCode)->type != OBJ_STRING) {
+                    printf("Runtime Error: eval() expects string.\n");
+                    exit(1);
+                }
+                ObjString* codeStr = AS_STRING(valCode);
+                AstNode* ast = parse(codeStr->chars);
+                if (!ast) {
+                    printf("Runtime Error: eval() failed to parse code.\n");
+                    exit(1);
+                }
+                
+                // We want eval to return a value, so force compiler to emit RETURN instead of HALT
+                compiler_set_emit_halt(false);
+                ObjFunction* fn = compile(ast);
+                compiler_set_emit_halt(true); // Restore default
+                
+                if (!fn) {
+                    printf("Runtime Error: eval() failed to compile code.\n");
+                    exit(1);
+                }
+                
+                Value result = call_viper_function(fn, 0, NULL);
+                FRAME_REG(frame, rA) = result;
+                break;
+            }
+            case OP_SYNC_START: {
+                pthread_mutex_lock(vm->global_mutex);
+                break;
+            }
+            case OP_SYNC_END: {
+                pthread_mutex_unlock(vm->global_mutex);
+                break;
+            }
+            case OP_GET_GLOBAL: {
+                ObjString* name = AS_STRING(frame->function->chunk.constants[rB]);
+                Value val = (Value){VAL_NIL, {.number = 0}};
+                for (int i = 0; i < vm->global_count; i++) {
+                    if (vm->global_names[i]->length == name->length &&
+                        memcmp(vm->global_names[i]->chars, name->chars, name->length) == 0) {
+                        val = vm->global_values[i];
+                        break;
+                    }
+                }
+                FRAME_REG(frame, rA) = val;
+                break;
+            }
+            case OP_SET_GLOBAL: {
+                ObjString* name = AS_STRING(frame->function->chunk.constants[rB]);
+                Value val = FRAME_REG(frame, rA);
+                int found = -1;
+                for (int i = 0; i < vm->global_count; i++) {
+                    if (vm->global_names[i]->length == name->length &&
+                        memcmp(vm->global_names[i]->chars, name->chars, name->length) == 0) {
+                        found = i; break;
+                    }
+                }
+                if (found != -1) {
+                    vm->global_values[found] = val;
+                } else {
+                    if (vm->global_count >= vm->global_capacity) {
+                        vm->global_capacity = vm->global_capacity < 8 ? 8 : vm->global_capacity * 2;
+                        vm->global_names = realloc(vm->global_names, sizeof(ObjString*) * vm->global_capacity);
+                        vm->global_values = realloc(vm->global_values, sizeof(Value) * vm->global_capacity);
+                    }
+                    vm->global_names[vm->global_count] = name;
+                    vm->global_values[vm->global_count] = val;
+                    vm->global_count++;
+                }
                 break;
             }
             case OP_HALT:

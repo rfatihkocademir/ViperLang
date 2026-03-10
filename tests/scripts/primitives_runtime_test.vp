@@ -1,0 +1,16 @@
+use "@std/os" as os
+use "@std/meta" as meta
+
+fn tick() {
+    pr("cron_tick")
+}
+
+pr("primitives_runtime_test")
+
+v sh_res = os.sh("printf hello")
+pr(sh_res)
+
+v cron_runs = os_cron("@every 1ms", tick, 2)
+pr("cron_runs", cron_runs)
+
+pr(meta.symbols())

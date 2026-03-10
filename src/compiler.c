@@ -11,6 +11,9 @@
 #include "vm.h"
 #include "native.h"
 
+ObjFunction* new_function(const char* name, int name_len, int arity);
+static void register_function_prototypes(AstNode* node, const char* alias, int alias_len);
+
 // ---- Local Variable Table -----------------------------------------------
 
 typedef struct {
@@ -28,6 +31,10 @@ typedef struct {
 
 static char entry_file_path[MAX_PATH_LEN];
 static char project_root_path[MAX_PATH_LEN];
+
+static char current_module_alias[MAX_NAMESPACE_ALIAS_LEN];
+static int current_alias_len = 0;
+
 static char** module_dir_stack = NULL;
 static int module_dir_depth = 0;
 static int module_dir_cap = 0;
@@ -100,6 +107,28 @@ static bool build_vbc_path(const char* module_path, char* out, size_t out_size) 
     out[n] = 'c';
     out[n + 1] = '\0';
     return true;
+}
+
+static char* unescape_string(const char* src, int len, int* out_len) {
+    char* res = malloc(len + 1);
+    int j = 0;
+    for (int i = 0; i < len; i++) {
+        if (src[i] == '\\' && i + 1 < len) {
+            switch (src[i+1]) {
+                case 'n': res[j++] = '\n'; i++; break;
+                case 'r': res[j++] = '\r'; i++; break;
+                case 't': res[j++] = '\t'; i++; break;
+                case '"': res[j++] = '"';  i++; break;
+                case '\\': res[j++] = '\\'; i++; break;
+                default: res[j++] = src[i]; break;
+            }
+        } else {
+            res[j++] = src[i];
+        }
+    }
+    res[j] = '\0';
+    if (out_len) *out_len = j;
+    return res;
 }
 
 static bool build_vbb_path(const char* module_path, char* out, size_t out_size) {
@@ -446,6 +475,24 @@ static void decode_use_path(Token token, char* out, size_t out_size) {
 }
 
 static void resolve_module_path(const char* raw_path, char* out, size_t out_size) {
+    if (strncmp(raw_path, "@std/", 5) == 0) {
+        // Resolve to project_root/lib/std/name.vp
+        detect_project_root();
+        char std_dir[MAX_PATH_LEN];
+        if (project_root_path[0] != '\0') {
+            join_path2(project_root_path, "lib/std", std_dir, sizeof(std_dir));
+        } else {
+            // Fallback for isolated files
+            copy_path(std_dir, sizeof(std_dir), "lib/std");
+        }
+        join_path2(std_dir, raw_path + 5, out, out_size);
+        // Ensure .vp extension if missing and it's a file
+        size_t len = strlen(out);
+        if (len < 3 || strcmp(out + len - 3, ".vp") != 0) {
+            strncat(out, ".vp", out_size - len - 1);
+        }
+        return;
+    }
     if (is_package_import(raw_path)) {
         resolve_package_path(raw_path, out, out_size);
         return;
@@ -555,7 +602,9 @@ static void clear_namespace_registry(void) {
 
 static int find_namespace_entry(const char* alias, int alias_len,
                                 int kind, const char* name, int name_len) {
-    if (!alias || alias_len <= 0 || !name || name_len <= 0) return -1;
+    if (!name || name_len <= 0) return -1;
+    // Normalize NULL alias to empty string for consistent comparison
+    if (!alias) { alias = ""; alias_len = 0; }
     for (int i = 0; i < ns_count; i++) {
         NamespaceEntry* entry = &ns_registry[i];
         if (entry->kind != kind) continue;
@@ -571,7 +620,9 @@ static int find_namespace_entry(const char* alias, int alias_len,
 static bool register_namespace_symbol(const char* alias, int alias_len,
                                       int kind, const char* name, int name_len,
                                       Obj* obj, const char* module_path) {
-    if (!alias || alias_len <= 0 || !name || name_len <= 0 || !obj) return false;
+    if (!name || name_len <= 0 || !obj) return false;
+    if (!alias) { alias = ""; alias_len = 0; }
+    
     if (alias_len >= MAX_NAMESPACE_ALIAS_LEN) {
         printf("Compiler Error: Namespace alias too long for import '%s'.\n", module_path);
         return false;
@@ -1208,16 +1259,34 @@ static int compile_expr(AstNode* expr) {
     if (!expr) return -1;
 
     if (expr->type == AST_NUMBER) {
+        int ci = add_constant(current_chunk(), (Value){VAL_NUMBER, {.number = expr->data.number_val}});
+        int rD = cst.next_reg++;
+        write_chunk(current_chunk(), ENCODE_INST(OP_LOAD_CONST, rD, ci, 0));
+        return rD;
+    }
+
+    if (expr->type == AST_NIL) {
+        int ci = add_constant(current_chunk(), (Value){VAL_NIL, {.number = 0}});
+        int rD = cst.next_reg++;
+        write_chunk(current_chunk(), ENCODE_INST(OP_LOAD_CONST, rD, ci, 0));
+        return rD;
+    }
+
+    if (expr->type == AST_STRING) {
         int reg = cst.next_reg++;
-        Value val = {VAL_NUMBER, {.number = expr->data.number_val}};
+        int unescaped_len = 0;
+        char* unescaped = unescape_string(expr->data.str_val.name, expr->data.str_val.length, &unescaped_len);
+        ObjString* s = copy_string(unescaped, unescaped_len);
+        free(unescaped);
+        Value val = {VAL_OBJ, {.obj = (Obj*)s}};
         int ci = add_constant(current_chunk(), val);
         write_chunk(current_chunk(), ENCODE_INST(OP_LOAD_CONST, reg, ci, 0));
         return reg;
     }
 
-    if (expr->type == AST_STRING) {
+    if (expr->type == AST_REGEX) {
         int reg = cst.next_reg++;
-        ObjString* s = copy_string(expr->data.str_val.name, expr->data.str_val.length);
+        ObjString* s = copy_string(expr->data.regex.pattern, expr->data.regex.length);
         Value val = {VAL_OBJ, {.obj = (Obj*)s}};
         int ci = add_constant(current_chunk(), val);
         write_chunk(current_chunk(), ENCODE_INST(OP_LOAD_CONST, reg, ci, 0));
@@ -1227,6 +1296,28 @@ static int compile_expr(AstNode* expr) {
     if (expr->type == AST_IDENTIFIER) {
         int reg = resolve_local(expr->data.identifier.name.start, expr->data.identifier.name.length);
         if (reg == -1) {
+            // Check globals
+            for (int i=0; i<global_var_count; i++) {
+                if (global_vars[i].length == expr->data.identifier.name.length &&
+                    memcmp(global_vars[i].name, expr->data.identifier.name.start, global_vars[i].length) == 0) {
+                    
+                    int rD = cst.next_reg++;
+                    ObjString* nameObj = copy_string(global_vars[i].name, global_vars[i].length);
+                    int ci = add_constant(current_chunk(), (Value){VAL_OBJ, {.obj = (Obj*)nameObj}});
+                    write_chunk(current_chunk(), ENCODE_INST(OP_GET_GLOBAL, rD, ci, 0));
+                    return rD;
+                }
+            }
+
+            // [NEW] Check for functions in global registry (Forward Reference support)
+            ObjFunction* fn = resolve_namespace_function(NULL, 0, expr->data.identifier.name.start, expr->data.identifier.name.length);
+            if (fn) {
+                int rD = cst.next_reg++;
+                int ci = add_constant(current_chunk(), (Value){VAL_OBJ, {.obj = (Obj*)fn}});
+                write_chunk(current_chunk(), ENCODE_INST(OP_LOAD_CONST, rD, ci, 0));
+                return rD;
+            }
+
             printf("Compiler Error: Undefined variable '%.*s'\n",
                 expr->data.identifier.name.length, expr->data.identifier.name.start);
             exit(1);
@@ -1237,12 +1328,52 @@ static int compile_expr(AstNode* expr) {
     if (expr->type == AST_ASSIGN_EXPR) {
         int src = compile_expr(expr->data.assign.value);
         int dst = resolve_local(expr->data.assign.name.start, expr->data.assign.name.length);
-        if (dst == -1) { printf("Compiler Error: Undefined variable for assignment\n"); exit(1); }
-        write_chunk(current_chunk(), ENCODE_INST(OP_MOVE, dst, src, 0));
-        return dst;
+        if (dst != -1) {
+            write_chunk(current_chunk(), ENCODE_INST(OP_MOVE, dst, src, 0));
+            return dst;
+        }
+
+        // Check globals
+        for (int i = 0; i < global_var_count; i++) {
+            if (global_vars[i].length == expr->data.assign.name.length &&
+                memcmp(global_vars[i].name, expr->data.assign.name.start, global_vars[i].length) == 0) {
+                
+                ObjString* nameObj = copy_string(global_vars[i].name, global_vars[i].length);
+                int ci = add_constant(current_chunk(), (Value){VAL_OBJ, {.obj = (Obj*)nameObj}});
+                write_chunk(current_chunk(), ENCODE_INST(OP_SET_GLOBAL, src, ci, 0));
+                return src; 
+            }
+        }
+
+        printf("Compiler Error: Undefined variable '%.*s' for assignment\n",
+            expr->data.assign.name.length, expr->data.assign.name.start);
+        exit(1);
     }
 
     if (expr->type == AST_BINARY_EXPR) {
+        if (expr->data.binary.op.type == TOKEN_QUESTION_QUESTION) {
+            int rL = compile_expr(expr->data.binary.left);
+            int destReg = cst.next_reg++;
+            
+            // Move left result to dest
+            write_chunk(current_chunk(), ENCODE_INST(OP_MOVE, destReg, rL, 0));
+            
+            // If NOT NIL, jump over right side evaluation
+            int jumpOverRight = current_chunk()->count;
+            write_chunk(current_chunk(), ENCODE_INST(OP_JUMP_IF_NOT_NIL, destReg, 0, 0));
+            
+            // Right side evaluation
+            int rR = compile_expr(expr->data.binary.right);
+            write_chunk(current_chunk(), ENCODE_INST(OP_MOVE, destReg, rR, 0));
+            
+            // Patch jump
+            int offset = current_chunk()->count - jumpOverRight - 1;
+            Instruction* p_inst = &current_chunk()->code[jumpOverRight];
+            *p_inst = ENCODE_INST(OP_JUMP_IF_NOT_NIL, destReg, (offset >> 8) & 0xFF, offset & 0xFF);
+            
+            return destReg;
+        }
+
         int rL = compile_expr(expr->data.binary.left);
         int rR = compile_expr(expr->data.binary.right);
         int rD = cst.next_reg++;
@@ -1261,6 +1392,31 @@ static int compile_expr(AstNode* expr) {
         }
         write_chunk(current_chunk(), ENCODE_INST(op, rD, rL, rR));
         return rD;
+    }
+
+    if (expr->type == AST_MATCH_EXPR) {
+        int rL = compile_expr(expr->data.match_expr.left);
+        int rR = compile_expr(expr->data.match_expr.right);
+        int rD = cst.next_reg++;
+        write_chunk(current_chunk(), ENCODE_INST(OP_MATCH, rD, rL, rR));
+        return rD;
+    }
+
+    if (expr->type == AST_INDEX_EXPR) {
+        int rObj = compile_expr(expr->data.index_expr.target);
+        int rIdx = compile_expr(expr->data.index_expr.index);
+        
+        if (expr->data.index_expr.value) {
+            // SET_INDEX
+            int rVal = compile_expr(expr->data.index_expr.value);
+            write_chunk(current_chunk(), ENCODE_INST(OP_SET_INDEX, rObj, rIdx, rVal));
+            return rVal;
+        } else {
+            // GET_INDEX
+            int rDest = cst.next_reg++;
+            write_chunk(current_chunk(), ENCODE_INST(OP_GET_INDEX, rDest, rObj, rIdx));
+            return rDest;
+        }
     }
 
     if (expr->type == AST_CALL_EXPR) {
@@ -1357,9 +1513,15 @@ static int compile_expr(AstNode* expr) {
                     free(arg_regs);
                     return destReg;
                 } else {
-                    printf("Compiler Error: Unknown callable '%.*s' (len=%d)\n", namelen, name, namelen);
-                    free(arg_regs);
-                    exit(1);
+                    // [NEW] Late binding for global functions
+                    ObjFunction* late_fn = resolve_namespace_function(NULL, 0, name, namelen);
+                    if (late_fn) {
+                        callee_fn = late_fn;
+                    } else {
+                        printf("Compiler Error: Unknown callable '%.*s'\n", namelen, name);
+                        free(arg_regs);
+                        exit(1);
+                    }
                 }
             }
         } else {
@@ -1400,14 +1562,186 @@ static int compile_expr(AstNode* expr) {
         return destReg;
     }
 
+    if (expr->type == AST_SPAWN_EXPR) {
+        AstNode* call_expr = expr->data.spawn_expr.expr;
+        if (call_expr->type != AST_CALL_EXPR) {
+            printf("Compiler Error: 'spawn' keyword requires a function call.\n");
+            exit(1);
+        }
+        
+        const char* name = call_expr->data.call_expr.name.start;
+        int namelen      = call_expr->data.call_expr.name.length;
+        int arg_count    = call_expr->data.call_expr.arg_count;
+        int* arg_regs = NULL;
+        ObjFunction* callee_fn = resolve_function(name, namelen);
+        if (!callee_fn) callee_fn = resolve_namespace_function(NULL, 0, name, namelen);
+        
+        if (!callee_fn) {
+            printf("Compiler Error: Unknown spawn callable '%.*s'\n", namelen, name);
+            exit(1);
+        }
+        
+        if (arg_count > 0) {
+            arg_regs = malloc(sizeof(int) * arg_count);
+            for (int i=0; i<arg_count; i++) {
+                arg_regs[i] = compile_expr(call_expr->data.call_expr.args[i]);
+            }
+        }
+        
+        int fnReg = cst.next_reg++;
+        Value val = {VAL_OBJ, {.obj = (Obj*)callee_fn}};
+        int ci = add_constant(current_chunk(), val);
+        write_chunk(current_chunk(), ENCODE_INST(OP_LOAD_CONST, fnReg, ci, 0));
+        
+        for (int i = 0; i < arg_count; i++) {
+            int argReg = cst.next_reg++;
+            write_chunk(current_chunk(), ENCODE_INST(OP_MOVE, argReg, arg_regs[i], 0));
+        }
+        
+        int destReg = cst.next_reg++;
+        write_chunk(current_chunk(), ENCODE_INST(OP_SPAWN, destReg, fnReg, (uint8_t)arg_count));
+        if(arg_regs) free(arg_regs);
+        return destReg;
+    }
+
+    if (expr->type == AST_AWAIT_EXPR) {
+        int rHandle = compile_expr(expr->data.await_expr.expr);
+        int destReg = cst.next_reg++;
+        write_chunk(current_chunk(), ENCODE_INST(OP_AWAIT, destReg, rHandle, 0));
+        return destReg;
+    }
+
+    if (expr->type == AST_TRY_EXPR) {
+        int destReg = cst.next_reg++;
+        
+        // Emits OP_SETUP_TRY <destReg> 0 0
+        int setup_inst_index = current_chunk()->count;
+        write_chunk(current_chunk(), ENCODE_INST(OP_SETUP_TRY, destReg, 0, 0));
+        
+        int tryReg = compile_expr(expr->data.try_expr.try_block);
+        if (tryReg != destReg) {
+            write_chunk(current_chunk(), ENCODE_INST(OP_MOVE, destReg, tryReg, 0));
+        }
+        
+        // Success: Cancel the panic interceptor
+        write_chunk(current_chunk(), ENCODE_INST(OP_TEARDOWN_TRY, 0, 0, 0));
+        
+        // Success: Skip the else branch
+        int jump_over_catch_index = current_chunk()->count;
+        write_chunk(current_chunk(), ENCODE_INST(OP_JUMP, 0, 0, 0));
+        
+        // Patch SETUP_TRY targeting here!
+        int catch_offset = current_chunk()->count - setup_inst_index;
+        Instruction* p_setup = &current_chunk()->code[setup_inst_index];
+        *p_setup = ENCODE_INST(OP_SETUP_TRY, destReg, (catch_offset >> 8) & 0xFF, catch_offset & 0xFF);
+        
+        // Else Block Compilation
+        int catchReg = compile_expr(expr->data.try_expr.catch_block);
+        if (catchReg != destReg) {
+            write_chunk(current_chunk(), ENCODE_INST(OP_MOVE, destReg, catchReg, 0));
+        }
+        
+        // Patch JUMP targeting here!
+        int end_offset = current_chunk()->count - jump_over_catch_index;
+        Instruction* p_end = &current_chunk()->code[jump_over_catch_index];
+        *p_end = ENCODE_INST(OP_JUMP, 0, (end_offset >> 8) & 0xFF, end_offset & 0xFF);
+        
+        return destReg;
+    }
+
+    if (expr->type == AST_TYPEOF_EXPR) {
+        int rVal = compile_expr(expr->data.typeof_expr.expr);
+        int destReg = cst.next_reg++;
+        write_chunk(current_chunk(), ENCODE_INST(OP_TYPEOF, destReg, rVal, 0));
+        return destReg;
+    }
+
+    if (expr->type == AST_CLONE_EXPR) {
+        int rVal = compile_expr(expr->data.clone_expr.expr);
+        int destReg = cst.next_reg++;
+        write_chunk(current_chunk(), ENCODE_INST(OP_CLONE, destReg, rVal, 0));
+        return destReg;
+    }
+
+    if (expr->type == AST_EVAL_EXPR) {
+        int rCode = compile_expr(expr->data.clone_expr.expr); 
+        int rDest = cst.next_reg++;
+        write_chunk(current_chunk(), ENCODE_INST(OP_EVAL, rDest, rCode, 0));
+        return rDest;
+    }
+
+    if (expr->type == AST_KEYS_EXPR) {
+        int rObj = compile_expr(expr->data.clone_expr.expr);
+        int rDest = cst.next_reg++;
+        write_chunk(current_chunk(), ENCODE_INST(OP_KEYS, rDest, rObj, 0));
+        return rDest;
+    }
+
+    if (expr->type == AST_HAS_EXPR) {
+        int rObj = compile_expr(expr->data.has_expr.obj);
+        int rProp = compile_expr(expr->data.has_expr.prop);
+        int rDest = cst.next_reg++;
+        write_chunk(current_chunk(), ENCODE_INST(OP_HAS, rDest, rObj, rProp));
+        return rDest;
+    }
+
+    if (expr->type == AST_ARRAY_EXPR) {
+        int count = expr->data.array_expr.count;
+        int startReg = cst.next_reg;
+        for (int i = 0; i < count; i++) {
+            int elemReg = compile_expr(expr->data.array_expr.elements[i]);
+            if (elemReg != startReg + i) {
+                write_chunk(current_chunk(), ENCODE_INST(OP_MOVE, startReg + i, elemReg, 0));
+            }
+            if (cst.next_reg <= startReg + i) cst.next_reg = startReg + i + 1;
+        }
+        int destReg = cst.next_reg++;
+        write_chunk(current_chunk(), ENCODE_INST(OP_ARRAY, destReg, count, startReg));
+        return destReg;
+    }
+
     if (expr->type == AST_GET_EXPR) {
         int rObj = compile_expr(expr->data.get_expr.obj);
-        int rDest = cst.next_reg++;
-        // Add field name as a string constant
+        int destReg = cst.next_reg++;
         ObjString* fieldName = copy_string(expr->data.get_expr.name.start, expr->data.get_expr.name.length);
         int ci = add_constant(current_chunk(), (Value){VAL_OBJ, {.obj = (Obj*)fieldName}});
-        write_chunk(current_chunk(), ENCODE_INST(OP_GET_FIELD, rDest, rObj, ci));
-        return rDest;
+        write_chunk(current_chunk(), ENCODE_INST(OP_GET_FIELD, destReg, rObj, ci));
+        return destReg;
+    }
+
+    if (expr->type == AST_SAFE_GET_EXPR) {
+        int rObj = compile_expr(expr->data.get_expr.obj);
+        int destReg = cst.next_reg++;
+        
+        // Handle nil check
+        int jumpIfNil = current_chunk()->count;
+        write_chunk(current_chunk(), ENCODE_INST(OP_JUMP_IF_NIL, rObj, 0, 0));
+        
+        // Regular get
+        ObjString* fieldName = copy_string(expr->data.get_expr.name.start, expr->data.get_expr.name.length);
+        int ci = add_constant(current_chunk(), (Value){VAL_OBJ, {.obj = (Obj*)fieldName}});
+        write_chunk(current_chunk(), ENCODE_INST(OP_GET_FIELD, destReg, rObj, ci));
+        
+        // Jump over nil-result assignment
+        int jumpEnd = current_chunk()->count;
+        write_chunk(current_chunk(), ENCODE_INST(OP_JUMP, 0, 0, 0));
+        
+        // Target for NIL check
+        int nilOffset = current_chunk()->count - jumpIfNil - 1;
+        Instruction* p_nil = &current_chunk()->code[jumpIfNil];
+        *p_nil = ENCODE_INST(OP_JUMP_IF_NIL, rObj, (nilOffset >> 8) & 0xFF, nilOffset & 0xFF);
+        
+        // Load NIL into destReg
+        Value nilVal = {VAL_NIL, {.number = 0}};
+        int nilCi = add_constant(current_chunk(), nilVal);
+        write_chunk(current_chunk(), ENCODE_INST(OP_LOAD_CONST, destReg, nilCi, 0));
+        
+        // Patch end jump
+        int endOffset = current_chunk()->count - jumpEnd - 1;
+        Instruction* p_end = &current_chunk()->code[jumpEnd];
+        *p_end = ENCODE_INST(OP_JUMP, 0, (endOffset >> 8) & 0xFF, endOffset & 0xFF);
+        
+        return destReg;
     }
 
     if (expr->type == AST_SET_EXPR) {
@@ -1437,12 +1771,21 @@ static void compile_stmt(AstNode* stmt) {
         if (cst.scope_depth == 0) {
             register_global_symbol(stmt->data.var_decl.name.start,
                                    stmt->data.var_decl.name.length);
+            
+            ObjString* nameObj = copy_string(stmt->data.var_decl.name.start, stmt->data.var_decl.name.length);
+            int ci = add_constant(current_chunk(), (Value){VAL_OBJ, {.obj = (Obj*)nameObj}});
+            write_chunk(current_chunk(), ENCODE_INST(OP_SET_GLOBAL, reg, ci, 0));
         }
     }
     else if (stmt->type == AST_BLOCK_STMT) {
         begin_scope();
         for (int i = 0; i < stmt->data.block.count; i++) compile_stmt(stmt->data.block.statements[i]);
         end_scope();
+    }
+    else if (stmt->type == AST_SYNC_STMT) {
+        write_chunk(current_chunk(), ENCODE_INST(OP_SYNC_START, 0, 0, 0));
+        compile_stmt(stmt->data.sync_stmt.body);
+        write_chunk(current_chunk(), ENCODE_INST(OP_SYNC_END, 0, 0, 0));
     }
     else if (stmt->type == AST_IF_STMT) {
         int rCond      = compile_expr(stmt->data.if_stmt.condition);
@@ -1470,38 +1813,28 @@ static void compile_stmt(AstNode* stmt) {
             write_chunk(current_chunk(), ENCODE_INST(OP_RETURN, 0, 0, 0));
         }
     }
-    else if (stmt->type == AST_FUNC_DECL) {
-        // Create a new ObjFunction and compile the body into it
-        ObjFunction* fn = new_function(
-            stmt->data.func_decl.name.start,
-            stmt->data.func_decl.name.length,
-            stmt->data.func_decl.param_count
-        );
-
-        // Register globally so call expressions can find it
-        register_function_symbol(fn);
-
-        // Save outer compiler state and start compiling the function body
-        CompilerState outer = cst;
-        init_compiler(fn);
-
-        // Bind parameters as locals at register 1..N (R0 is bookkeeping)
-        for (int i = 0; i < stmt->data.func_decl.param_count; i++) {
-            add_local(stmt->data.func_decl.params[i].start,
-                      stmt->data.func_decl.params[i].length,
-                      cst.next_reg++,
-                      0);
+    if (stmt->type == AST_FUNC_DECL) {
+        // Find already registered prototype
+        ObjFunction* fn = resolve_namespace_function(current_module_alias, current_alias_len,
+                                                       stmt->data.func_decl.name.start, stmt->data.func_decl.name.length);
+        if (!fn) {
+             printf("Compiler Error: Proto for %.*s not found (alias: %.*s)\n", 
+                    stmt->data.func_decl.name.length, stmt->data.func_decl.name.start,
+                    current_alias_len, current_module_alias);
+             exit(1);
         }
-
-        // Compile function body
+        
+        CompilerState prevCompiler = cst;
+        init_compiler(fn);
+        begin_scope();
+        for (int i = 0; i < stmt->data.func_decl.param_count; i++) {
+            add_local(stmt->data.func_decl.params[i].start, stmt->data.func_decl.params[i].length, cst.next_reg++, 0);
+        }
         compile_stmt(stmt->data.func_decl.body);
-
-        // Implicit return nil if no explicit ret
         write_chunk(current_chunk(), ENCODE_INST(OP_RETURN, 0, 0, 0));
-
+        end_scope();
         free(cst.locals);
-        // Restore outer state
-        cst = outer;
+        cst = prevCompiler;
     }
     else if (stmt->type == AST_STRUCT_DECL) {
         // Prepare arrays of field names and lengths
@@ -1586,6 +1919,22 @@ static void compile_stmt(AstNode* stmt) {
         push_module_dir(module_dir);
         AstNode* mod_ast = parse(source);
 
+        // --- NEW: Handle Aliased Prototype Registration ---
+        char prev_alias[MAX_NAMESPACE_ALIAS_LEN];
+        int prev_alias_len = current_alias_len;
+        memcpy(prev_alias, current_module_alias, MAX_NAMESPACE_ALIAS_LEN);
+
+        if (alias_len > 0) {
+            memcpy(current_module_alias, alias_buf, alias_len + 1);
+            current_alias_len = alias_len;
+        } else {
+            // If no alias, it's a flat import into current namespace (or global)
+            // But we still need prototypes to be searchable.
+            // For now, let's keep current alias if it's set.
+        }
+
+        register_function_prototypes(mod_ast, current_module_alias, current_alias_len);
+
         ExportDecl* exports = NULL;
         int export_count = 0;
         bool has_public = false;
@@ -1599,6 +1948,11 @@ static void compile_stmt(AstNode* stmt) {
                 compile_stmt(mod_ast->data.block.statements[i]);
             }
         }
+        
+        // Restore alias
+        memcpy(current_module_alias, prev_alias, MAX_NAMESPACE_ALIAS_LEN);
+        current_alias_len = prev_alias_len;
+        
         pop_module_dir();
 
         bool apply_public_filter = is_package_import(raw_path) && has_public;
@@ -1613,7 +1967,7 @@ static void compile_stmt(AstNode* stmt) {
                 exit(1);
             }
         }
-        free(exports);
+        free(exports); 
 
         // Note: We do NOT free(source) here because names of functions/structs 
         // compiled from this module point directly into this source string.
@@ -1647,19 +2001,42 @@ void generate_contract() {
     printf("-----------------\n\n");
 }
 
-ObjFunction* compile(AstNode* ast) {
+static void register_function_prototypes(AstNode* node, const char* alias, int alias_len) {
+    if (!node) return;
+    if (node->type == AST_PROGRAM || node->type == AST_BLOCK_STMT) {
+        for (int i=0; i < node->data.block.count; i++) {
+            register_function_prototypes(node->data.block.statements[i], alias, alias_len);
+        }
+    } else if (node->type == AST_FUNC_DECL) {
+        ObjFunction* fn = new_function(node->data.func_decl.name.start, 
+                                       node->data.func_decl.name.length,
+                                       node->data.func_decl.param_count);
+        register_function_symbol(fn);
+        register_namespace_symbol(alias, alias_len, ABI_KIND_FUNCTION, fn->name, fn->name_len, (Obj*)fn, "builtin");
+    }
+}
+
+ObjFunction* compile(AstNode* program) {
+    if (!program) return NULL;
     clear_imported_modules();
     clear_module_dirs();
     clear_namespace_registry();
-    if (cst.locals) {
-        free(cst.locals);
-        cst.locals = NULL;
-    }
     fn_count = 0;
     st_count = 0;
     global_var_count = 0;
     cst.local_cap = 0;
     cst.local_count = 0;
+    if (cst.locals) {
+        free(cst.locals);
+        cst.locals = NULL;
+    }
+    
+    current_module_alias[0] = '\0';
+    current_alias_len = 0;
+    
+    // Pass 1: Register all top-level functions (MUST happen after clear)
+    register_function_prototypes(program, NULL, 0);
+
     detect_project_root();
 
     char entry_dir[MAX_PATH_LEN];
@@ -1670,16 +2047,25 @@ ObjFunction* compile(AstNode* ast) {
     }
     push_module_dir(entry_dir);
 
-    // Wrap all top-level code in an implicit "main" function
     ObjFunction* main_fn = new_function("__main__", 8, 0);
-    init_compiler(main_fn);
 
-    if (ast->type == AST_PROGRAM) {
-        for (int i = 0; i < ast->data.block.count; i++) {
-            compile_stmt(ast->data.block.statements[i]);
+    // Pass 2: Compile
+    init_compiler(main_fn);
+    if (program->type == AST_PROGRAM) {
+        for (int i = 0; i < program->data.block.count; i++) {
+            AstNode* stmt = program->data.block.statements[i];
+            if (!emit_halt_enabled && i == program->data.block.count - 1 && stmt->type == AST_EXPR_STMT) {
+                // For eval(), make sure the last expression result lands in R0
+                int r = compile_expr(stmt->data.expr_stmt.expr);
+                if (r != 0) {
+                    write_chunk(current_chunk(), ENCODE_INST(OP_MOVE, 0, r, 0));
+                }
+            } else {
+                compile_stmt(stmt);
+            }
         }
     } else {
-        compile_stmt(ast);
+        compile_stmt(program);
     }
 
     // Keep exported symbols reachable from root for bytecode serialization.

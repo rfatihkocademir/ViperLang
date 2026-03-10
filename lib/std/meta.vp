@@ -1,0 +1,21 @@
+// ViperLang Standard Meta Library (@std/meta)
+
+pub fn symbols() {
+    ret meta_symbols()
+}
+
+pub fn ast(path) {
+    ret meta_ast(path)
+}
+
+pub fn eval_sandboxed(code, permissions) {
+    ret meta_eval_sandboxed(code, permissions)
+}
+
+pub fn test_runner(dir_path) {
+    ret meta_test_runner(dir_path)
+}
+
+pub fn compress_context() {
+    ret meta_compress_context()
+}

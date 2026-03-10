@@ -1,22 +1,41 @@
-# Build artifacts
+# Build outputs (C / linker)
 *.o
-*.so
-*.dll
-*.dylib
+*.obj
+*.lo
 *.a
-viper
-docs/
-# Viper artifacts
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+/viper
+/docs
+/examples
+# Viper bytecode and package artifacts
 *.vbb
 *.vbc
 *.vabi
 .viper/
+**/.viper/
 
-# Logs and tests
+# Runtime and local scratch outputs
 *.log
-tests/dummy_project/
-viper_test_file.txt
+*.tmp
+*.temp
+/data.db
+/viper_test_file.txt
+/*_test.vp
+/*_test.txt
 
-# OS generated
+# Project-local generated caches
+/tests/dummy_project/
+/tests/dummy_project/.viper/
+
+# Editor and OS files
 .DS_Store
 Thumbs.db
+.idea/
+.vscode/
+*.code-workspace
+*.swp
+*.swo

@@ -30,6 +30,10 @@ static ObjFunction* compile_file(const char* path, char** out_source) {
     AstNode* ast = parse(source);
 
     init_native_core(); // Call init_native_core() before compiling/interpreting.
+    if (parser_had_error()) {
+        if (out_source) free(source);
+        exit(65);
+    }
     ObjFunction* main_fn = compile(ast);
 
     if (out_source) {

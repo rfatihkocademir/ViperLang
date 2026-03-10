@@ -13,6 +13,7 @@ typedef enum {
 } ValueType;
 
 typedef struct sObj Obj;
+typedef struct sObjString ObjString;
 
 typedef struct {
     ValueType type;
@@ -24,6 +25,8 @@ typedef struct {
 } Value;
 
 #include <stdint.h>
+#include <stdbool.h>
+#include <pthread.h>
 
 // Register-based Opcodes
 typedef enum {
@@ -46,6 +49,8 @@ typedef enum {
     // Control Flow
     OP_MOVE,            // MOVE R_DEST, R_SRC
     OP_JUMP_IF_FALSE,   // JUMP_IF_FALSE R_COND, OFFSET_HIGH, OFFSET_LOW
+    OP_JUMP_IF_NIL,     // JUMP_IF_NIL R_VAL, OFFSET_HIGH, OFFSET_LOW
+    OP_JUMP_IF_NOT_NIL, // JUMP_IF_NOT_NIL R_VAL, OFFSET_HIGH, OFFSET_LOW
     OP_JUMP,            // JUMP 0, OFFSET_HIGH, OFFSET_LOW
     OP_LOOP,            // LOOP 0, OFFSET_HIGH, OFFSET_LOW (backward jump)
     
@@ -58,7 +63,32 @@ typedef enum {
     OP_SET_FIELD,       // SET_FIELD R_OBJ, CONST_INDEX_NAME, R_VAL
     
     OP_PRINT,       // PRINT R_A
-    OP_HALT         // End of execution
+    OP_HALT,        // End of execution
+    OP_GET_GLOBAL,  // GET_GLOBAL R_DEST, CONST_INDEX_NAME
+    OP_SET_GLOBAL,      // SET_GLOBAL 0, CONST_INDEX_NAME, R_VAL
+    
+    // Core Async
+    OP_SPAWN,           // SPAWN R_DEST, R_FN, ARG_COUNT
+    OP_AWAIT,           // AWAIT R_DEST, R_HANDLE, 0
+    
+    // Core Types & Memory
+    OP_TYPEOF,          // TYPEOF R_DEST, R_VAL, 0
+    OP_CLONE,           // CLONE R_DEST, R_VAL, 0
+    OP_ARRAY,           // ARRAY R_DEST, ELEM_COUNT, R_START
+    
+    // Core Safety
+    OP_SETUP_TRY,       // SETUP_TRY R_DEST, OFFSET_HIGH, OFFSET_LOW
+    OP_TEARDOWN_TRY,    // TEARDOWN_TRY
+    
+    // Core Dynamic
+    OP_EVAL,            // EVAL R_DEST, R_CODE_STR
+    OP_KEYS,            // KEYS R_DEST, R_OBJ
+    OP_HAS,             // HAS R_DEST, R_OBJ, R_PROP
+    OP_GET_INDEX,       // GET_INDEX R_DEST, R_OBJ, R_INDEX
+    OP_SET_INDEX,       // SET_INDEX R_OBJ, R_INDEX, R_VAL
+    OP_MATCH,           // MATCH R_DEST, R_STR, R_REGEX
+    OP_SYNC_START,      // SYNC_START
+    OP_SYNC_END         // SYNC_END
 } OpCode;
 
 // Instruction is 32-bit: 8-bit Opcode, 8-bit Dest Register, 8-bit Reg A, 8-bit Reg B
@@ -97,14 +127,34 @@ typedef struct {
 } CallFrame;
 
 typedef struct {
+    uint32_t catch_ip; // Instruction pointer to jump to upon panic
+    int target_vp;     // The destination register for the try block evaluation
+    int frame_count;   // Target frame depth to unwind to securely
+} CatchHandler;
+
+#define MAX_CATCH_HANDLERS 64
+
+typedef struct {
     CallFrame* frames;
     int frame_count;
     int frame_capacity;
     Value* registers; // Shared flat register space, dynamically grown
     int register_capacity;
+
+    CatchHandler catch_stack[MAX_CATCH_HANDLERS];
+    int catch_count;
+
+    // Simple Global Store
+    ObjString** global_names;
+    Value* global_values;
+    int global_count;
+    int global_capacity;
+
+    pthread_mutex_t* global_mutex;
 } VM;
 
 void init_vm(VM* vm);
 void interpret(VM* vm, struct sObjFunction* main_fn);
+Value call_viper_function(struct sObjFunction* fn, int argCount, Value* args);
 
 #endif // VIPER_VM_H

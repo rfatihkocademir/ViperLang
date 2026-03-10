@@ -28,11 +28,12 @@ typedef enum {
     TOKEN_PIPE_QUESTION, // |?
     TOKEN_PLUS_TILDE,   // +~ (Wrapping Add)
     TOKEN_CARET_PLUS,   // ^+ (Saturating Add)
-    TOKEN_QUESTION_DOT, // ?.
-    TOKEN_QUESTION,     // ? (Error propagation)
+    TOKEN_QUESTION_DOT,      // ?.
+    TOKEN_QUESTION_QUESTION, // ??
+    TOKEN_QUESTION,          // ? (Error propagation)
     
     // Literals
-    TOKEN_IDENTIFIER, TOKEN_STRING, TOKEN_NUMBER,
+    TOKEN_IDENTIFIER, TOKEN_STRING, TOKEN_NUMBER, TOKEN_REGEX,
     
     // ViperLang Keywords
     TOKEN_V, TOKEN_C, TOKEN_FN, TOKEN_R, TOKEN_I, TOKEN_EI, TOKEN_E,
@@ -40,6 +41,10 @@ typedef enum {
     TOKEN_IMPL, TOKEN_USE, TOKEN_TP, TOKEN_PUB, TOKEN_SPAWN,
     TOKEN_AS, TOKEN_ASYNC, TOKEN_AWAIT, TOKEN_MUT, TOKEN_IN,
     TOKEN_RET, TOKEN_PR,
+    TOKEN_JSON, TOKEN_DB,
+    TOKEN_TYPEOF, TOKEN_CLONE, TOKEN_SYNC, TOKEN_PANIC,
+    TOKEN_RECOVER, TOKEN_TRY, TOKEN_ELSE, TOKEN_MATCH,
+    TOKEN_EVAL, TOKEN_KEYS, TOKEN_HAS,
 
     // Specific Types (i, f, b, s, c, u8, any) handled as identifiers or keywords?
     // We treat them as identifiers that the parser will resolve, or as keywords.

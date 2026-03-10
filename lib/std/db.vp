@@ -1,0 +1,69 @@
+// ViperLang Standard DB Library (@std/db)
+
+pub fn connect(conn_str) {
+    ret vdb_connect(conn_str)
+}
+
+pub fn sync(table, schema) {
+    ret vdb_sync(table, schema)
+}
+
+pub fn get(table, id) {
+    ret vdb_get(table, id)
+}
+
+pub fn find(table, where_text) {
+    ret vdb_find(table, where_text)
+}
+
+pub fn first(table, where_text) {
+    ret vdb_first(table, where_text)
+}
+
+pub fn save(table, data_text) {
+    ret vdb_save(table, data_text)
+}
+
+pub fn insert(table, data_text) {
+    ret vdb_insert(table, data_text)
+}
+
+pub fn update(table, id, data_text) {
+    ret vdb_update(table, id, data_text)
+}
+
+pub fn upsert(table, conflict_key, data_text) {
+    ret vdb_upsert(table, conflict_key, data_text)
+}
+
+pub fn delete(table, id) {
+    ret vdb_delete(table, id)
+}
+
+pub fn query(sql_text) {
+    ret vdb_query(sql_text)
+}
+
+pub fn begin() {
+    ret vdb_begin()
+}
+
+pub fn commit() {
+    ret vdb_commit()
+}
+
+pub fn rollback() {
+    ret vdb_rollback()
+}
+
+pub fn count(table, where_text) {
+    ret vdb_count(table, where_text)
+}
+
+pub fn exists(table, where_text) {
+    ret vdb_exists(table, where_text)
+}
+
+pub fn paginate(table, where_text, page, size) {
+    ret vdb_paginate(table, where_text, page, size)
+}

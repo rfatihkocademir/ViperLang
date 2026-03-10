@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -std=c99 -Iinclude -O2
-LDFLAGS = -lffi -ldl
+LDFLAGS = -lffi -ldl -lm
 
 SRCS = $(wildcard src/*.c)
 OBJS = $(SRCS:.c=.o)

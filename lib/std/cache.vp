@@ -1,0 +1,29 @@
+// ViperLang Standard Cache Library (@std/cache)
+
+pub fn set(key, value, ttl_ms) {
+    ret cache_set(key, value, ttl_ms)
+}
+
+pub fn get(key) {
+    ret cache_get(key)
+}
+
+pub fn delete(key) {
+    ret cache_delete(key)
+}
+
+pub fn has(key) {
+    ret cache_has(key)
+}
+
+pub fn increment(key, amount) {
+    ret cache_increment(key, amount)
+}
+
+pub fn clear() {
+    ret cache_clear()
+}
+
+pub fn keys(pattern) {
+    ret cache_keys(pattern)
+}
