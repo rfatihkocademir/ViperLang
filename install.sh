@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -e
 
-echo "=== ViperLang Installer ==="
+echo "=== ViperLang v3 Installer ==="
+echo "Features: M:N Scheduler, Tiered JIT, Real Concurrency, Zero-Copy I/O"
 echo ""
 
 # Check for required dependencies
-command -v gcc >/dev/null 2>&1 || { echo "Error: gcc is required. Install it first."; exit 1; }
+command -v gcc >/dev/null 2>&1 || { echo "Error: gcc is required for the JIT compiler. Install it first."; exit 1; }
 command -v make >/dev/null 2>&1 || { echo "Error: make is required. Install it first."; exit 1; }
 
 # Check for libffi
@@ -16,7 +17,7 @@ if ! ldconfig -p 2>/dev/null | grep -q libffi || ! find /usr/lib* /usr/local/lib
     echo ""
 fi
 
-echo "Building ViperLang from source..."
+echo "Building ViperLang v3 from source..."
 make clean
 make
 
@@ -41,10 +42,19 @@ sudo cp lib/std/*.so $LIB_DIR/
 
 # Copy LLM Reference Guide (used by viper pkg init)
 echo "Installing LLM Reference Guide..."
-sudo cp docs/LLM_REFERENCE.md /usr/local/lib/viper/LLM_REFERENCE.md
+sudo mkdir -p /usr/local/lib/viper
+if [ -f docs/LLM_REFERENCE.md ]; then
+    sudo cp docs/LLM_REFERENCE.md /usr/local/lib/viper/LLM_REFERENCE.md
+fi
 
 echo ""
-echo "✅ ViperLang installed successfully!"
+echo "✅ ViperLang v3 installed successfully!"
+echo ""
+echo "New in v3:"
+echo " - Real Concurrency (Fibers + M:N Scheduler)"
+echo " - Tiered JIT Compilation"
+echo " - Advanced Memory Profiler (run with pr_profile())"
+echo " - Zero-Copy Asynchronous I/O"
 echo ""
 echo "You can now run 'viper' from anywhere:"
 echo "  viper my_script.vp"
