@@ -4,11 +4,11 @@
 st Socket { fd }
 
 pub fn serve(port) {
-    v ext = load_dl("lib/std/net.so")
-    v _server = ext.get_fn("net_tcp_server", "i->i")
+    var ext = load_dl("lib/std/net.so")
+    var _server = ext.get_fn("net_tcp_server", "i->i")
     
-    v fd = _server(port)
-    i (fd < 0) {
+    var fd = _server(port)
+    if (fd < 0) {
         // Return 0 for failure temporarily until Option/Result types
         ret 0
     }
@@ -16,37 +16,74 @@ pub fn serve(port) {
 }
 
 pub fn accept(server) {
-    v ext = load_dl("lib/std/net.so")
-    v _accept = ext.get_fn("net_accept", "i->i")
+    var ext = load_dl("lib/std/net.so")
+    var _accept = ext.get_fn("net_accept", "i->i")
     
-    v client_fd = _accept(server.fd)
-    i (client_fd < 0) {
+    var client_fd = _accept(server.fd)
+    if (client_fd < 0) {
         ret 0
     }
     ret Socket(client_fd)
 }
 
 pub fn send(socket, message) {
-    v ext = load_dl("lib/std/net.so")
-    v _send = ext.get_fn("net_send", "i,s->i")
+    var ext = load_dl("lib/std/net.so")
+    var _send = ext.get_fn("net_send", "i,s->i")
     
     ret _send(socket.fd, message)
 }
 
 pub fn recv_string(socket) {
-    v ext = load_dl("lib/std/net.so")
-    v _recv = ext.get_fn("net_recv_string", "i->s")
+    var ext = load_dl("lib/std/net.so")
+    var _recv = ext.get_fn("net_recv_string", "i->s")
     ret _recv(socket.fd)
 }
 
 pub fn http_respond(socket, html) {
-    v ext = load_dl("lib/std/net.so")
-    v _respond = ext.get_fn("net_http_respond", "i,s->i")
+    var ext = load_dl("lib/std/net.so")
+    var _respond = ext.get_fn("net_http_respond", "i,s->i")
     ret _respond(socket.fd, html)
 }
 
 pub fn close(socket) {
-    v ext = load_dl("lib/std/net.so")
-    v _close = ext.get_fn("net_close", "i->v")
+    var ext = load_dl("lib/std/net.so")
+    var _close = ext.get_fn("net_close", "i->v")
     _close(socket.fd)
+}
+
+// ---- Async / Non-blocking Extensions ----
+
+pub fn accept_async(server) {
+    var ext = load_dl("lib/std/net.so")
+    var _accept = ext.get_fn("net_accept_async", "i->i")
+    
+    var client_fd = _accept(server.fd)
+    // -2 = EAGAIN (no pending connections, should yield)
+    // -1 = error
+    if (client_fd < 0) {
+        ret client_fd
+    }
+    ret Socket(client_fd)
+}
+
+pub fn send_async(socket, message) {
+    var ext = load_dl("lib/std/net.so")
+    var _send = ext.get_fn("net_send_async", "i,s,i->i")
+    ret _send(socket.fd, message, 0)
+}
+
+// Zero-Copy: Serve a file directly from kernel to socket via sendfile()
+pub fn http_respond_file(socket, filepath) {
+    var ext = load_dl("lib/std/net.so")
+    var _respond_file = ext.get_fn("net_http_respond_file", "i,s->i")
+    ret _respond_file(socket.fd, filepath)
+}
+
+// ---- Event Loop ----
+
+pub fn event_loop_init() {
+    var ext = load_dl("lib/std/net.so")
+    // Use the main viper binary's async_io functions since they're statically linked
+    // For now, event loop is managed internally by the C layer.
+    ret 0
 }

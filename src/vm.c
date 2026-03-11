@@ -7,57 +7,23 @@
 #include <pthread.h>
 #include "compiler.h"
 #include "parser.h"
+#include "capabilities.h"
 #include <regex.h>
+#include <time.h>
+#include <unistd.h>
+#include "scheduler.h"
+#include "jit.h"
+#include "profiler.h"
 
-static __thread VM* current_vm = NULL;
+VM* current_vm = NULL;
+
+static void runtime_error(VM* vm, const char* format, ...);
 static bool ensure_frame_capacity(VM* vm, int needed);
 static bool ensure_register_capacity(VM* vm, int needed);
 static bool ensure_register_capacity(VM* vm, int needed);
 static void vm_fatal_oom(void);
 static Value deep_clone_value(Value value);
 
-// Thread runner struct
-typedef struct {
-    ObjFunction* fn;
-    int argCount;
-    Value* args;
-    ObjThread* thread_obj;
-    VM* parent_vm;
-} ThreadPayload;
-
-static void* spawn_runner(void* arg) {
-    ThreadPayload* payload = (ThreadPayload*)arg;
-    
-    VM child_vm;
-    init_vm(&child_vm);
-    
-    // Set this thread's thread-local pointer
-    current_vm = &child_vm;
-    
-    // Share global memory
-    child_vm.global_names = payload->parent_vm->global_names;
-    child_vm.global_values = payload->parent_vm->global_values;
-    child_vm.global_count = payload->parent_vm->global_count;
-    child_vm.global_capacity = payload->parent_vm->global_capacity;
-    
-    // Share the same mutex
-    if (child_vm.global_mutex) free(child_vm.global_mutex); // Free newly allocated one
-    child_vm.global_mutex = payload->parent_vm->global_mutex; 
-    
-    Value result = call_viper_function(payload->fn, payload->argCount, payload->args);
-    
-    payload->thread_obj->result = result;
-    payload->thread_obj->finished = true;
-    
-    if (payload->args) free(payload->args);
-    free(payload);
-    
-    // Teardown child VM execution memory
-    free(child_vm.frames);
-    free(child_vm.registers);
-    
-    return NULL;
-}
 
 Value call_viper_function(ObjFunction* fn, int argCount, Value* args) {
     if (!current_vm) return (Value){VAL_NIL, {.number = 0}};
@@ -93,8 +59,8 @@ Value call_viper_function(ObjFunction* fn, int argCount, Value* args) {
     frame->base = base;
     frame->return_dest = dest;
 
-    // Run VM until this frame is popped
-    interpret(current_vm, NULL); // NULL means continue with existing frames
+    // Run VM until this frame is popped (no yielding for C-ABI calls for now)
+    interpret(current_vm, NULL, -1); // -1 means infinite steps
     
     return current_vm->registers[dest];
 }
@@ -161,6 +127,7 @@ int add_constant(Chunk* chunk, Value value) {
 }
 
 void init_vm(VM* vm) {
+    profiler_init();
     vm->frame_capacity = 64;
     vm->frames = malloc(sizeof(CallFrame) * vm->frame_capacity);
     vm->frame_count = 0;
@@ -176,6 +143,8 @@ void init_vm(VM* vm) {
     vm->catch_count = 0;
     vm->global_mutex = (pthread_mutex_t*)malloc(sizeof(pthread_mutex_t));
     pthread_mutex_init(vm->global_mutex, NULL);
+    
+    vm->thread_obj = NULL;
 }
 
 // Helper: get register from current frame's base
@@ -291,7 +260,7 @@ static Value deep_clone_value(Value value) {
     }
 }
 
-void interpret(VM* vm, struct sObjFunction* main_fn) {
+InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
     current_vm = vm;
     int stop_count = vm->frame_count > 0 ? vm->frame_count - 1 : 0;
 
@@ -306,13 +275,25 @@ void interpret(VM* vm, struct sObjFunction* main_fn) {
         frame->ip = 0;
         frame->base = 0;
         frame->return_dest = 0;
+        
+        // If max_steps is strictly 0, we just wanted to set up the frame
+        if (max_steps == 0) {
+            return INTERPRET_YIELD;
+        }
     }
 
-    if (vm->frame_count == 0) return;
+    if (vm->frame_count == 0) return INTERPRET_OK;
     CallFrame* frame = &vm->frames[vm->frame_count - 1];
 
+    int steps = 0;
     for (;;) {
-        if (vm->frame_count <= stop_count) return; // Callback finished
+        profiler_track_instructions(1);
+        if (max_steps > 0 && steps >= max_steps) {
+            return INTERPRET_YIELD;
+        }
+        steps++;
+        
+        if (vm->frame_count <= stop_count) return INTERPRET_OK; // Callback finished
         frame = &vm->frames[vm->frame_count - 1]; // Refresh frame in case of stack changes
         
         if (frame->ip >= (uint32_t)frame->function->chunk.count) {
@@ -471,6 +452,14 @@ void interpret(VM* vm, struct sObjFunction* main_fn) {
             case OP_LOOP: {
                 uint16_t offset = (rB << 8) | rC;
                 frame->ip -= offset;
+                
+                // Profile-Guided Optimization: Track hot loops
+                // If a function isn't called often but loops internally heavily,
+                // compile it to JIT so next time it's invoked, it's native.
+                if (frame->function->hot_count++ > 100 && !frame->function->jit_fn) {
+                    jit_compile_function(frame->function);
+                }
+                
                 break;
             }
             case OP_CALL: {
@@ -482,7 +471,39 @@ void interpret(VM* vm, struct sObjFunction* main_fn) {
                             printf("Runtime Error: Expected %d args, got %d\n", fn->arity, rB);
                             exit(1);
                         }
+                        // Tier-2 PGO JIT Compilation
+                        if (fn->hot_count++ > 100 && !fn->jit_fn) {
+                            jit_compile_function(fn);
+                        }
                         
+                        // Tier-3 Direct Native Execution
+                        if (fn->jit_fn) {
+                            // Extract arguments 
+                            Value* jit_args = NULL;
+                            if (rB > 0) {
+                                jit_args = malloc(sizeof(Value) * rB);
+                                for (int i = 0; i < rB; i++) {
+                                    jit_args[i] = vm->registers[frame->base + rA + 1 + i];
+                                }
+                            }
+                            
+                            // Define function signature ptr (matching jit.c signature)
+                            typedef Value (*CompiledFn)(int argCount, Value* args, Value* closure_env);
+                            CompiledFn jit_exec = (CompiledFn)fn->jit_fn;
+                            
+                            Value res = jit_exec(rB, jit_args, NULL);
+                            
+                            if (jit_args) free(jit_args);
+                            
+                            // Store the result directly without creating CallFrame
+                            int next_return = frame->base + rC;
+                            if (!ensure_register_capacity(vm, next_return + 1)) vm_fatal_oom();
+                            vm->registers[next_return] = res;
+                            
+                            break; // Skip bytecode processing 
+                        }
+                        
+                        // Default Bytecode Interpreting Path
                         // New frame setup
                         int next_base = frame->base + rA;
                         int next_return = frame->base + rC;
@@ -612,6 +633,11 @@ void interpret(VM* vm, struct sObjFunction* main_fn) {
             }
             case OP_CALL_NATIVE: {
                 // A = native_index, B = arg_count, C = dest_reg
+                if (!native_is_enabled(rA)) {
+                    printf("Runtime Error: Native '%s' is disabled (capability=%s, profile=%s).\n",
+                           get_native_name(rA), native_capability(rA), VIPER_PROFILE_NAME);
+                    exit(1);
+                }
                 NativeFn native = get_native_by_index(rA);
                 if (native == NULL) {
                     printf("Runtime Error: Unknown native function index %d.\n", rA);
@@ -755,25 +781,40 @@ void interpret(VM* vm, struct sObjFunction* main_fn) {
                     exit(1);
                 }
                 
-                ThreadPayload* payload = malloc(sizeof(ThreadPayload));
-                payload->fn = fn;
-                payload->argCount = rC;
-                payload->args = NULL;
-                if (rC > 0) {
-                    payload->args = malloc(sizeof(Value) * rC);
-                    for(int i=0; i<rC; i++) {
-                        payload->args[i] = vm->registers[frame->base + rB + 1 + i];
-                    }
-                }
+                VM* child_vm = malloc(sizeof(VM));
+                init_vm(child_vm);
                 
-                ObjThread* t = new_thread(0); 
-                payload->thread_obj = t;
-                payload->parent_vm = vm;
-                
-                if (pthread_create(&t->thread, NULL, spawn_runner, payload) != 0) {
-                    printf("Runtime Error: Failed to spawn thread.\n");
+                // Share globals and mutex
+                child_vm->global_names = vm->global_names;
+                child_vm->global_values = vm->global_values;
+                child_vm->global_count = vm->global_count;
+                child_vm->global_capacity = vm->global_capacity;
+                if (child_vm->global_mutex) free(child_vm->global_mutex);
+                child_vm->global_mutex = vm->global_mutex;
+
+                // Setup the frame for the function
+                if (!ensure_frame_capacity(child_vm, 1) || !ensure_register_capacity(child_vm, REGISTER_WINDOW)) {
+                    printf("Runtime Error: Out of memory spawning fiber.\n");
                     exit(1);
                 }
+                
+                // fn is at base
+                child_vm->registers[0] = (Value){VAL_OBJ, {.obj = (Obj*)fn}};
+                for (int i=0; i<rC; i++) {
+                    child_vm->registers[1 + i] = vm->registers[frame->base + rB + 1 + i];
+                }
+                
+                CallFrame* cframe = &child_vm->frames[child_vm->frame_count++];
+                cframe->function = fn;
+                cframe->ip = 0;
+                cframe->base = 0;
+                cframe->return_dest = 255;
+                
+                ObjThread* t = new_thread(0); 
+                t->finished = false;
+                child_vm->thread_obj = t;
+                
+                schedule_fiber(child_vm);
                 
                 FRAME_REG(frame, rA) = (Value){VAL_OBJ, {.obj = (Obj*)t}};
                 break;
@@ -785,8 +826,12 @@ void interpret(VM* vm, struct sObjFunction* main_fn) {
                     exit(1);
                 }
                 ObjThread* t = (ObjThread*)AS_OBJ(th);
+                if (!t->finished) {
+                    // Preempt the current VM so the spawned tasks can execute
+                    frame->ip--; // retry this instruction next time
+                    return INTERPRET_YIELD;
+                }
                 if (!t->joined) {
-                    pthread_join(t->thread, NULL);
                     t->joined = true;
                 }
                 FRAME_REG(frame, rA) = t->result;
@@ -804,7 +849,7 @@ void interpret(VM* vm, struct sObjFunction* main_fn) {
                 }
                 vm->registers[dest] = retVal;
 
-                if (vm->frame_count == 0) return; // End of execution or top level return
+                if (vm->frame_count == 0) return INTERPRET_OK; // End of execution or top level return
                 frame = &vm->frames[vm->frame_count - 1];
                 break;
             }
@@ -945,6 +990,68 @@ void interpret(VM* vm, struct sObjFunction* main_fn) {
                 pthread_mutex_unlock(vm->global_mutex);
                 break;
             }
+            case OP_ASSERT_TYPE: {
+                // OP_ASSERT_TYPE rA=value_reg, rB=const_index_of_type_str, rC=unused
+                Value val = FRAME_REG(frame, rA);
+                ObjString* expected = AS_STRING(frame->function->chunk.constants[rB]);
+                
+                const char* actual_type = NULL;
+                switch (val.type) {
+                    case VAL_NUMBER:  actual_type = "int";    break; // Viper uses 'int' for numeric
+                    case VAL_BOOL:    actual_type = "bool";   break;
+                    case VAL_NIL:     actual_type = "nil";    break;
+                    case VAL_OBJ: {
+                        Obj* obj = AS_OBJ(val);
+                        switch (obj->type) {
+                            case OBJ_STRING:   actual_type = "str";    break;
+                            case OBJ_ARRAY:    actual_type = "array";  break;
+                            case OBJ_FUNCTION: actual_type = "fn";     break;
+                            case OBJ_INSTANCE: actual_type = "struct"; break;
+                            default:           actual_type = "obj";    break;
+                        }
+                        break;
+                    }
+                }
+                
+                // Also accept "float" as alias for numeric
+                bool type_ok = false;
+                if (actual_type && (int)strlen(actual_type) == expected->length &&
+                    memcmp(actual_type, expected->chars, expected->length) == 0) {
+                    type_ok = true;
+                }
+                // Additional alias: "float" and "f" match numbers too
+                if (!type_ok && val.type == VAL_NUMBER) {
+                    if ((expected->length == 5 && memcmp(expected->chars, "float", 5) == 0) ||
+                        (expected->length == 1 && expected->chars[0] == 'f') ||
+                        (expected->length == 1 && expected->chars[0] == 'i')) {
+                        type_ok = true;
+                    }
+                }
+                // "any" always passes
+                if (!type_ok && expected->length == 3 && memcmp(expected->chars, "any", 3) == 0) {
+                    type_ok = true;
+                }
+                // "s" is alias for "str"
+                if (!type_ok && val.type == VAL_OBJ && AS_OBJ(val)->type == OBJ_STRING) {
+                    if (expected->length == 1 && expected->chars[0] == 's') {
+                        type_ok = true;
+                    }
+                }
+                // "b" is alias for "bool"
+                if (!type_ok && val.type == VAL_BOOL) {
+                    if (expected->length == 1 && expected->chars[0] == 'b') {
+                        type_ok = true;
+                    }
+                }
+                
+                if (!type_ok) {
+                    printf("TypeError: Expected type '%.*s', got '%s'\n",
+                           expected->length, expected->chars,
+                           actual_type ? actual_type : "unknown");
+                    exit(1);
+                }
+                break;
+            }
             case OP_GET_GLOBAL: {
                 ObjString* name = AS_STRING(frame->function->chunk.constants[rB]);
                 Value val = (Value){VAL_NIL, {.number = 0}};
@@ -983,7 +1090,7 @@ void interpret(VM* vm, struct sObjFunction* main_fn) {
                 break;
             }
             case OP_HALT:
-                return;
+                return INTERPRET_OK;
             default:
                 printf("VM Error: Unknown opcode %d.\n", op);
                 exit(1);

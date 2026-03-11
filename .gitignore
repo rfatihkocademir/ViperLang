@@ -10,7 +10,7 @@
 *.out
 /viper
 /docs
-/examples
+/examples/
 # Viper bytecode and package artifacts
 *.vbb
 *.vbc

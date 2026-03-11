@@ -89,11 +89,12 @@ AstNode* ast_new_sync_stmt(AstNode* body) {
     return node;
 }
 
-AstNode* ast_new_func_decl(Token name, Token* params, int param_count, AstNode* body) {
+AstNode* ast_new_func_decl(Token name, Token* params, int param_count, Token return_type, AstNode* body) {
     AstNode* node = ast_alloc(AST_FUNC_DECL);
     node->data.func_decl.name = name;
     node->data.func_decl.params = params;
     node->data.func_decl.param_count = param_count;
+    node->data.func_decl.return_type = return_type;
     node->data.func_decl.body = body;
     node->data.func_decl.is_public = false;
     return node;

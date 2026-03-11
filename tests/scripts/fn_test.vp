@@ -10,17 +10,17 @@ fn multiply(num1, num2) {
 }
 
 fn greet(factor) {
-    v result = multiply(factor, 10)
+    var result = multiply(factor, 10)
     pr("Result: ")
     pr(result)
     ret result
 }
 
 // Top-level orchestration
-v sum = add(15, 25)
+var sum = add(15, 25)
 pr(sum)
 
-v product = multiply(6, 7)
+var product = multiply(6, 7)
 pr(product)
 
 greet(5)

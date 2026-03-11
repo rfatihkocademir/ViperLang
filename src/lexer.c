@@ -119,29 +119,11 @@ static TokenType check_keyword(int start, int length, const char* rest, TokenTyp
 
 static TokenType identifier_type() {
     int len = lexer.current - lexer.start;
-    
-    // Single letter keywords
-    if (len == 1) {
-        switch (lexer.start[0]) {
-            case 'v': return TOKEN_V;
-            case 'c': return TOKEN_C;
-            case 'r': return TOKEN_R;
-            case 'i': return TOKEN_I;
-            case 'e': return TOKEN_E;
-            case 'f': return TOKEN_F;
-            case 'w': return TOKEN_W;
-            case 'l': return TOKEN_L;
-            case 'm': return TOKEN_M;
-            case 'b': return TOKEN_TYPE_B;
-            case 's': return TOKEN_TYPE_S;
-        }
-    }
-    
+
     // Two letter keywords
     if (len == 2) {
         if (memcmp(lexer.start, "as", 2) == 0) return TOKEN_AS;
         if (memcmp(lexer.start, "fn", 2) == 0) return TOKEN_FN;
-        if (memcmp(lexer.start, "ei", 2) == 0) return TOKEN_EI;
         if (memcmp(lexer.start, "st", 2) == 0) return TOKEN_ST;
         if (memcmp(lexer.start, "en", 2) == 0) return TOKEN_EN;
         if (memcmp(lexer.start, "tr", 2) == 0) return TOKEN_TR;
@@ -152,10 +134,6 @@ static TokenType identifier_type() {
         if (memcmp(lexer.start, "db", 2) == 0) return TOKEN_DB;
     }
 
-    if (len == 3) {
-        if (memcmp(lexer.start, "ret", 3) == 0) return TOKEN_RET;
-    }
-    
     // Multi letter keywords
     switch (lexer.start[0]) {
         case 'a': 
@@ -167,19 +145,29 @@ static TokenType identifier_type() {
                 }
             }
             break;
-        case 'c': return check_keyword(1, 4, "lone", TOKEN_CLONE);
+        case 'c':
+            if (len > 1) {
+                if (lexer.start[1] == 'l') return check_keyword(2, 3, "one", TOKEN_CLONE);
+                if (lexer.start[1] == 'o') return check_keyword(2, 3, "nst", TOKEN_C);
+                if (lexer.start[1] == 'h') return check_keyword(2, 2, "ar", TOKEN_TYPE_C);
+            }
+            break;
         case 'e':
             if (len > 1) {
                 switch(lexer.start[1]) {
-                    case 'l': return check_keyword(2, 2, "se", TOKEN_ELSE);
+                    case 'l':
+                        if (len == 4 && memcmp(lexer.start, "elif", 4) == 0) return TOKEN_EI;
+                        return check_keyword(2, 2, "se", TOKEN_ELSE);
                     case 'v': return check_keyword(2, 2, "al", TOKEN_EVAL);
                 }
             }
             break;
+        case 'b': return check_keyword(1, 3, "ool", TOKEN_TYPE_B);
         case 'f':
             if (len > 1) {
                 switch(lexer.start[1]) {
                     case 'a': return check_keyword(2, 3, "lse", TOKEN_FALSE);
+                    case 'l': return check_keyword(2, 3, "oat", TOKEN_TYPE_F);
                     case 'n': return check_keyword(2, 0, "", TOKEN_FN);
                 }
             }
@@ -189,11 +177,13 @@ static TokenType identifier_type() {
         case 'i':
             if (len > 1) {
                 switch(lexer.start[1]) {
+                    case 'f': return check_keyword(2, 0, "", TOKEN_I);
+                    case 'n': return check_keyword(2, 1, "t", TOKEN_TYPE_I);
                     case 'm': return check_keyword(2, 2, "pl", TOKEN_IMPL);
-                    case 'n': return check_keyword(2, 0, "", TOKEN_IN);
                 }
             }
             break;
+        case 'l': return check_keyword(1, 3, "oop", TOKEN_L);
         case 'j': return check_keyword(1, 3, "son", TOKEN_JSON);
         case 'k': return check_keyword(1, 3, "eys", TOKEN_KEYS);
         case 'm': 
@@ -218,6 +208,7 @@ static TokenType identifier_type() {
             if (len > 1) {
                 if (lexer.start[1] == 'e') {
                     if (len == 3) return check_keyword(2, 1, "t", TOKEN_RET);
+                    if (len == 6) return check_keyword(2, 4, "turn", TOKEN_RET);
                     return check_keyword(2, 5, "cover", TOKEN_RECOVER);
                 }
             }
@@ -226,6 +217,7 @@ static TokenType identifier_type() {
             if (len > 1) {
                 switch(lexer.start[1]) {
                     case 'p': return check_keyword(2, 3, "awn", TOKEN_SPAWN);
+                    case 't': return check_keyword(2, 4, "ring", TOKEN_TYPE_S);
                     case 'y': return check_keyword(2, 2, "nc", TOKEN_SYNC);
                 }
             }
@@ -241,7 +233,19 @@ static TokenType identifier_type() {
                 }
             }
             break;
-        case 'u': return check_keyword(1, 2, "se", TOKEN_USE);
+        case 'u':
+            if (len > 1) {
+                if (lexer.start[1] == 's') return check_keyword(2, 1, "e", TOKEN_USE);
+                if (lexer.start[1] == '8') return check_keyword(2, 0, "", TOKEN_TYPE_U8);
+            }
+            break;
+        case 'v': return check_keyword(1, 2, "ar", TOKEN_V);
+        case 'w':
+            if (len > 1) {
+                if (lexer.start[1] == 'h') return check_keyword(2, 3, "ile", TOKEN_M);
+                if (lexer.start[1] == 'i') return check_keyword(2, 2, "th", TOKEN_W);
+            }
+            break;
     }
     return TOKEN_IDENTIFIER;
 }

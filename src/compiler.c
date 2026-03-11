@@ -10,6 +10,7 @@
 #include "bytecode.h"
 #include "vm.h"
 #include "native.h"
+#include "capabilities.h"
 
 ObjFunction* new_function(const char* name, int name_len, int arity);
 static void register_function_prototypes(AstNode* node, const char* alias, int alias_len);
@@ -43,6 +44,66 @@ static int imported_module_count = 0;
 static int imported_module_cap = 0;
 static bool contract_output_enabled = true;
 static bool emit_halt_enabled = true;
+
+static const char* capability_hint_for_symbol(const char* name, int len) {
+    (void)name;
+    (void)len;
+#if !VIPER_CAP_WEB
+    if ((len == 5 && memcmp(name, "serve", 5) == 0) ||
+        (len == 5 && memcmp(name, "fetch", 5) == 0) ||
+        (len >= 4 && memcmp(name, "web_", 4) == 0)) {
+        return "web capability is disabled in this build profile";
+    }
+#endif
+#if !VIPER_CAP_DB
+    if ((len == 5 && memcmp(name, "query", 5) == 0) ||
+        (len >= 4 && memcmp(name, "vdb_", 4) == 0)) {
+        return "db capability is disabled in this build profile";
+    }
+#endif
+#if !VIPER_CAP_AI
+    if (len >= 3 && memcmp(name, "ai_", 3) == 0) {
+        return "ai capability is disabled in this build profile";
+    }
+#endif
+#if !VIPER_CAP_FS
+    if (len >= 3 && memcmp(name, "fs_", 3) == 0) {
+        return "fs capability is disabled in this build profile";
+    }
+#endif
+#if !VIPER_CAP_OS
+    if (len >= 3 && memcmp(name, "os_", 3) == 0) {
+        return "os capability is disabled in this build profile";
+    }
+#endif
+#if !VIPER_CAP_CACHE
+    if (len >= 6 && memcmp(name, "cache_", 6) == 0) {
+        return "cache capability is disabled in this build profile";
+    }
+#endif
+#if !VIPER_CAP_UTIL
+    if ((len >= 5 && memcmp(name, "time_", 5) == 0) ||
+        (len >= 5 && memcmp(name, "math_", 5) == 0) ||
+        (len >= 5 && memcmp(name, "text_", 5) == 0) ||
+        (len >= 4 && memcmp(name, "arr_", 4) == 0)) {
+        return "util capability is disabled in this build profile";
+    }
+#endif
+#if !VIPER_CAP_META
+    if (len >= 5 && memcmp(name, "meta_", 5) == 0) {
+        return "meta capability is disabled in this build profile";
+    }
+#endif
+    return NULL;
+}
+
+static void compiler_error_disabled_native(const char* name, int len, int native_idx) {
+    const char* cap = native_capability(native_idx);
+    if (!cap) cap = "unknown";
+    printf("Compiler Error: Native '%.*s' is disabled (capability=%s, profile=%s)\n",
+           len, name, cap, VIPER_PROFILE_NAME);
+    exit(1);
+}
 
 static void copy_path(char* dst, size_t dst_size, const char* src) {
     if (dst_size == 0) return;
@@ -563,6 +624,7 @@ typedef struct {
     int next_reg;
     int scope_depth;
     ObjFunction* current_fn; // The function we are currently compiling into
+    int return_type_ci;      // Constant index of the return type string (-1 = untyped)
 } CompilerState;
 
 static CompilerState cst;
@@ -683,6 +745,7 @@ static void init_compiler(ObjFunction* fn) {
     cst.next_reg = 1;       // R0 is reserved for call bookkeeping
     cst.scope_depth = 0;
     cst.current_fn = fn;
+    cst.return_type_ci = -1; // No return type by default
 }
 
 static Chunk* current_chunk() {
@@ -1457,6 +1520,10 @@ static int compile_expr(AstNode* expr) {
                     free(arg_regs);
                     exit(1);
                 }
+                if (!native_is_enabled(native_idx)) {
+                    free(arg_regs);
+                    compiler_error_disabled_native(member.start, member.length, native_idx);
+                }
                 
                 // For native methods (like obj.get_fn()), the object itself is the first argument!
                 int obj_reg = resolve_local(alias.start, alias.length);
@@ -1490,6 +1557,10 @@ static int compile_expr(AstNode* expr) {
             callee_fn = resolve_function(name, namelen);
             callee_st = callee_fn ? NULL : resolve_struct(name, namelen);
             native_idx = (callee_fn || callee_st) ? -1 : find_native_index(name, namelen);
+            if (native_idx != -1 && !native_is_enabled(native_idx)) {
+                free(arg_regs);
+                compiler_error_disabled_native(name, namelen, native_idx);
+            }
             
             // If it's not a static function, struct, or built-in native, 
             // it might be a dynamic function variable (e.g., `v puts = lib.get_fn(...)`).
@@ -1518,7 +1589,13 @@ static int compile_expr(AstNode* expr) {
                     if (late_fn) {
                         callee_fn = late_fn;
                     } else {
-                        printf("Compiler Error: Unknown callable '%.*s'\n", namelen, name);
+                        const char* hint = capability_hint_for_symbol(name, namelen);
+                        if (hint) {
+                            printf("Compiler Error: Unknown callable '%.*s' (%s, profile=%s)\n",
+                                   namelen, name, hint, VIPER_PROFILE_NAME);
+                        } else {
+                            printf("Compiler Error: Unknown callable '%.*s'\n", namelen, name);
+                        }
                         free(arg_regs);
                         exit(1);
                     }
@@ -1577,7 +1654,13 @@ static int compile_expr(AstNode* expr) {
         if (!callee_fn) callee_fn = resolve_namespace_function(NULL, 0, name, namelen);
         
         if (!callee_fn) {
-            printf("Compiler Error: Unknown spawn callable '%.*s'\n", namelen, name);
+            const char* hint = capability_hint_for_symbol(name, namelen);
+            if (hint) {
+                printf("Compiler Error: Unknown spawn callable '%.*s' (%s, profile=%s)\n",
+                       namelen, name, hint, VIPER_PROFILE_NAME);
+            } else {
+                printf("Compiler Error: Unknown spawn callable '%.*s'\n", namelen, name);
+            }
             exit(1);
         }
         
@@ -1768,6 +1851,14 @@ static void compile_stmt(AstNode* stmt) {
                   reg,
                   cst.scope_depth);
 
+        // Gradual Typing: Emit OP_ASSERT_TYPE if type annotation is present
+        if (stmt->data.var_decl.type_annot.length > 0) {
+            ObjString* typeStr = copy_string(stmt->data.var_decl.type_annot.start,
+                                             stmt->data.var_decl.type_annot.length);
+            int ti = add_constant(current_chunk(), (Value){VAL_OBJ, {.obj = (Obj*)typeStr}});
+            write_chunk(current_chunk(), ENCODE_INST(OP_ASSERT_TYPE, reg, ti, 0));
+        }
+
         if (cst.scope_depth == 0) {
             register_global_symbol(stmt->data.var_decl.name.start,
                                    stmt->data.var_decl.name.length);
@@ -1808,6 +1899,14 @@ static void compile_stmt(AstNode* stmt) {
     else if (stmt->type == AST_RETURN_STMT) {
         if (stmt->data.return_stmt.value) {
             int reg = compile_expr(stmt->data.return_stmt.value);
+            // Gradual Typing: If enclosing function has a return type, assert it
+            if (cst.current_fn && cst.current_fn->name) {
+                // We store the return_type constant index at compile time of the func_decl
+                // For now we check via the cst.return_type_ci field
+                if (cst.return_type_ci >= 0) {
+                    write_chunk(current_chunk(), ENCODE_INST(OP_ASSERT_TYPE, reg, cst.return_type_ci, 0));
+                }
+            }
             write_chunk(current_chunk(), ENCODE_INST(OP_RETURN, reg, 0, 0));
         } else {
             write_chunk(current_chunk(), ENCODE_INST(OP_RETURN, 0, 0, 0));
@@ -1826,6 +1925,14 @@ static void compile_stmt(AstNode* stmt) {
         
         CompilerState prevCompiler = cst;
         init_compiler(fn);
+        
+        // Gradual Typing: Store return type constant index if annotation exists
+        if (stmt->data.func_decl.return_type.length > 0) {
+            ObjString* rtStr = copy_string(stmt->data.func_decl.return_type.start,
+                                           stmt->data.func_decl.return_type.length);
+            cst.return_type_ci = add_constant(current_chunk(), (Value){VAL_OBJ, {.obj = (Obj*)rtStr}});
+        }
+        
         begin_scope();
         for (int i = 0; i < stmt->data.func_decl.param_count; i++) {
             add_local(stmt->data.func_decl.params[i].start, stmt->data.func_decl.params[i].length, cst.next_reg++, 0);

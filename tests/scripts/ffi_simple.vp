@@ -1,3 +1,3 @@
-v t = clock()
+var t = clock()
 pr("Time is: ", t)
 pr("FFI is working!")

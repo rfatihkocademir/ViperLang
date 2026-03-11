@@ -45,6 +45,10 @@ struct sObjFunction {
     const char* name;    // For @contract output and error messages
     int name_len;
     int base_reg;        // The register offset inside a CallFrame
+    
+    // Tiered JIT Support
+    int hot_count;       // Track how many times it was called
+    void* jit_fn;        // Pointer to the dynamically compiled C-Backend function
 };
 
 struct sObjStruct {
@@ -123,6 +127,8 @@ void push_native(const char* name, NativeFn function);
 int find_native_index(const char* name, int length);
 NativeFn get_native_by_index(int index);
 const char* get_native_name(int index);
+bool native_is_enabled(int index);
+const char* native_capability(int index);
 int native_count();
 
 // Memory Management (Reference Counting Core)

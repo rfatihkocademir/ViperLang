@@ -46,9 +46,7 @@ typedef enum {
     TOKEN_RECOVER, TOKEN_TRY, TOKEN_ELSE, TOKEN_MATCH,
     TOKEN_EVAL, TOKEN_KEYS, TOKEN_HAS,
 
-    // Specific Types (i, f, b, s, c, u8, any) handled as identifiers or keywords?
-    // We treat them as identifiers that the parser will resolve, or as keywords.
-    // Let's treat them as keywords for stricter parsing.
+    // Specific primitive type names.
     TOKEN_TYPE_I, TOKEN_TYPE_F, TOKEN_TYPE_B, TOKEN_TYPE_S, 
     TOKEN_TYPE_C, TOKEN_TYPE_U8, TOKEN_TYPE_ANY,
     

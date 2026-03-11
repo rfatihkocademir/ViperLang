@@ -139,11 +139,15 @@ static AstNode* if_statement() {
     AstNode* thenBranch = block();
     
     AstNode* elseBranch = NULL;
-    if (match_token(TOKEN_E)) {
-        consume(TOKEN_LEFT_BRACE, "Expected '{' after 'e' (else).");
-        elseBranch = block();
-    } else if (match_token(TOKEN_EI)) {
+    if (match_token(TOKEN_EI)) {
         elseBranch = if_statement(); // else if chain
+    } else if (match_token(TOKEN_ELSE) || match_token(TOKEN_E)) {
+        if (match_token(TOKEN_I)) {
+            elseBranch = if_statement();
+        } else {
+            consume(TOKEN_LEFT_BRACE, "Expected '{' after 'else'.");
+            elseBranch = block();
+        }
     }
     
     return ast_new_if_stmt(condition, thenBranch, elseBranch);
@@ -361,6 +365,10 @@ static AstNode* primary() {
 
 static AstNode* call() {
     AstNode* expr = primary();
+    if (expr == NULL) {
+        // Keep parser resilient after syntax errors in primary expressions.
+        return ast_new_nil();
+    }
 
     for (;;) {
         if (match_token(TOKEN_LEFT_PAREN)) {
@@ -482,8 +490,15 @@ static AstNode* var_declaration() {
     (void)consume_decl_name(&name, "Expected variable name.");
     Token type_annot = {0};
     if (match_token(TOKEN_COLON)) {
-        if (match_token(TOKEN_IDENTIFIER) || match_token(TOKEN_I) || 
-            match_token(TOKEN_TYPE_S) || match_token(TOKEN_TYPE_F)) {
+        if (check(TOKEN_IDENTIFIER) ||
+            check(TOKEN_TYPE_I) ||
+            check(TOKEN_TYPE_F) ||
+            check(TOKEN_TYPE_B) ||
+            check(TOKEN_TYPE_S) ||
+            check(TOKEN_TYPE_C) ||
+            check(TOKEN_TYPE_U8) ||
+            check(TOKEN_TYPE_ANY)) {
+            advance_parser();
             type_annot = parser.previous;
         }
     }
@@ -528,9 +543,27 @@ static AstNode* func_declaration() {
         } while (match_token(TOKEN_COMMA));
     }
     consume(TOKEN_RIGHT_PAREN, "Expected ')' after parameters.");
+    
+    // Optional return type annotations: `-> int`
+    Token return_type = {0};
+    if (match_token(TOKEN_MINUS)) {
+        consume(TOKEN_GREATER, "Expected '>' after '-' for return type annotation (->).");
+        if (check(TOKEN_IDENTIFIER) ||
+            check(TOKEN_TYPE_I) || check(TOKEN_TYPE_F) ||
+            check(TOKEN_TYPE_B) || check(TOKEN_TYPE_S) ||
+            check(TOKEN_TYPE_C) || check(TOKEN_TYPE_U8) ||
+            check(TOKEN_TYPE_ANY)) {
+            advance_parser();
+            return_type = parser.previous;
+        } else {
+            printf("Syntax Error on line %d: Expected return type after '->'.\n", parser.current.line);
+            parser.hadError = true;
+        }
+    }
+    
     consume(TOKEN_LEFT_BRACE, "Expected '{' before function body.");
     AstNode* body = block();
-    return ast_new_func_decl(name, params, param_count, body);
+    return ast_new_func_decl(name, params, param_count, return_type, body);
 }
 
 static AstNode* struct_declaration() {

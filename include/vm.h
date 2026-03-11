@@ -88,7 +88,10 @@ typedef enum {
     OP_SET_INDEX,       // SET_INDEX R_OBJ, R_INDEX, R_VAL
     OP_MATCH,           // MATCH R_DEST, R_STR, R_REGEX
     OP_SYNC_START,      // SYNC_START
-    OP_SYNC_END         // SYNC_END
+    OP_SYNC_END,        // SYNC_END
+    
+    // Gradual Typing
+    OP_ASSERT_TYPE      // ASSERT_TYPE R_VAL, CONST_INDEX_TYPE_STR, 0
 } OpCode;
 
 // Instruction is 32-bit: 8-bit Opcode, 8-bit Dest Register, 8-bit Reg A, 8-bit Reg B
@@ -141,6 +144,8 @@ typedef struct {
     Value* registers; // Shared flat register space, dynamically grown
     int register_capacity;
 
+    struct sObjThread* thread_obj; // The Thread Object representing this Fiber (if spawned)
+    
     CatchHandler catch_stack[MAX_CATCH_HANDLERS];
     int catch_count;
 
@@ -153,8 +158,14 @@ typedef struct {
     pthread_mutex_t* global_mutex;
 } VM;
 
+typedef enum {
+    INTERPRET_OK,
+    INTERPRET_YIELD,
+    INTERPRET_ERROR
+} InterpretResult;
+
 void init_vm(VM* vm);
-void interpret(VM* vm, struct sObjFunction* main_fn);
+InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps);
 Value call_viper_function(struct sObjFunction* fn, int argCount, Value* args);
 
 #endif // VIPER_VM_H

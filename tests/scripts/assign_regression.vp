@@ -1,9 +1,9 @@
-v x = 1
+var x = 1
 x = x + 2
 
-i x == 3 {
+if x == 3 {
     pr("assign ok")
-} e {
-    v crash = 1 / 0
+} else {
+    var crash = 1 / 0
     pr(crash)
 }

@@ -1,8 +1,8 @@
 // string_test.vp - Testing String Memory Allocation using RC
 
-v name = "ViperLang is ALIVE!"
-v speed = "Lightning Fast"
-v year = 2026
+var name = "ViperLang is ALIVE!"
+var speed = "Lightning Fast"
+var year = 2026
 
 name
 speed

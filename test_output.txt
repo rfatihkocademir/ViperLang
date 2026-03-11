@@ -1,1 +1,0 @@
-ViperLang standard library test content.

@@ -250,7 +250,7 @@ if (
         printf 'fn %s() {\n    ret %d\n}\n' "${fn}" "${i}" > "${STAR_DIR}/${mod}" &&
         i=$((i + 1))
     done &&
-    printf '\nv total = 0\n' >> "${STAR_DIR}/main.vp" &&
+    printf '\nvar total = 0\n' >> "${STAR_DIR}/main.vp" &&
     i=1 &&
     while [ "${i}" -le 80 ]; do
         fn="$(printf 'f%03d' "${i}")" &&

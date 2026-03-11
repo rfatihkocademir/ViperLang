@@ -60,6 +60,24 @@ Run it instantly with:
 viper main.vp
 ```
 
+### 5️⃣ Build App Runtime (Auto-Capability)
+
+For production-style output, Viper can analyze your app and build a smaller runtime that only includes the native capabilities your code actually uses.
+
+```bash
+viper build main.vp --out-dir=build --name=my_app
+./build/my_app/run.sh
+```
+
+Generated artifacts:
+
+* `build/my_app/app.vbb` — compiled bytecode
+* `build/my_app/viper-runtime` — app-specific runtime binary
+* `build/my_app/capabilities.lock` — detected native capability map
+* `build/my_app/run.sh` — launcher
+
+Native call indexing is kept stable across profiles. If a disabled capability is called at runtime, Viper fails with a clear capability/profile error.
+
 ---
 
 ## 🌐 Community Packages (VPM)
@@ -83,6 +101,14 @@ ViperLang comes fully equipped with the tools you need right out of the box.
 * **`@std/os`**: Interact with your operating system, read environment variables, or execute bash commands.
 * **`@std/net`**: Build HTTP servers and TCP socket applications.
 * **`@std/math`**: Advanced math functions — `sin`, `cos`, `sqrt`, `pow`, `ceil`, `floor`, `abs`, and more.
+* **`@std/text`**: High-density string primitives (`trim`, `split`, `join`, `replace`, `starts_with`, `ends_with`, ...).
+* **`@std/collections`**: Array transforms (`map`, `filter`, `reduce`, `slice`, `reverse`, `join`, ...).
+* **`@std/fsx`**: High-level file/path helpers (`read_json`, `write_json`, `path_join`, `touch`, ...).
+* **`@std/netx`**: High-level network helpers (`get_json`, `post_json`, `retry_get`, JWT/hash wrappers, ...).
+* **`@std/task`**: Scheduling + iteration helpers (`repeat`, `each`, `retry`, `run_all`, `run_series`, ...).
+* **`@std/schema`**: Tiny schema DSL (`required`, `optional`, `validate`, `coerce_number`, ...).
+* **`@std/cachex`**: Cache patterns (`get_or_set`, `memoize`, tag invalidation, lightweight locks, ...).
+* **`@std/gamekit`**: Gameplay math/collision helpers (`vec2`, `dot`, `aabb_intersect`, `circle_intersect`, ...).
 
 ---
 
@@ -111,10 +137,15 @@ Inside the `ViperLang` folder you downloaded, you will find a `vscode-viperlang`
 - [x] **Phase 8**: Standard Library (`@std/math`, `@std/io`, `@std/os`, `@std/net`).
 - [ ] **The Horizon**: AOT/JIT Compilation & AI Model Integration.
 
+## ✅ Beta Readiness
+
+Beta çıkış kapıları ve mevcut durum takibi:
+
+- `BETA_READINESS_CHECKLIST.md`
+
 ---
 
 ## 🤝 Contributing
 
 Love C99 and Virtual Machines? Want to help make ViperLang even faster?
 Check out our `CONTRIBUTING.md` guide and drop a Pull Request! We are completely open source (MIT License).
-

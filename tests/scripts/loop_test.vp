@@ -1,9 +1,9 @@
 // loop_test.vp - Testing while loops and pr() built-in print
 
-v counter = 0
-v limit = 5
+var counter = 0
+var limit = 5
 
-m counter < limit {
+while counter < limit {
     pr(counter)
     counter = counter + 1
 }

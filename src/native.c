@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "native.h"
+#include "capabilities.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +13,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include "memory.h"
+#include "profiler.h"
 #include <fcntl.h>
 #include <errno.h>
 #include <dirent.h>
@@ -82,13 +85,19 @@ static int g_ws_next_client_id = 1;
 static Value g_ai_tools[MAX_AI_TOOLS];
 static int g_ai_tool_count = 0;
 
-// Allocate a generic object and add to memory chain
+static Value native_json(int argCount, Value* args);
+static char* trim_inplace(char* s);
+
+// ---- Object Allocation & GC ------------------------------------------
+
 static Obj* allocate_obj(size_t size, int type) {
-    Obj* object = (Obj*)malloc(size);
+    Obj* object = (Obj*)viper_allocate(size, type);
     object->type = type;
     object->ref_count = 1; // start with 1 reference
     object->next = objects;
     objects = object;
+    
+    profiler_track_alloc(size, type);
     return object;
 }
 
@@ -814,6 +823,8 @@ ObjFunction* new_function(const char* name, int name_len, int arity) {
     fn->name = name;
     fn->name_len = name_len;
     fn->base_reg = 0;
+    fn->hot_count = 0;
+    fn->jit_fn = NULL;
     init_chunk(&fn->chunk);
     return fn;
 }
@@ -904,6 +915,18 @@ void release_obj(Obj* obj) {
     obj->ref_count--;
     
     if (obj->ref_count <= 0) {
+        // ... free logic ...
+        size_t size = 0;
+        switch (obj->type) {
+            case OBJ_STRING: size = sizeof(ObjString) + ((ObjString*)obj)->length + 1; break;
+            case OBJ_ARRAY:  size = sizeof(ObjArray) + ((ObjArray*)obj)->capacity * sizeof(Value); break;
+            case OBJ_FUNCTION: size = sizeof(ObjFunction); break;
+            case OBJ_STRUCT: size = sizeof(ObjStruct); break;
+            case OBJ_INSTANCE: size = sizeof(ObjInstance); break;
+            default: size = sizeof(Obj); break; 
+        }
+        profiler_track_free(size, obj->type);
+
         if (obj->type == OBJ_STRING) {
             ObjString* string = (ObjString*)obj;
             free(string->chars);
@@ -1013,17 +1036,25 @@ static Value native_print(int argCount, Value* args) {
 typedef struct {
     const char* name;
     NativeFn function;
+    const char* capability;
+    bool enabled;
 } NativeEntry;
 
 #define MAX_NATIVES 256
 static NativeEntry native_registry[MAX_NATIVES];
 static int _native_count = 0;
 
-void push_native(const char* name, NativeFn function) {
+static void push_native_cap(const char* name, NativeFn function, const char* capability, bool enabled) {
     if (_native_count >= MAX_NATIVES) return;
     native_registry[_native_count].name = name;
     native_registry[_native_count].function = function;
+    native_registry[_native_count].capability = capability ? capability : "core";
+    native_registry[_native_count].enabled = enabled;
     _native_count++;
+}
+
+void push_native(const char* name, NativeFn function) {
+    push_native_cap(name, function, "core", true);
 }
 
 int find_native_index(const char* name, int length) {
@@ -1047,12 +1078,78 @@ const char* get_native_name(int index) {
     return native_registry[index].name;
 }
 
+bool native_is_enabled(int index) {
+    if (index < 0 || index >= _native_count) return false;
+    return native_registry[index].enabled;
+}
+
+const char* native_capability(int index) {
+    if (index < 0 || index >= _native_count) return "unknown";
+    return native_registry[index].capability ? native_registry[index].capability : "core";
+}
+
 int native_count() {
     return _native_count;
 }
 
 // Global thread-safe structure for passing panics up to 'recover'
 __thread const char* last_panic_msg = NULL;
+
+static Value __attribute__((unused)) native_disabled_os(int argCount, Value* args) {
+    (void)argCount;
+    (void)args;
+    last_panic_msg = "Capability 'os' is disabled in this runtime.";
+    return (Value){VAL_NIL, {.number = 0}};
+}
+
+static Value __attribute__((unused)) native_disabled_fs(int argCount, Value* args) {
+    (void)argCount;
+    (void)args;
+    last_panic_msg = "Capability 'fs' is disabled in this runtime.";
+    return (Value){VAL_NIL, {.number = 0}};
+}
+
+static Value __attribute__((unused)) native_disabled_web(int argCount, Value* args) {
+    (void)argCount;
+    (void)args;
+    last_panic_msg = "Capability 'web' is disabled in this runtime.";
+    return (Value){VAL_NIL, {.number = 0}};
+}
+
+static Value __attribute__((unused)) native_disabled_db(int argCount, Value* args) {
+    (void)argCount;
+    (void)args;
+    last_panic_msg = "Capability 'db' is disabled in this runtime.";
+    return (Value){VAL_NIL, {.number = 0}};
+}
+
+static Value __attribute__((unused)) native_disabled_ai(int argCount, Value* args) {
+    (void)argCount;
+    (void)args;
+    last_panic_msg = "Capability 'ai' is disabled in this runtime.";
+    return (Value){VAL_NIL, {.number = 0}};
+}
+
+static Value __attribute__((unused)) native_disabled_cache(int argCount, Value* args) {
+    (void)argCount;
+    (void)args;
+    last_panic_msg = "Capability 'cache' is disabled in this runtime.";
+    return (Value){VAL_NIL, {.number = 0}};
+}
+
+static Value __attribute__((unused)) native_disabled_util(int argCount, Value* args) {
+    (void)argCount;
+    (void)args;
+    last_panic_msg = "Capability 'util' is disabled in this runtime.";
+    return (Value){VAL_NIL, {.number = 0}};
+}
+
+static Value __attribute__((unused)) native_disabled_meta(int argCount, Value* args) {
+    (void)argCount;
+    (void)args;
+    last_panic_msg = "Capability 'meta' is disabled in this runtime.";
+    return (Value){VAL_NIL, {.number = 0}};
+}
 
 static Value native_panic(int argCount, Value* args) {
     if (argCount != 1 || !IS_OBJ(args[0]) || AS_OBJ(args[0])->type != OBJ_STRING) {
@@ -1888,6 +1985,412 @@ static Value native_math_hash(int argCount, Value* args) {
         return (Value){VAL_NUMBER, {.number = (double)hash_string(tmp, (int)strlen(tmp))}};
     }
     return (Value){VAL_NIL, {.number = 0}};
+}
+
+static bool value_is_truthy(Value v) {
+    if (v.type == VAL_BOOL) return v.as.boolean;
+    if (v.type == VAL_NIL) return false;
+    if (v.type == VAL_NUMBER) return v.as.number != 0.0;
+    return true;
+}
+
+static bool append_bytes_dyn(char** buf, size_t* cap, size_t* len, const char* src, size_t src_len) {
+    if (!buf || !cap || !len || !src) return false;
+    if (*buf == NULL || *cap == 0) {
+        *cap = 64;
+        *buf = (char*)malloc(*cap);
+        if (!*buf) return false;
+        (*buf)[0] = '\0';
+        *len = 0;
+    }
+    if (*len + src_len + 1 > *cap) {
+        size_t next = *cap;
+        while (next < *len + src_len + 1) next *= 2;
+        char* grown = (char*)realloc(*buf, next);
+        if (!grown) return false;
+        *buf = grown;
+        *cap = next;
+    }
+    memcpy(*buf + *len, src, src_len);
+    *len += src_len;
+    (*buf)[*len] = '\0';
+    return true;
+}
+
+static Value join_array_as_text(ObjArray* arr, const char* sep) {
+    if (!arr) return (Value){VAL_NIL, {.number = 0}};
+    if (!sep) sep = "";
+    size_t sep_len = strlen(sep);
+
+    char* out = NULL;
+    size_t cap = 0;
+    size_t len = 0;
+
+    for (int i = 0; i < arr->count; i++) {
+        if (i > 0 && !append_bytes_dyn(&out, &cap, &len, sep, sep_len)) {
+            free(out);
+            return (Value){VAL_NIL, {.number = 0}};
+        }
+
+        Value v = arr->elements[i];
+        if (is_string_value(v)) {
+            ObjString* s = AS_STRING(v);
+            if (!append_bytes_dyn(&out, &cap, &len, s->chars, (size_t)s->length)) {
+                free(out);
+                return (Value){VAL_NIL, {.number = 0}};
+            }
+            continue;
+        }
+
+        char tmp[128];
+        const char* part = NULL;
+        size_t part_len = 0;
+        if (v.type == VAL_NUMBER) {
+            int n = snprintf(tmp, sizeof(tmp), "%.15g", v.as.number);
+            if (n < 0) n = 0;
+            part = tmp;
+            part_len = (size_t)n;
+        } else if (v.type == VAL_BOOL) {
+            part = v.as.boolean ? "true" : "false";
+            part_len = strlen(part);
+        } else if (v.type == VAL_NIL) {
+            part = "nil";
+            part_len = 3;
+        } else {
+            Value j = native_json(1, &v);
+            if (is_string_value(j)) {
+                part = AS_STRING(j)->chars;
+                part_len = (size_t)AS_STRING(j)->length;
+            } else {
+                part = "<obj>";
+                part_len = 5;
+            }
+        }
+
+        if (!append_bytes_dyn(&out, &cap, &len, part, part_len)) {
+            free(out);
+            return (Value){VAL_NIL, {.number = 0}};
+        }
+    }
+
+    if (!out) return string_value("");
+    Value out_v = string_value(out);
+    free(out);
+    return out_v;
+}
+
+static Value native_text_len(int argCount, Value* args) {
+    if (argCount != 1 || !is_string_value(args[0])) return (Value){VAL_NIL, {.number = 0}};
+    return (Value){VAL_NUMBER, {.number = (double)AS_STRING(args[0])->length}};
+}
+
+static Value native_text_trim(int argCount, Value* args) {
+    if (argCount != 1 || !is_string_value(args[0])) return (Value){VAL_NIL, {.number = 0}};
+    char* copy = dup_cstr(AS_STRING(args[0])->chars);
+    if (!copy) return (Value){VAL_NIL, {.number = 0}};
+    char* trimmed = trim_inplace(copy);
+    Value out = string_value(trimmed);
+    free(copy);
+    return out;
+}
+
+static Value native_text_lower(int argCount, Value* args) {
+    if (argCount != 1 || !is_string_value(args[0])) return (Value){VAL_NIL, {.number = 0}};
+    ObjString* s = AS_STRING(args[0]);
+    char* out = (char*)malloc((size_t)s->length + 1);
+    if (!out) return (Value){VAL_NIL, {.number = 0}};
+    for (int i = 0; i < s->length; i++) out[i] = (char)tolower((unsigned char)s->chars[i]);
+    out[s->length] = '\0';
+    Value v = string_value(out);
+    free(out);
+    return v;
+}
+
+static Value native_text_upper(int argCount, Value* args) {
+    if (argCount != 1 || !is_string_value(args[0])) return (Value){VAL_NIL, {.number = 0}};
+    ObjString* s = AS_STRING(args[0]);
+    char* out = (char*)malloc((size_t)s->length + 1);
+    if (!out) return (Value){VAL_NIL, {.number = 0}};
+    for (int i = 0; i < s->length; i++) out[i] = (char)toupper((unsigned char)s->chars[i]);
+    out[s->length] = '\0';
+    Value v = string_value(out);
+    free(out);
+    return v;
+}
+
+static Value native_text_contains(int argCount, Value* args) {
+    if (argCount != 2 || !is_string_value(args[0]) || !is_string_value(args[1])) {
+        return (Value){VAL_BOOL, {.boolean = false}};
+    }
+    const char* hay = AS_STRING(args[0])->chars;
+    const char* needle = AS_STRING(args[1])->chars;
+    return (Value){VAL_BOOL, {.boolean = strstr(hay, needle) != NULL}};
+}
+
+static Value native_text_starts_with(int argCount, Value* args) {
+    if (argCount != 2 || !is_string_value(args[0]) || !is_string_value(args[1])) {
+        return (Value){VAL_BOOL, {.boolean = false}};
+    }
+    ObjString* s = AS_STRING(args[0]);
+    ObjString* p = AS_STRING(args[1]);
+    if (p->length > s->length) return (Value){VAL_BOOL, {.boolean = false}};
+    return (Value){VAL_BOOL, {.boolean = memcmp(s->chars, p->chars, (size_t)p->length) == 0}};
+}
+
+static Value native_text_ends_with(int argCount, Value* args) {
+    if (argCount != 2 || !is_string_value(args[0]) || !is_string_value(args[1])) {
+        return (Value){VAL_BOOL, {.boolean = false}};
+    }
+    ObjString* s = AS_STRING(args[0]);
+    ObjString* p = AS_STRING(args[1]);
+    if (p->length > s->length) return (Value){VAL_BOOL, {.boolean = false}};
+    const char* tail = s->chars + (s->length - p->length);
+    return (Value){VAL_BOOL, {.boolean = memcmp(tail, p->chars, (size_t)p->length) == 0}};
+}
+
+static Value native_text_replace(int argCount, Value* args) {
+    if (argCount != 3 || !is_string_value(args[0]) || !is_string_value(args[1]) || !is_string_value(args[2])) {
+        return (Value){VAL_NIL, {.number = 0}};
+    }
+
+    const char* src = AS_STRING(args[0])->chars;
+    const char* from = AS_STRING(args[1])->chars;
+    const char* to = AS_STRING(args[2])->chars;
+    size_t src_len = strlen(src);
+    size_t from_len = strlen(from);
+    size_t to_len = strlen(to);
+    if (from_len == 0) return string_value(src);
+
+    size_t count = 0;
+    const char* p = src;
+    while (1) {
+        const char* hit = strstr(p, from);
+        if (!hit) break;
+        count++;
+        p = hit + from_len;
+    }
+
+    if (count == 0) return string_value(src);
+
+    size_t out_len = src_len + count * (to_len - from_len);
+    char* out = (char*)malloc(out_len + 1);
+    if (!out) return (Value){VAL_NIL, {.number = 0}};
+
+    const char* cur = src;
+    char* dst = out;
+    while (1) {
+        const char* hit = strstr(cur, from);
+        if (!hit) break;
+        size_t head_len = (size_t)(hit - cur);
+        memcpy(dst, cur, head_len);
+        dst += head_len;
+        memcpy(dst, to, to_len);
+        dst += to_len;
+        cur = hit + from_len;
+    }
+    strcpy(dst, cur);
+
+    Value ret = string_value(out);
+    free(out);
+    return ret;
+}
+
+static Value native_text_split(int argCount, Value* args) {
+    if (argCount != 2 || !is_string_value(args[0]) || !is_string_value(args[1])) {
+        return (Value){VAL_OBJ, {.obj = (Obj*)new_array()}};
+    }
+
+    const char* src = AS_STRING(args[0])->chars;
+    const char* sep = AS_STRING(args[1])->chars;
+    size_t sep_len = strlen(sep);
+    ObjArray* out = new_array();
+
+    if (sep_len == 0) {
+        size_t n = strlen(src);
+        for (size_t i = 0; i < n; i++) {
+            char ch[2] = {src[i], '\0'};
+            array_append(out, string_value(ch));
+        }
+        return (Value){VAL_OBJ, {.obj = (Obj*)out}};
+    }
+
+    const char* p = src;
+    while (1) {
+        const char* hit = strstr(p, sep);
+        if (!hit) {
+            array_append(out, (Value){VAL_OBJ, {.obj = (Obj*)copy_string(p, (int)strlen(p))}});
+            break;
+        }
+        array_append(out, (Value){VAL_OBJ, {.obj = (Obj*)copy_string(p, (int)(hit - p))}});
+        p = hit + sep_len;
+    }
+
+    return (Value){VAL_OBJ, {.obj = (Obj*)out}};
+}
+
+static Value native_text_join(int argCount, Value* args) {
+    if (argCount < 1 || !IS_OBJ(args[0]) || AS_OBJ(args[0])->type != OBJ_ARRAY) {
+        return (Value){VAL_NIL, {.number = 0}};
+    }
+    const char* sep = "";
+    if (argCount >= 2 && is_string_value(args[1])) sep = AS_STRING(args[1])->chars;
+    return join_array_as_text((ObjArray*)AS_OBJ(args[0]), sep);
+}
+
+static Value native_arr_len(int argCount, Value* args) {
+    if (argCount != 1 || !IS_OBJ(args[0]) || AS_OBJ(args[0])->type != OBJ_ARRAY) return (Value){VAL_NIL, {.number = 0}};
+    return (Value){VAL_NUMBER, {.number = (double)((ObjArray*)AS_OBJ(args[0]))->count}};
+}
+
+static Value native_arr_push(int argCount, Value* args) {
+    if (argCount != 2 || !IS_OBJ(args[0]) || AS_OBJ(args[0])->type != OBJ_ARRAY) return (Value){VAL_NIL, {.number = 0}};
+    ObjArray* arr = (ObjArray*)AS_OBJ(args[0]);
+    array_append(arr, args[1]);
+    return (Value){VAL_NUMBER, {.number = (double)arr->count}};
+}
+
+static Value native_arr_pop(int argCount, Value* args) {
+    if (argCount != 1 || !IS_OBJ(args[0]) || AS_OBJ(args[0])->type != OBJ_ARRAY) return (Value){VAL_NIL, {.number = 0}};
+    ObjArray* arr = (ObjArray*)AS_OBJ(args[0]);
+    if (arr->count <= 0) return (Value){VAL_NIL, {.number = 0}};
+    Value out = arr->elements[arr->count - 1];
+    arr->count--;
+    return out;
+}
+
+static Value native_arr_at(int argCount, Value* args) {
+    if (argCount != 2 || !IS_OBJ(args[0]) || AS_OBJ(args[0])->type != OBJ_ARRAY || !IS_NUMBER(args[1])) {
+        return (Value){VAL_NIL, {.number = 0}};
+    }
+    ObjArray* arr = (ObjArray*)AS_OBJ(args[0]);
+    int idx = (int)args[1].as.number;
+    if (idx < 0) idx = arr->count + idx;
+    if (idx < 0 || idx >= arr->count) return (Value){VAL_NIL, {.number = 0}};
+    return arr->elements[idx];
+}
+
+static Value native_arr_set(int argCount, Value* args) {
+    if (argCount != 3 || !IS_OBJ(args[0]) || AS_OBJ(args[0])->type != OBJ_ARRAY || !IS_NUMBER(args[1])) {
+        return (Value){VAL_BOOL, {.boolean = false}};
+    }
+    ObjArray* arr = (ObjArray*)AS_OBJ(args[0]);
+    int idx = (int)args[1].as.number;
+    if (idx < 0) idx = arr->count + idx;
+    if (idx < 0 || idx >= arr->count) return (Value){VAL_BOOL, {.boolean = false}};
+
+    if (IS_OBJ(arr->elements[idx])) release_obj(AS_OBJ(arr->elements[idx]));
+    arr->elements[idx] = args[2];
+    if (IS_OBJ(args[2])) retain_obj(AS_OBJ(args[2]));
+    return (Value){VAL_BOOL, {.boolean = true}};
+}
+
+static Value native_arr_slice(int argCount, Value* args) {
+    if (argCount != 3 || !IS_OBJ(args[0]) || AS_OBJ(args[0])->type != OBJ_ARRAY ||
+        !IS_NUMBER(args[1]) || !IS_NUMBER(args[2])) {
+        return (Value){VAL_OBJ, {.obj = (Obj*)new_array()}};
+    }
+    ObjArray* arr = (ObjArray*)AS_OBJ(args[0]);
+    int n = arr->count;
+    int start = (int)args[1].as.number;
+    int end = (int)args[2].as.number;
+    if (start < 0) start = n + start;
+    if (end < 0) end = n + end;
+    if (start < 0) start = 0;
+    if (end > n) end = n;
+    if (start > n) start = n;
+    if (end < start) end = start;
+
+    ObjArray* out = new_array();
+    for (int i = start; i < end; i++) array_append(out, arr->elements[i]);
+    return (Value){VAL_OBJ, {.obj = (Obj*)out}};
+}
+
+static Value native_arr_reverse(int argCount, Value* args) {
+    if (argCount != 1 || !IS_OBJ(args[0]) || AS_OBJ(args[0])->type != OBJ_ARRAY) {
+        return (Value){VAL_OBJ, {.obj = (Obj*)new_array()}};
+    }
+    ObjArray* arr = (ObjArray*)AS_OBJ(args[0]);
+    ObjArray* out = new_array();
+    for (int i = arr->count - 1; i >= 0; i--) array_append(out, arr->elements[i]);
+    return (Value){VAL_OBJ, {.obj = (Obj*)out}};
+}
+
+static Value native_arr_map(int argCount, Value* args) {
+    if (argCount != 2 || !IS_OBJ(args[0]) || AS_OBJ(args[0])->type != OBJ_ARRAY ||
+        !IS_OBJ(args[1]) || AS_OBJ(args[1])->type != OBJ_FUNCTION) {
+        return (Value){VAL_OBJ, {.obj = (Obj*)new_array()}};
+    }
+    ObjArray* arr = (ObjArray*)AS_OBJ(args[0]);
+    ObjFunction* fn = (ObjFunction*)AS_OBJ(args[1]);
+    ObjArray* out = new_array();
+    for (int i = 0; i < arr->count; i++) {
+        Value fn_args[2];
+        fn_args[0] = arr->elements[i];
+        fn_args[1] = (Value){VAL_NUMBER, {.number = (double)i}};
+        Value mapped = call_viper_function(fn, 2, fn_args);
+        array_append(out, mapped);
+    }
+    return (Value){VAL_OBJ, {.obj = (Obj*)out}};
+}
+
+static Value native_arr_filter(int argCount, Value* args) {
+    if (argCount != 2 || !IS_OBJ(args[0]) || AS_OBJ(args[0])->type != OBJ_ARRAY ||
+        !IS_OBJ(args[1]) || AS_OBJ(args[1])->type != OBJ_FUNCTION) {
+        return (Value){VAL_OBJ, {.obj = (Obj*)new_array()}};
+    }
+    ObjArray* arr = (ObjArray*)AS_OBJ(args[0]);
+    ObjFunction* fn = (ObjFunction*)AS_OBJ(args[1]);
+    ObjArray* out = new_array();
+    for (int i = 0; i < arr->count; i++) {
+        Value fn_args[2];
+        fn_args[0] = arr->elements[i];
+        fn_args[1] = (Value){VAL_NUMBER, {.number = (double)i}};
+        Value keep = call_viper_function(fn, 2, fn_args);
+        if (value_is_truthy(keep)) array_append(out, arr->elements[i]);
+    }
+    return (Value){VAL_OBJ, {.obj = (Obj*)out}};
+}
+
+static Value native_arr_reduce(int argCount, Value* args) {
+    if (argCount < 2 || argCount > 3 || !IS_OBJ(args[0]) || AS_OBJ(args[0])->type != OBJ_ARRAY) {
+        return (Value){VAL_NIL, {.number = 0}};
+    }
+
+    ObjArray* arr = (ObjArray*)AS_OBJ(args[0]);
+    ObjFunction* fn = NULL;
+    Value acc = (Value){VAL_NIL, {.number = 0}};
+    int start = 0;
+
+    if (argCount == 2) {
+        if (!IS_OBJ(args[1]) || AS_OBJ(args[1])->type != OBJ_FUNCTION) return (Value){VAL_NIL, {.number = 0}};
+        if (arr->count <= 0) return (Value){VAL_NIL, {.number = 0}};
+        fn = (ObjFunction*)AS_OBJ(args[1]);
+        acc = arr->elements[0];
+        start = 1;
+    } else {
+        if (!IS_OBJ(args[2]) || AS_OBJ(args[2])->type != OBJ_FUNCTION) return (Value){VAL_NIL, {.number = 0}};
+        fn = (ObjFunction*)AS_OBJ(args[2]);
+        acc = args[1];
+        start = 0;
+    }
+
+    for (int i = start; i < arr->count; i++) {
+        Value fn_args[3];
+        fn_args[0] = acc;
+        fn_args[1] = arr->elements[i];
+        fn_args[2] = (Value){VAL_NUMBER, {.number = (double)i}};
+        acc = call_viper_function(fn, 3, fn_args);
+    }
+    return acc;
+}
+
+static Value native_arr_join(int argCount, Value* args) {
+    if (argCount < 1 || !IS_OBJ(args[0]) || AS_OBJ(args[0])->type != OBJ_ARRAY) {
+        return (Value){VAL_NIL, {.number = 0}};
+    }
+    const char* sep = "";
+    if (argCount >= 2 && is_string_value(args[1])) sep = AS_STRING(args[1])->chars;
+    return join_array_as_text((ObjArray*)AS_OBJ(args[0]), sep);
 }
 
 static Value native_keys_method(int argCount, Value* args) {
@@ -3283,7 +3786,12 @@ static Value native_meta_symbols(int argCount, Value* args) {
     (void)args;
     char out[8192];
     size_t len = 0;
-    if (!append_fmt(out, sizeof(out), &len, "{\"native_count\":%d,\"ai_tool_count\":%d,\"natives\":[", _native_count, g_ai_tool_count)) {
+    if (!append_fmt(out, sizeof(out), &len,
+                    "{\"profile\":\"%s\",\"caps\":{\"os\":%d,\"fs\":%d,\"web\":%d,\"db\":%d,\"ai\":%d,\"cache\":%d,\"util\":%d,\"meta\":%d},\"native_count\":%d,\"ai_tool_count\":%d,\"natives\":[",
+                    VIPER_PROFILE_NAME,
+                    VIPER_CAP_OS, VIPER_CAP_FS, VIPER_CAP_WEB, VIPER_CAP_DB, VIPER_CAP_AI,
+                    VIPER_CAP_CACHE, VIPER_CAP_UTIL, VIPER_CAP_META,
+                    _native_count, g_ai_tool_count)) {
         return (Value){VAL_NIL, {.number = 0}};
     }
     for (int i = 0; i < _native_count; i++) {
@@ -3364,6 +3872,12 @@ static Value native_meta_compress_context(int argCount, Value* args) {
     );
 }
 
+static Value native_profile(int argCount, Value* args) {
+    (void)argCount; (void)args;
+    profiler_print_snapshot();
+    return (Value){VAL_NIL, {.number = 0}};
+}
+
 void init_native_core() {
     _native_count = 0;
     srand((unsigned int)time(NULL));
@@ -3377,121 +3891,291 @@ void init_native_core() {
     ai_clear_tool_registry();
 
     // Core runtime
-    push_native("pr", native_print);
-    push_native("clock", native_clock);
-    push_native("load_dl", native_load_dl);
-    push_native("get_fn", native_get_fn);
-    push_native("serve", native_serve);
-    push_native("fetch", native_fetch);
-    push_native("query", native_query);
-    push_native("json", native_json);
-    push_native("panic", native_panic);
-    push_native("recover", native_recover);
+    push_native_cap("pr", native_print, "core", true);
+    push_native_cap("pr_profile", native_profile, "core", true);
+    push_native_cap("clock", native_clock, "core", true);
+    push_native_cap("load_dl", native_load_dl, "core", true);
+    push_native_cap("get_fn", native_get_fn, "core", true);
+#if VIPER_CAP_WEB
+    push_native_cap("serve", native_serve, "web", true);
+    push_native_cap("fetch", native_fetch, "web", true);
+#else
+    push_native_cap("serve", native_disabled_web, "web", false);
+    push_native_cap("fetch", native_disabled_web, "web", false);
+#endif
+#if VIPER_CAP_DB
+    push_native_cap("query", native_query, "db", true);
+#else
+    push_native_cap("query", native_disabled_db, "db", false);
+#endif
+    push_native_cap("json", native_json, "core", true);
+    push_native_cap("panic", native_panic, "core", true);
+    push_native_cap("recover", native_recover, "core", true);
 
     // Core dynamic helpers (method-call path)
-    push_native("keys", native_keys_method);
-    push_native("has", native_has_method);
+    push_native_cap("keys", native_keys_method, "core", true);
+    push_native_cap("has", native_has_method, "core", true);
 
     // OS primitives
-    push_native("os_sh", native_sh);
-    push_native("os_env", native_env);
-    push_native("os_setenv", native_setenv);
-    push_native("os_args", native_args);
-    push_native("os_exit", native_exit_now);
-    push_native("os_cwd", native_cwd);
-    push_native("os_pid", native_pid);
-    push_native("os_kill", native_kill_proc);
-    push_native("os_sleep", native_sleep_ms);
-    push_native("os_info", native_os_info);
-    push_native("os_cron", native_os_cron);
+#if VIPER_CAP_OS
+    push_native_cap("os_sh", native_sh, "os", true);
+    push_native_cap("os_env", native_env, "os", true);
+    push_native_cap("os_setenv", native_setenv, "os", true);
+    push_native_cap("os_args", native_args, "os", true);
+    push_native_cap("os_exit", native_exit_now, "os", true);
+    push_native_cap("os_cwd", native_cwd, "os", true);
+    push_native_cap("os_pid", native_pid, "os", true);
+    push_native_cap("os_kill", native_kill_proc, "os", true);
+    push_native_cap("os_sleep", native_sleep_ms, "os", true);
+    push_native_cap("os_info", native_os_info, "os", true);
+    push_native_cap("os_cron", native_os_cron, "os", true);
+#else
+    push_native_cap("os_sh", native_disabled_os, "os", false);
+    push_native_cap("os_env", native_disabled_os, "os", false);
+    push_native_cap("os_setenv", native_disabled_os, "os", false);
+    push_native_cap("os_args", native_disabled_os, "os", false);
+    push_native_cap("os_exit", native_disabled_os, "os", false);
+    push_native_cap("os_cwd", native_disabled_os, "os", false);
+    push_native_cap("os_pid", native_disabled_os, "os", false);
+    push_native_cap("os_kill", native_disabled_os, "os", false);
+    push_native_cap("os_sleep", native_disabled_os, "os", false);
+    push_native_cap("os_info", native_disabled_os, "os", false);
+    push_native_cap("os_cron", native_disabled_os, "os", false);
+#endif
 
     // FS primitives
-    push_native("fs_read", native_read);
-    push_native("fs_read_bytes", native_read_bytes);
-    push_native("fs_write", native_write);
-    push_native("fs_append", native_append);
-    push_native("fs_delete", native_delete_file);
-    push_native("fs_copy", native_copy_file);
-    push_native("fs_move", native_move_file);
-    push_native("fs_exists", native_exists);
-    push_native("fs_is_dir", native_is_dir);
-    push_native("fs_mkdir", native_mkdir);
-    push_native("fs_ls", native_ls);
-    push_native("fs_watch", native_watch);
-    push_native("fs_stream_read", native_stream_read);
+#if VIPER_CAP_FS
+    push_native_cap("fs_read", native_read, "fs", true);
+    push_native_cap("fs_read_bytes", native_read_bytes, "fs", true);
+    push_native_cap("fs_write", native_write, "fs", true);
+    push_native_cap("fs_append", native_append, "fs", true);
+    push_native_cap("fs_delete", native_delete_file, "fs", true);
+    push_native_cap("fs_copy", native_copy_file, "fs", true);
+    push_native_cap("fs_move", native_move_file, "fs", true);
+    push_native_cap("fs_exists", native_exists, "fs", true);
+    push_native_cap("fs_is_dir", native_is_dir, "fs", true);
+    push_native_cap("fs_mkdir", native_mkdir, "fs", true);
+    push_native_cap("fs_ls", native_ls, "fs", true);
+    push_native_cap("fs_watch", native_watch, "fs", true);
+    push_native_cap("fs_stream_read", native_stream_read, "fs", true);
+#else
+    push_native_cap("fs_read", native_disabled_fs, "fs", false);
+    push_native_cap("fs_read_bytes", native_disabled_fs, "fs", false);
+    push_native_cap("fs_write", native_disabled_fs, "fs", false);
+    push_native_cap("fs_append", native_disabled_fs, "fs", false);
+    push_native_cap("fs_delete", native_disabled_fs, "fs", false);
+    push_native_cap("fs_copy", native_disabled_fs, "fs", false);
+    push_native_cap("fs_move", native_disabled_fs, "fs", false);
+    push_native_cap("fs_exists", native_disabled_fs, "fs", false);
+    push_native_cap("fs_is_dir", native_disabled_fs, "fs", false);
+    push_native_cap("fs_mkdir", native_disabled_fs, "fs", false);
+    push_native_cap("fs_ls", native_disabled_fs, "fs", false);
+    push_native_cap("fs_watch", native_disabled_fs, "fs", false);
+    push_native_cap("fs_stream_read", native_disabled_fs, "fs", false);
+#endif
 
     // Time & math utility primitives
-    push_native("time_now", native_time_now);
-    push_native("time_format", native_time_format);
-    push_native("time_parse", native_time_parse);
-    push_native("time_add", native_time_add);
-    push_native("math_rand", native_math_rand);
-    push_native("math_uuid", native_math_uuid);
-    push_native("math_round", native_math_round);
-    push_native("math_hash", native_math_hash);
+#if VIPER_CAP_UTIL
+    push_native_cap("time_now", native_time_now, "util", true);
+    push_native_cap("time_format", native_time_format, "util", true);
+    push_native_cap("time_parse", native_time_parse, "util", true);
+    push_native_cap("time_add", native_time_add, "util", true);
+    push_native_cap("math_rand", native_math_rand, "util", true);
+    push_native_cap("math_uuid", native_math_uuid, "util", true);
+    push_native_cap("math_round", native_math_round, "util", true);
+    push_native_cap("math_hash", native_math_hash, "util", true);
+#else
+    push_native_cap("time_now", native_disabled_util, "util", false);
+    push_native_cap("time_format", native_disabled_util, "util", false);
+    push_native_cap("time_parse", native_disabled_util, "util", false);
+    push_native_cap("time_add", native_disabled_util, "util", false);
+    push_native_cap("math_rand", native_disabled_util, "util", false);
+    push_native_cap("math_uuid", native_disabled_util, "util", false);
+    push_native_cap("math_round", native_disabled_util, "util", false);
+    push_native_cap("math_hash", native_disabled_util, "util", false);
+#endif
 
     // Cache primitives
-    push_native("cache_set", native_cache_set);
-    push_native("cache_get", native_cache_get);
-    push_native("cache_delete", native_cache_delete);
-    push_native("cache_has", native_cache_has);
-    push_native("cache_increment", native_cache_increment);
-    push_native("cache_clear", native_cache_clear);
-    push_native("cache_keys", native_cache_keys);
+#if VIPER_CAP_CACHE
+    push_native_cap("cache_set", native_cache_set, "cache", true);
+    push_native_cap("cache_get", native_cache_get, "cache", true);
+    push_native_cap("cache_delete", native_cache_delete, "cache", true);
+    push_native_cap("cache_has", native_cache_has, "cache", true);
+    push_native_cap("cache_increment", native_cache_increment, "cache", true);
+    push_native_cap("cache_clear", native_cache_clear, "cache", true);
+    push_native_cap("cache_keys", native_cache_keys, "cache", true);
+#else
+    push_native_cap("cache_set", native_disabled_cache, "cache", false);
+    push_native_cap("cache_get", native_disabled_cache, "cache", false);
+    push_native_cap("cache_delete", native_disabled_cache, "cache", false);
+    push_native_cap("cache_has", native_disabled_cache, "cache", false);
+    push_native_cap("cache_increment", native_disabled_cache, "cache", false);
+    push_native_cap("cache_clear", native_disabled_cache, "cache", false);
+    push_native_cap("cache_keys", native_disabled_cache, "cache", false);
+#endif
 
     // Web primitives
-    push_native("web_serve", native_web_serve);
-    push_native("web_route", native_web_route);
-    push_native("web_middleware", native_web_middleware);
-    push_native("web_static", native_web_static);
-    push_native("web_cors", native_web_cors);
-    push_native("web_jwt_sign", native_web_jwt_sign);
-    push_native("web_jwt_verify", native_web_jwt_verify);
-    push_native("web_hash", native_web_hash);
-    push_native("web_fetch", native_fetch);
-    push_native("web_post", native_web_post);
-    push_native("web_put", native_web_put);
-    push_native("web_patch", native_web_patch);
-    push_native("web_delete", native_web_delete);
-    push_native("web_ws_serve", native_web_ws_serve);
-    push_native("web_ws_send", native_web_ws_send);
-    push_native("web_download", native_web_download);
-    push_native("web_upload", native_web_upload);
+#if VIPER_CAP_WEB
+    push_native_cap("web_serve", native_web_serve, "web", true);
+    push_native_cap("web_route", native_web_route, "web", true);
+    push_native_cap("web_middleware", native_web_middleware, "web", true);
+    push_native_cap("web_static", native_web_static, "web", true);
+    push_native_cap("web_cors", native_web_cors, "web", true);
+    push_native_cap("web_jwt_sign", native_web_jwt_sign, "web", true);
+    push_native_cap("web_jwt_verify", native_web_jwt_verify, "web", true);
+    push_native_cap("web_hash", native_web_hash, "web", true);
+    push_native_cap("web_fetch", native_fetch, "web", true);
+    push_native_cap("web_post", native_web_post, "web", true);
+    push_native_cap("web_put", native_web_put, "web", true);
+    push_native_cap("web_patch", native_web_patch, "web", true);
+    push_native_cap("web_delete", native_web_delete, "web", true);
+    push_native_cap("web_ws_serve", native_web_ws_serve, "web", true);
+    push_native_cap("web_ws_send", native_web_ws_send, "web", true);
+    push_native_cap("web_download", native_web_download, "web", true);
+    push_native_cap("web_upload", native_web_upload, "web", true);
+#else
+    push_native_cap("web_serve", native_disabled_web, "web", false);
+    push_native_cap("web_route", native_disabled_web, "web", false);
+    push_native_cap("web_middleware", native_disabled_web, "web", false);
+    push_native_cap("web_static", native_disabled_web, "web", false);
+    push_native_cap("web_cors", native_disabled_web, "web", false);
+    push_native_cap("web_jwt_sign", native_disabled_web, "web", false);
+    push_native_cap("web_jwt_verify", native_disabled_web, "web", false);
+    push_native_cap("web_hash", native_disabled_web, "web", false);
+    push_native_cap("web_fetch", native_disabled_web, "web", false);
+    push_native_cap("web_post", native_disabled_web, "web", false);
+    push_native_cap("web_put", native_disabled_web, "web", false);
+    push_native_cap("web_patch", native_disabled_web, "web", false);
+    push_native_cap("web_delete", native_disabled_web, "web", false);
+    push_native_cap("web_ws_serve", native_disabled_web, "web", false);
+    push_native_cap("web_ws_send", native_disabled_web, "web", false);
+    push_native_cap("web_download", native_disabled_web, "web", false);
+    push_native_cap("web_upload", native_disabled_web, "web", false);
+#endif
 
     // DB primitives
-    push_native("vdb_connect", vdb_connect);
-    push_native("vdb_sync", vdb_sync);
-    push_native("vdb_get", vdb_get);
-    push_native("vdb_find", vdb_find);
-    push_native("vdb_first", vdb_first);
-    push_native("vdb_save", vdb_save);
-    push_native("vdb_insert", vdb_insert);
-    push_native("vdb_update", vdb_update);
-    push_native("vdb_upsert", vdb_upsert);
-    push_native("vdb_delete", vdb_delete);
-    push_native("vdb_query", vdb_query);
-    push_native("vdb_begin", vdb_begin);
-    push_native("vdb_commit", vdb_commit);
-    push_native("vdb_rollback", vdb_rollback);
-    push_native("vdb_count", vdb_count);
-    push_native("vdb_exists", vdb_exists);
-    push_native("vdb_paginate", vdb_paginate);
-    push_native("vdb_table", vdb_table);
-    push_native("vdb_where", vdb_where);
+#if VIPER_CAP_DB
+    push_native_cap("vdb_connect", vdb_connect, "db", true);
+    push_native_cap("vdb_sync", vdb_sync, "db", true);
+    push_native_cap("vdb_get", vdb_get, "db", true);
+    push_native_cap("vdb_find", vdb_find, "db", true);
+    push_native_cap("vdb_first", vdb_first, "db", true);
+    push_native_cap("vdb_save", vdb_save, "db", true);
+    push_native_cap("vdb_insert", vdb_insert, "db", true);
+    push_native_cap("vdb_update", vdb_update, "db", true);
+    push_native_cap("vdb_upsert", vdb_upsert, "db", true);
+    push_native_cap("vdb_delete", vdb_delete, "db", true);
+    push_native_cap("vdb_query", vdb_query, "db", true);
+    push_native_cap("vdb_begin", vdb_begin, "db", true);
+    push_native_cap("vdb_commit", vdb_commit, "db", true);
+    push_native_cap("vdb_rollback", vdb_rollback, "db", true);
+    push_native_cap("vdb_count", vdb_count, "db", true);
+    push_native_cap("vdb_exists", vdb_exists, "db", true);
+    push_native_cap("vdb_paginate", vdb_paginate, "db", true);
+    push_native_cap("vdb_table", vdb_table, "db", true);
+    push_native_cap("vdb_where", vdb_where, "db", true);
+#else
+    push_native_cap("vdb_connect", native_disabled_db, "db", false);
+    push_native_cap("vdb_sync", native_disabled_db, "db", false);
+    push_native_cap("vdb_get", native_disabled_db, "db", false);
+    push_native_cap("vdb_find", native_disabled_db, "db", false);
+    push_native_cap("vdb_first", native_disabled_db, "db", false);
+    push_native_cap("vdb_save", native_disabled_db, "db", false);
+    push_native_cap("vdb_insert", native_disabled_db, "db", false);
+    push_native_cap("vdb_update", native_disabled_db, "db", false);
+    push_native_cap("vdb_upsert", native_disabled_db, "db", false);
+    push_native_cap("vdb_delete", native_disabled_db, "db", false);
+    push_native_cap("vdb_query", native_disabled_db, "db", false);
+    push_native_cap("vdb_begin", native_disabled_db, "db", false);
+    push_native_cap("vdb_commit", native_disabled_db, "db", false);
+    push_native_cap("vdb_rollback", native_disabled_db, "db", false);
+    push_native_cap("vdb_count", native_disabled_db, "db", false);
+    push_native_cap("vdb_exists", native_disabled_db, "db", false);
+    push_native_cap("vdb_paginate", native_disabled_db, "db", false);
+    push_native_cap("vdb_table", native_disabled_db, "db", false);
+    push_native_cap("vdb_where", native_disabled_db, "db", false);
+#endif
 
     // AI primitives
-    push_native("ai_config", native_ai_config);
-    push_native("ai_ask", native_ai_ask);
-    push_native("ai_chat", native_ai_chat);
-    push_native("ai_embed", native_ai_embed);
-    push_native("ai_extract", native_ai_extract);
-    push_native("ai_vision", native_ai_vision);
-    push_native("ai_tool", native_ai_tool);
+#if VIPER_CAP_AI
+    push_native_cap("ai_config", native_ai_config, "ai", true);
+    push_native_cap("ai_ask", native_ai_ask, "ai", true);
+    push_native_cap("ai_chat", native_ai_chat, "ai", true);
+    push_native_cap("ai_embed", native_ai_embed, "ai", true);
+    push_native_cap("ai_extract", native_ai_extract, "ai", true);
+    push_native_cap("ai_vision", native_ai_vision, "ai", true);
+    push_native_cap("ai_tool", native_ai_tool, "ai", true);
+#else
+    push_native_cap("ai_config", native_disabled_ai, "ai", false);
+    push_native_cap("ai_ask", native_disabled_ai, "ai", false);
+    push_native_cap("ai_chat", native_disabled_ai, "ai", false);
+    push_native_cap("ai_embed", native_disabled_ai, "ai", false);
+    push_native_cap("ai_extract", native_disabled_ai, "ai", false);
+    push_native_cap("ai_vision", native_disabled_ai, "ai", false);
+    push_native_cap("ai_tool", native_disabled_ai, "ai", false);
+#endif
 
     // Meta primitives
-    push_native("meta_symbols", native_meta_symbols);
-    push_native("meta_ast", native_meta_ast);
-    push_native("meta_eval_sandboxed", native_meta_eval_sandboxed);
-    push_native("meta_test_runner", native_meta_test_runner);
-    push_native("meta_compress_context", native_meta_compress_context);
+#if VIPER_CAP_META
+    push_native_cap("meta_symbols", native_meta_symbols, "meta", true);
+    push_native_cap("meta_ast", native_meta_ast, "meta", true);
+    push_native_cap("meta_eval_sandboxed", native_meta_eval_sandboxed, "meta", true);
+    push_native_cap("meta_test_runner", native_meta_test_runner, "meta", true);
+    push_native_cap("meta_compress_context", native_meta_compress_context, "meta", true);
+#else
+    push_native_cap("meta_symbols", native_disabled_meta, "meta", false);
+    push_native_cap("meta_ast", native_disabled_meta, "meta", false);
+    push_native_cap("meta_eval_sandboxed", native_disabled_meta, "meta", false);
+    push_native_cap("meta_test_runner", native_disabled_meta, "meta", false);
+    push_native_cap("meta_compress_context", native_disabled_meta, "meta", false);
+#endif
+
+    // Extended text + collections primitives (AI density helpers)
+#if VIPER_CAP_UTIL
+    push_native_cap("text_len", native_text_len, "util", true);
+    push_native_cap("text_trim", native_text_trim, "util", true);
+    push_native_cap("text_lower", native_text_lower, "util", true);
+    push_native_cap("text_upper", native_text_upper, "util", true);
+    push_native_cap("text_contains", native_text_contains, "util", true);
+    push_native_cap("text_starts_with", native_text_starts_with, "util", true);
+    push_native_cap("text_ends_with", native_text_ends_with, "util", true);
+    push_native_cap("text_replace", native_text_replace, "util", true);
+    push_native_cap("text_split", native_text_split, "util", true);
+    push_native_cap("text_join", native_text_join, "util", true);
+
+    push_native_cap("arr_len", native_arr_len, "util", true);
+    push_native_cap("arr_push", native_arr_push, "util", true);
+    push_native_cap("arr_pop", native_arr_pop, "util", true);
+    push_native_cap("arr_at", native_arr_at, "util", true);
+    push_native_cap("arr_set", native_arr_set, "util", true);
+    push_native_cap("arr_slice", native_arr_slice, "util", true);
+    push_native_cap("arr_reverse", native_arr_reverse, "util", true);
+    push_native_cap("arr_map", native_arr_map, "util", true);
+    push_native_cap("arr_filter", native_arr_filter, "util", true);
+    push_native_cap("arr_reduce", native_arr_reduce, "util", true);
+    push_native_cap("arr_join", native_arr_join, "util", true);
+#else
+    push_native_cap("text_len", native_disabled_util, "util", false);
+    push_native_cap("text_trim", native_disabled_util, "util", false);
+    push_native_cap("text_lower", native_disabled_util, "util", false);
+    push_native_cap("text_upper", native_disabled_util, "util", false);
+    push_native_cap("text_contains", native_disabled_util, "util", false);
+    push_native_cap("text_starts_with", native_disabled_util, "util", false);
+    push_native_cap("text_ends_with", native_disabled_util, "util", false);
+    push_native_cap("text_replace", native_disabled_util, "util", false);
+    push_native_cap("text_split", native_disabled_util, "util", false);
+    push_native_cap("text_join", native_disabled_util, "util", false);
+
+    push_native_cap("arr_len", native_disabled_util, "util", false);
+    push_native_cap("arr_push", native_disabled_util, "util", false);
+    push_native_cap("arr_pop", native_disabled_util, "util", false);
+    push_native_cap("arr_at", native_disabled_util, "util", false);
+    push_native_cap("arr_set", native_disabled_util, "util", false);
+    push_native_cap("arr_slice", native_disabled_util, "util", false);
+    push_native_cap("arr_reverse", native_disabled_util, "util", false);
+    push_native_cap("arr_map", native_disabled_util, "util", false);
+    push_native_cap("arr_filter", native_disabled_util, "util", false);
+    push_native_cap("arr_reduce", native_disabled_util, "util", false);
+    push_native_cap("arr_join", native_disabled_util, "util", false);
+#endif
 }
