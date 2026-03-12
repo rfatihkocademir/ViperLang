@@ -1,0 +1,19 @@
+st User {
+    name
+    age
+}
+
+fn make_user() -> User {
+    ret User("Ada", 37)
+}
+
+fn lucky() -> int {
+    ret 12
+}
+
+var user: User = make_user()
+var answer: int = lucky()
+answer = answer + 1
+
+pr(user.name)
+pr(answer)

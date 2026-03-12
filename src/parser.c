@@ -221,7 +221,8 @@ static AstNode* primary() {
         if (!args) parser_fatal_oom();
         args[0] = expression();
         AstNode* callee = ast_new_identifier(tok);
-        return ast_new_call_expr(callee, tok, args, 1);
+        AstNode* node = ast_new_call_expr(callee, tok, args, 1);
+        return node;
     }
 
 
@@ -409,6 +410,8 @@ static AstNode* call() {
             if (consume_field_name(&field, "Expected field name after '?.'.")) {
                 expr = ast_new_safe_get_expr(expr, field);
             }
+        } else if (match_token(TOKEN_QUESTION)) {
+            expr = ast_new_error_propagate_expr(expr);
         } else {
             break;
         }
@@ -458,8 +461,9 @@ static AstNode* term() {
 
 static AstNode* comparison() {
     AstNode* expr = term();
-    while (match_token(TOKEN_EQUAL_EQUAL) || match_token(TOKEN_LESS) ||
-           match_token(TOKEN_GREATER) || match_token(TOKEN_MATCH)) {
+    while (match_token(TOKEN_EQUAL_EQUAL) || match_token(TOKEN_BANG_EQUAL) ||
+           match_token(TOKEN_LESS) || match_token(TOKEN_GREATER) || 
+           match_token(TOKEN_MATCH)) {
         Token op = parser.previous;
         AstNode* right = term();
         if (op.type == TOKEN_MATCH) {
@@ -524,7 +528,51 @@ static AstNode* while_statement() {
     return ast_new_while_stmt(condition, body);
 }
 
-static AstNode* func_declaration() {
+static bool parse_effect_decorators(Token** out_effects, int* out_count) {
+    Token* effects = NULL;
+    int effect_count = 0;
+    int effect_cap = 0;
+
+    while (match_token(TOKEN_AT)) {
+        Token decorator = {0};
+        if (!consume_decl_name(&decorator, "Expected decorator name after '@'.")) {
+            free(effects);
+            return false;
+        }
+
+        if (!(decorator.length == 6 && memcmp(decorator.start, "effect", 6) == 0)) {
+            printf("Syntax Error on line %d: Unknown decorator '@%.*s'.\n",
+                   decorator.line, decorator.length, decorator.start);
+            parser.hadError = true;
+            free(effects);
+            return false;
+        }
+
+        consume(TOKEN_LEFT_PAREN, "Expected '(' after '@effect'.");
+        if (!check(TOKEN_RIGHT_PAREN)) {
+            do {
+                Token effect = {0};
+                if (!consume_decl_name(&effect, "Expected effect name inside '@effect(...)'.")) {
+                    free(effects);
+                    return false;
+                }
+                if (!ensure_capacity((void**)&effects, &effect_cap,
+                                     effect_count + 1, sizeof(Token))) {
+                    free(effects);
+                    parser_fatal_oom();
+                }
+                effects[effect_count++] = effect;
+            } while (match_token(TOKEN_COMMA));
+        }
+        consume(TOKEN_RIGHT_PAREN, "Expected ')' after effect list.");
+    }
+
+    *out_effects = effects;
+    *out_count = effect_count;
+    return true;
+}
+
+static AstNode* func_declaration_with_effects(Token* effects, int effect_count) {
     Token name = {0};
     (void)consume_decl_name(&name, "Expected function name.");
     consume(TOKEN_LEFT_PAREN, "Expected '(' after function name.");
@@ -563,7 +611,11 @@ static AstNode* func_declaration() {
     
     consume(TOKEN_LEFT_BRACE, "Expected '{' before function body.");
     AstNode* body = block();
-    return ast_new_func_decl(name, params, param_count, return_type, body);
+    return ast_new_func_decl(name, params, param_count, effects, effect_count, return_type, body);
+}
+
+static AstNode* func_declaration() {
+    return func_declaration_with_effects(NULL, 0);
 }
 
 static AstNode* struct_declaration() {
@@ -593,6 +645,28 @@ static AstNode* sync_statement() {
 }
 
 static AstNode* statement() {
+    Token* effects = NULL;
+    int effect_count = 0;
+    if (check(TOKEN_AT)) {
+        if (!parse_effect_decorators(&effects, &effect_count)) {
+            return ast_new_expr_stmt(ast_new_nil());
+        }
+    }
+
+    if (effect_count > 0) {
+        bool is_public = match_token(TOKEN_PUB);
+        if (match_token(TOKEN_FN)) {
+            AstNode* fn = func_declaration_with_effects(effects, effect_count);
+            fn->data.func_decl.is_public = is_public;
+            return fn;
+        }
+        printf("Syntax Error on line %d: '@effect' can only be applied to function declarations.\n",
+               parser.current.line);
+        parser.hadError = true;
+        free(effects);
+        return ast_new_expr_stmt(ast_new_nil());
+    }
+
     if (match_token(TOKEN_PUB)) {
         if (match_token(TOKEN_FN)) {
             AstNode* fn = func_declaration();

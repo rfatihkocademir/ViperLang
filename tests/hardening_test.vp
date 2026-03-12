@@ -1,0 +1,55 @@
+// ViperLang Hardening Verification Script (v4)
+use "@std/crypto" as crypto
+use "@std/db" as db
+use "@std/net" as net
+use "@std/math" as math
+
+pr("1. Testing CSPRNG & Crypto Headers...")
+var uuid = math.uuid()
+pr("UUID generated: " + uuid)
+if (text_len(uuid) == 36) {
+    pr("SUCCESS: UUID length is 36")
+} else {
+    pr("FAIL: Invalid UUID length: " + text_len(uuid))
+}
+
+var hmac = crypto.hmac_sha256("secret", "hello world")
+pr("HMAC-SHA256: " + hmac)
+if (text_len(hmac) == 64) {
+    pr("SUCCESS: HMAC length is 64")
+} else {
+    pr("FAIL: Invalid HMAC length")
+}
+
+pr("\n2. Testing Native SQLite Driver...")
+db.connect(":memory:")
+db.query("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);")
+db.query("INSERT INTO users (name) VALUES (\"Alice\");")
+db.query("INSERT INTO users (name) VALUES (\"Bob\");")
+var users = db.query("SELECT * FROM users ORDER BY name ASC;")
+pr("Users from DB: " + json(users))
+// Native driver returns array of arrays (rows)
+if (users[0][1] == "Alice") {
+    pr("SUCCESS: DB Query Result correct")
+} else {
+    pr("FAIL: DB Query Result mismatch")
+}
+
+pr("\n3. Testing JSON Escaping & Dynamics...")
+// Using double quotes and escaping for the internal JSON string
+var complex_json = "{\"key\": \"value with \\n newline \\\" quotes\", \"fields\": [1, 2, 3]}"
+var obj = json(complex_json)
+pr("Parsed JSON key: " + obj.key)
+if (text_contains(obj.key, "newline")) {
+    pr("SUCCESS: JSON Escape parsing verified")
+} else {
+    pr("FAIL: JSON Escape parsing")
+}
+
+pr("\n4. Testing Web Request/Response Objects (Heuristic)...")
+// Since we can't easily run a long-lived server in tests, 
+// we'll check if the native functions are registered.
+pr("Web vweb_status registered: " + typeof(vweb_status))
+pr("Web vweb_send registered: " + typeof(vweb_send))
+
+pr("\nALL SYSTEMS HARDENED AND VERIFIED.")

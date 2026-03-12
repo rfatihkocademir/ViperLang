@@ -1,0 +1,861 @@
+// Comprehensive Auth Example (SQLite3 + JWT Sessions) for ViperLang
+// Endpoints:
+//   GET  /health
+//   POST /auth/register
+//   POST /auth/login
+//   POST /auth/refresh
+//   GET  /auth/me
+//   POST /auth/logout
+//   POST /auth/logout-all
+//   POST /auth/change-password
+//   GET  /auth/sessions
+//   GET  /auth/audit (admin only)
+//
+// Expected request body format for POST endpoints:
+//   JSON body, for example: {"email":"user@example.com","password":"secret123"}
+
+use "@std/web" as web
+use "@std/db" as db
+use "@std/time" as time
+use "@std/os" as os
+use "@std/cache" as cache
+use "@std/fs" as fs
+
+var PORT = 8090
+var DB_URL = "sqlite://example/auth/auth.db"
+
+var AUTH_SECRET = "change-me-auth-secret"
+var PASS_PEPPER = "change-me-password-pepper"
+
+var ACCESS_TTL_MS = 900000
+var REFRESH_TTL_MS = 604800000
+var LOCKOUT_MS = 300000
+var MAX_FAIL_BEFORE_LOCK = 5
+var LOGIN_RATE_LIMIT_SOFT = 20
+
+st AuthCtx {
+    ok
+    code
+    message
+    token
+    payload
+    user_id
+    session_row_id
+    session_id
+    role
+}
+
+st SessionIssue {
+    ok
+    message
+    access_token
+    refresh_token
+    csrf_token
+    session_id
+    access_exp
+    refresh_exp
+}
+
+fn json_quote(raw) {
+    var s = raw
+    if (typeof(s) == "string") {
+    } else {
+        s = "" + s
+    }
+    s = text_replace(s, "\"", "'")
+    s = text_replace(s, "\n", " ")
+    s = text_replace(s, "\r", " ")
+    ret "\"" + s + "\""
+}
+
+fn json_error(code, message) {
+    ret "{\"ok\":false,\"code\":" + json_quote(code) + ",\"message\":" + json_quote(message) + "}"
+}
+
+fn json_ok(message) {
+    ret "{\"ok\":true,\"message\":" + json_quote(message) + "}"
+}
+
+fn to_num(raw) {
+    if (typeof(raw) == "number") {
+        ret raw
+    }
+    if (typeof(raw) == "string") {
+        var cleaned = text_trim(raw)
+        if (cleaned == "") {
+            ret 0
+        }
+        var parsed = json(cleaned)
+        if (typeof(parsed) == "number") {
+            ret parsed
+        }
+    }
+    ret 0
+}
+
+fn row_cols(raw_text) {
+    if (typeof(raw_text) == "string") {
+    } else {
+        ret []
+    }
+    var clean = text_trim(raw_text)
+    if (clean == "") {
+        ret []
+    }
+    var lines = text_split(clean, "\n")
+    if (arr_len(lines) < 1) {
+        ret []
+    }
+    ret text_split(lines[0], "|")
+}
+
+fn db_safe(raw) {
+    if (typeof(raw) == "string") {
+    } else {
+        ret ""
+    }
+    var s = text_trim(raw)
+    s = text_replace(s, ",", " ")
+    s = text_replace(s, "\n", " ")
+    s = text_replace(s, "\r", " ")
+    ret s
+}
+
+fn sql_escape(raw) {
+    if (typeof(raw) == "string") {
+    } else {
+        ret ""
+    }
+    ret text_replace(raw, "'", "''")
+}
+
+fn sql_quote(raw) {
+    ret "'" + sql_escape(raw) + "'"
+}
+
+fn req_body(req_text) {
+    if (typeof(req_text) == "string") {
+    } else {
+        ret ""
+    }
+    var parts = text_split(req_text, "\r\n\r\n")
+    if (arr_len(parts) < 2) {
+        ret ""
+    }
+    var idx = arr_len(parts) - 1
+    ret text_trim(parts[idx])
+}
+
+fn req_header(req_text, header_name) {
+    if (typeof(req_text) == "string") {
+    } else {
+        ret ""
+    }
+    var marker = header_name + ": "
+    var chunks = text_split(req_text, marker)
+    if (arr_len(chunks) < 2) {
+        ret ""
+    }
+    var tail = chunks[1]
+    var lines = text_split(tail, "\r\n")
+    if (arr_len(lines) < 1) {
+        ret ""
+    }
+    ret text_trim(lines[0])
+}
+
+fn req_ip(req_text) {
+    var ip = req_header(req_text, "X-Forwarded-For")
+    if (ip == "") {
+        ip = "local"
+    }
+    ret db_safe(ip)
+}
+
+fn req_user_agent(req_text) {
+    var ua = req_header(req_text, "User-Agent")
+    if (ua == "") {
+        ua = "unknown"
+    }
+    ret db_safe(ua)
+}
+
+fn req_bearer_token(req_text) {
+    var auth = req_header(req_text, "Authorization")
+    if (auth == "") {
+        ret ""
+    }
+    var chunks = text_split(auth, "Bearer ")
+    if (arr_len(chunks) < 2) {
+        ret ""
+    }
+    ret text_trim(chunks[1])
+}
+
+fn body_string(req_text, key) {
+    var body = req_body(req_text)
+    if (body == "") {
+        ret ""
+    }
+    var marker = "\"" + key + "\""
+    var chunks = text_split(body, marker)
+    if (arr_len(chunks) < 2) {
+        ret ""
+    }
+    var tail = text_trim(chunks[1])
+    var colon_parts = text_split(tail, ":")
+    if (arr_len(colon_parts) < 2) {
+        ret ""
+    }
+    tail = text_trim(colon_parts[1])
+    if (text_starts_with(tail, "\"")) {
+        var quote_parts = text_split(tail, "\"")
+        if (arr_len(quote_parts) < 2) {
+            ret ""
+        }
+        ret text_trim(quote_parts[1])
+    }
+    ret ""
+}
+
+fn normalize_email(raw_email) {
+    var email = text_lower(text_trim(raw_email))
+    ret email
+}
+
+fn is_valid_email(email) {
+    if (email == "") {
+        ret false
+    }
+    if (text_contains(email, "@")) {
+    } else {
+        ret false
+    }
+    var parts = text_split(email, "@")
+    if (arr_len(parts) < 2) {
+        ret false
+    }
+    if (arr_len(parts) > 2) {
+        ret false
+    }
+    var domain = parts[1]
+    if (text_contains(domain, ".")) {
+    } else {
+        ret false
+    }
+    ret true
+}
+
+fn is_valid_password(password) {
+    if (password == "") {
+        ret false
+    }
+    if (text_len(password) < 8) {
+        ret false
+    }
+    ret true
+}
+
+fn login_rate_key(email) {
+    ret "auth_login_fail:" + email
+}
+
+fn payload_get(payload_text, key) {
+    var parts = text_split(payload_text, ";")
+    var i = 0
+    while (i < arr_len(parts)) {
+        var pair = parts[i]
+        var kv = text_split(pair, "=")
+        if (arr_len(kv) > 1) {
+            var k = text_trim(kv[0])
+            if (k == key) {
+                var value = kv[1]
+                var j = 2
+                while (j < arr_len(kv)) {
+                    value = value + "=" + kv[j]
+                    j = j + 1
+                }
+                ret text_trim(value)
+            }
+        }
+        i = i + 1
+    }
+    ret ""
+}
+
+fn next_nonce() {
+    ret cache.increment("auth_nonce_global", 1)
+}
+
+fn make_salt(email) {
+    var seed = email + "|" + time.now() + "|" + os.pid() + "|" + next_nonce()
+    ret web.hash(seed, "sha256")
+}
+
+fn hash_password(password, salt) {
+    var r1 = web.hash(password + "|" + salt + "|" + PASS_PEPPER, "sha256")
+    var r2 = web.hash(r1 + "|" + password + "|" + PASS_PEPPER, "sha256")
+    var r3 = web.hash(r2 + "|" + salt + "|" + r1, "sha256")
+    ret r3
+}
+
+fn log_event(user_id, event, meta, ip) {
+    var uid = user_id
+    if (uid < 1) {
+        uid = 0
+    }
+    var now = time.now()
+    var data = "user_id:" + uid +
+        ",event:" + db_safe(event) +
+        ",meta:" + db_safe(meta) +
+        ",created_at:" + now +
+        ",ip:" + db_safe(ip)
+    db.save("audit_logs", data)
+}
+
+fn prune_expired_sessions() {
+    var now = time.now()
+    db.query("UPDATE auth_sessions SET revoked=1 WHERE revoked=0 AND refresh_expires_at < " + now + ";")
+}
+
+fn ensure_storage() {
+    if (fs.mkdir("example/auth")) {
+        ret true
+    }
+    pr("Auth bootstrap error: could not create example/auth")
+    ret false
+}
+
+fn db_bootstrap() {
+    if (ensure_storage()) {
+    } else {
+        os.exit(1)
+    }
+
+    var ok = db.connect(DB_URL)
+    if (ok) {
+    } else {
+        pr("Auth bootstrap error: db.connect failed")
+        os.exit(1)
+    }
+
+    if (db.sync("users", "email:s,name:s,password_hash:s,password_salt:s,role:s,is_active:i,created_at:i,updated_at:i,last_login_at:i,failed_login_count:i,locked_until:i")) {
+    } else {
+        pr("Auth bootstrap error: users table sync failed")
+        os.exit(1)
+    }
+    if (db.sync("auth_sessions", "user_id:i,session_id:s,access_token:s,refresh_token:s,csrf_token:s,expires_at:i,refresh_expires_at:i,revoked:i,created_at:i,last_seen_at:i,ip:s,user_agent:s")) {
+    } else {
+        pr("Auth bootstrap error: auth_sessions table sync failed")
+        os.exit(1)
+    }
+    if (db.sync("audit_logs", "user_id:i,event:s,meta:s,created_at:i,ip:s")) {
+    } else {
+        pr("Auth bootstrap error: audit_logs table sync failed")
+        os.exit(1)
+    }
+
+    db.query("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email);")
+    db.query("CREATE INDEX IF NOT EXISTS idx_sessions_access ON auth_sessions(access_token);")
+    db.query("CREATE INDEX IF NOT EXISTS idx_sessions_refresh ON auth_sessions(refresh_token);")
+    db.query("CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON auth_sessions(user_id);")
+    db.query("CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at);")
+}
+
+fn issue_session(user_id, role, ip, user_agent) {
+    var out = SessionIssue()
+    out.ok = false
+    out.message = "session_issue_failed"
+    out.access_token = ""
+    out.refresh_token = ""
+    out.csrf_token = ""
+    out.session_id = ""
+    out.access_exp = 0
+    out.refresh_exp = 0
+
+    var now = time.now()
+    var sid_seed = user_id + "|" + role + "|" + now + "|" + os.pid() + "|" + next_nonce()
+    var session_id = web.hash(sid_seed, "sha256")
+    var access_exp = now + ACCESS_TTL_MS
+    var refresh_exp = now + REFRESH_TTL_MS
+
+    var access_payload = "uid=" + user_id + ";sid=" + session_id + ";exp=" + access_exp + ";typ=access"
+    var refresh_payload = "uid=" + user_id + ";sid=" + session_id + ";exp=" + refresh_exp + ";typ=refresh"
+
+    var access_token = web.jwt_sign(access_payload, AUTH_SECRET)
+    var refresh_token = web.jwt_sign(refresh_payload, AUTH_SECRET)
+    var csrf_token = web.hash(session_id + "|csrf|" + now + "|" + next_nonce(), "sha256")
+
+    var data = "user_id:" + user_id +
+        ",session_id:" + db_safe(session_id) +
+        ",access_token:" + db_safe(access_token) +
+        ",refresh_token:" + db_safe(refresh_token) +
+        ",csrf_token:" + db_safe(csrf_token) +
+        ",expires_at:" + access_exp +
+        ",refresh_expires_at:" + refresh_exp +
+        ",revoked:0" +
+        ",created_at:" + now +
+        ",last_seen_at:" + now +
+        ",ip:" + db_safe(ip) +
+        ",user_agent:" + db_safe(user_agent)
+
+    var inserted_id = to_num(db.save("auth_sessions", data))
+    if (inserted_id < 1) {
+        ret out
+    }
+
+    out.ok = true
+    out.message = "ok"
+    out.session_id = session_id
+    out.access_token = access_token
+    out.refresh_token = refresh_token
+    out.csrf_token = csrf_token
+    out.access_exp = access_exp
+    out.refresh_exp = refresh_exp
+    ret out
+}
+
+fn auth_fail(code, message) {
+    var ctx = AuthCtx()
+    ctx.ok = false
+    ctx.code = code
+    ctx.message = message
+    ctx.token = ""
+    ctx.payload = ""
+    ctx.user_id = 0
+    ctx.session_row_id = 0
+    ctx.session_id = ""
+    ctx.role = ""
+    ret ctx
+}
+
+fn verify_access_ctx(req_text) {
+    var token = req_bearer_token(req_text)
+    if (token == "") {
+        token = body_string(req_text, "access_token")
+    }
+    if (token == "") {
+        ret auth_fail("missing_token", "access token is required")
+    }
+
+    var payload = web.jwt_verify(token, AUTH_SECRET)
+    if (payload == nil) {
+        ret auth_fail("invalid_token", "token signature is invalid")
+    }
+    if (typeof(payload) == "string") {
+    } else {
+        ret auth_fail("invalid_token", "token payload type is invalid")
+    }
+
+    var typ = payload_get(payload, "typ")
+    if (typ == "access") {
+    } else {
+        ret auth_fail("invalid_token", "token type is not access")
+    }
+
+    var uid = to_num(payload_get(payload, "uid"))
+    var sid = payload_get(payload, "sid")
+    var exp = to_num(payload_get(payload, "exp"))
+    var now = time.now()
+
+    if (uid < 1) {
+        ret auth_fail("invalid_token", "token user id is invalid")
+    }
+    if (sid == "") {
+        ret auth_fail("invalid_token", "token session id is missing")
+    }
+    if (now > exp) {
+        ret auth_fail("token_expired", "access token is expired")
+    }
+
+    var q = "SELECT s.id,s.user_id,s.session_id,s.revoked,u.role FROM auth_sessions s " +
+        "JOIN users u ON u.id=s.user_id " +
+        "WHERE s.access_token=" + sql_quote(token) +
+        " AND s.session_id=" + sql_quote(sid) +
+        " AND s.user_id=" + uid +
+        " LIMIT 1;"
+    var cols = row_cols(db.query(q))
+    if (arr_len(cols) < 5) {
+        ret auth_fail("session_not_found", "session does not exist")
+    }
+    var revoked = to_num(cols[3])
+    if (revoked > 0) {
+        ret auth_fail("session_revoked", "session is revoked")
+    }
+
+    var ctx = AuthCtx()
+    ctx.ok = true
+    ctx.code = "ok"
+    ctx.message = "ok"
+    ctx.token = token
+    ctx.payload = payload
+    ctx.user_id = to_num(cols[1])
+    ctx.session_row_id = to_num(cols[0])
+    ctx.session_id = cols[2]
+    ctx.role = cols[4]
+    ret ctx
+}
+
+fn token_json_response(user_id, role, issue) {
+    ret "{\"ok\":true," +
+        "\"user_id\":" + user_id + "," +
+        "\"role\":" + json_quote(role) + "," +
+        "\"access_token\":" + json_quote(issue.access_token) + "," +
+        "\"refresh_token\":" + json_quote(issue.refresh_token) + "," +
+        "\"csrf_token\":" + json_quote(issue.csrf_token) + "," +
+        "\"access_expires_at\":" + issue.access_exp + "," +
+        "\"refresh_expires_at\":" + issue.refresh_exp +
+        "}"
+}
+
+fn handle_health(req_text) {
+    var now = time.now()
+    ret "{\"ok\":true,\"service\":\"auth\",\"db\":" + json_quote(DB_URL) + ",\"now\":" + now + "}"
+}
+
+fn handle_register(req_text) {
+    ret "{\"debug_body\":" + json_quote(req_body(req_text)) + ",\"debug_email\":" + json_quote(body_string(req_text, "email")) + "}"
+    var email = normalize_email(body_string(req_text, "email"))
+    var password = body_string(req_text, "password")
+    var name = body_string(req_text, "name")
+    if (name == "") {
+        name = "user"
+    }
+
+    if (is_valid_email(email)) {
+    } else {
+        ret json_error("invalid_email", "email format is invalid")
+    }
+    if (is_valid_password(password)) {
+    } else {
+        ret json_error("weak_password", "password must have at least 8 chars")
+    }
+
+    if (db.exists("users", "email=" + sql_quote(email))) {
+        ret json_error("email_exists", "email already registered")
+    }
+
+    var total_users = to_num(db.count("users", "1=1"))
+    var role = "user"
+    if (total_users < 1) {
+        role = "admin"
+    }
+
+    var salt = make_salt(email)
+    var pass_hash = hash_password(password, salt)
+    var now = time.now()
+    var user_data = "email:" + db_safe(email) +
+        ",name:" + db_safe(name) +
+        ",password_hash:" + db_safe(pass_hash) +
+        ",password_salt:" + db_safe(salt) +
+        ",role:" + role +
+        ",is_active:1" +
+        ",created_at:" + now +
+        ",updated_at:" + now +
+        ",last_login_at:0" +
+        ",failed_login_count:0" +
+        ",locked_until:0"
+    var user_id = to_num(db.save("users", user_data))
+    if (user_id < 1) {
+        ret json_error("db_error", "could not create user")
+    }
+
+    var issue = issue_session(user_id, role, req_ip(req_text), req_user_agent(req_text))
+    if (issue.ok) {
+    } else {
+        ret json_error("session_error", "user created but session could not be created")
+    }
+
+    log_event(user_id, "register_ok", "email=" + email + ";role=" + role, req_ip(req_text))
+    ret token_json_response(user_id, role, issue)
+}
+
+fn handle_login(req_text) {
+    var email = normalize_email(body_string(req_text, "email"))
+    var password = body_string(req_text, "password")
+    if (email == "") {
+        ret json_error("invalid_request", "email and password are required")
+    }
+    if (password == "") {
+        ret json_error("invalid_request", "email and password are required")
+    }
+
+    var rate_key = login_rate_key(email)
+    var cached = cache.get(rate_key)
+    if (typeof(cached) == "number") {
+        if (cached > LOGIN_RATE_LIMIT_SOFT) {
+            ret json_error("rate_limited", "too many attempts, wait and retry")
+        }
+    }
+
+    var q = "SELECT id,password_hash,password_salt,role,is_active,locked_until,failed_login_count " +
+        "FROM users WHERE email=" + sql_quote(email) + " LIMIT 1;"
+    var cols = row_cols(db.query(q))
+    if (arr_len(cols) < 7) {
+        var n1 = cache.increment(rate_key, 1)
+        cache.set(rate_key, n1, 600000)
+        log_event(0, "login_failed", "unknown_email=" + email, req_ip(req_text))
+        ret json_error("invalid_credentials", "email or password is invalid")
+    }
+
+    var user_id = to_num(cols[0])
+    var stored_hash = cols[1]
+    var stored_salt = cols[2]
+    var role = cols[3]
+    var is_active = to_num(cols[4])
+    var locked_until = to_num(cols[5])
+    var failed_count = to_num(cols[6])
+    var now = time.now()
+
+    if (is_active < 1) {
+        ret json_error("account_disabled", "account is disabled")
+    }
+    if (locked_until > now) {
+        ret json_error("account_locked", "account is temporarily locked")
+    }
+
+    var candidate_hash = hash_password(password, stored_salt)
+    if (candidate_hash == stored_hash) {
+    } else {
+        var new_failed = failed_count + 1
+        var new_locked = 0
+        if (new_failed > (MAX_FAIL_BEFORE_LOCK - 1)) {
+            new_locked = now + LOCKOUT_MS
+        }
+        db.query("UPDATE users SET failed_login_count=" + new_failed +
+            ",locked_until=" + new_locked +
+            ",updated_at=" + now +
+            " WHERE id=" + user_id + ";")
+
+        var n2 = cache.increment(rate_key, 1)
+        cache.set(rate_key, n2, 600000)
+        log_event(user_id, "login_failed", "bad_password", req_ip(req_text))
+
+        if (new_locked > now) {
+            ret json_error("account_locked", "too many failures, account locked")
+        }
+        ret json_error("invalid_credentials", "email or password is invalid")
+    }
+
+    cache.delete(rate_key)
+    db.query("UPDATE users SET failed_login_count=0,locked_until=0,last_login_at=" + now + ",updated_at=" + now + " WHERE id=" + user_id + ";")
+
+    var issue = issue_session(user_id, role, req_ip(req_text), req_user_agent(req_text))
+    if (issue.ok) {
+    } else {
+        ret json_error("session_error", "login succeeded but session creation failed")
+    }
+
+    log_event(user_id, "login_ok", "role=" + role, req_ip(req_text))
+    ret token_json_response(user_id, role, issue)
+}
+
+fn handle_refresh(req_text) {
+    var refresh_token = body_string(req_text, "refresh_token")
+    if (refresh_token == "") {
+        ret json_error("missing_refresh", "refresh_token is required")
+    }
+
+    var payload = web.jwt_verify(refresh_token, AUTH_SECRET)
+    if (payload == nil) {
+        ret json_error("invalid_refresh", "refresh token is invalid")
+    }
+    if (typeof(payload) == "string") {
+    } else {
+        ret json_error("invalid_refresh", "refresh token is invalid")
+    }
+    if (payload_get(payload, "typ") == "refresh") {
+    } else {
+        ret json_error("invalid_refresh", "refresh token type is invalid")
+    }
+
+    var uid = to_num(payload_get(payload, "uid"))
+    var sid = payload_get(payload, "sid")
+    var exp = to_num(payload_get(payload, "exp"))
+    var now = time.now()
+    if (uid < 1) {
+        ret json_error("invalid_refresh", "refresh token payload is invalid")
+    }
+    if (sid == "") {
+        ret json_error("invalid_refresh", "refresh token payload is invalid")
+    }
+    if (now > exp) {
+        ret json_error("refresh_expired", "refresh token is expired")
+    }
+
+    var q = "SELECT s.id,s.user_id,s.revoked,u.role FROM auth_sessions s " +
+        "JOIN users u ON u.id=s.user_id " +
+        "WHERE s.refresh_token=" + sql_quote(refresh_token) +
+        " AND s.session_id=" + sql_quote(sid) +
+        " AND s.user_id=" + uid +
+        " LIMIT 1;"
+    var cols = row_cols(db.query(q))
+    if (arr_len(cols) < 4) {
+        ret json_error("invalid_refresh", "session not found for refresh token")
+    }
+
+    var old_session_id = to_num(cols[0])
+    var revoked = to_num(cols[2])
+    var role = cols[3]
+    if (revoked > 0) {
+        ret json_error("invalid_refresh", "refresh session is revoked")
+    }
+
+    var issue = issue_session(uid, role, req_ip(req_text), req_user_agent(req_text))
+    if (issue.ok) {
+    } else {
+        ret json_error("session_error", "could not rotate session")
+    }
+
+    db.query("UPDATE auth_sessions SET revoked=1,last_seen_at=" + now + " WHERE id=" + old_session_id + ";")
+    log_event(uid, "refresh_ok", "old_session=" + old_session_id, req_ip(req_text))
+    ret token_json_response(uid, role, issue)
+}
+
+fn handle_me(req_text) {
+    var ctx = verify_access_ctx(req_text)
+    if (ctx.ok) {
+    } else {
+        ret json_error(ctx.code, ctx.message)
+    }
+
+    var q = "SELECT id,email,name,role,created_at,last_login_at,is_active FROM users WHERE id=" + ctx.user_id + " LIMIT 1;"
+    var cols = row_cols(db.query(q))
+    if (arr_len(cols) < 7) {
+        ret json_error("user_not_found", "user does not exist")
+    }
+
+    ret "{\"ok\":true,\"user\":{" +
+        "\"id\":" + to_num(cols[0]) + "," +
+        "\"email\":" + json_quote(cols[1]) + "," +
+        "\"name\":" + json_quote(cols[2]) + "," +
+        "\"role\":" + json_quote(cols[3]) + "," +
+        "\"created_at\":" + to_num(cols[4]) + "," +
+        "\"last_login_at\":" + to_num(cols[5]) + "," +
+        "\"is_active\":" + to_num(cols[6]) +
+        "}}"
+}
+
+fn handle_logout(req_text) {
+    var ctx = verify_access_ctx(req_text)
+    if (ctx.ok) {
+    } else {
+        ret json_error(ctx.code, ctx.message)
+    }
+    db.query("UPDATE auth_sessions SET revoked=1,last_seen_at=" + time.now() + " WHERE id=" + ctx.session_row_id + ";")
+    log_event(ctx.user_id, "logout_ok", "session_id=" + ctx.session_id, req_ip(req_text))
+    ret json_ok("logout_ok")
+}
+
+fn handle_logout_all(req_text) {
+    var ctx = verify_access_ctx(req_text)
+    if (ctx.ok) {
+    } else {
+        ret json_error(ctx.code, ctx.message)
+    }
+    db.query("UPDATE auth_sessions SET revoked=1,last_seen_at=" + time.now() + " WHERE user_id=" + ctx.user_id + ";")
+    log_event(ctx.user_id, "logout_all_ok", "all_sessions_revoked", req_ip(req_text))
+    ret json_ok("logout_all_ok")
+}
+
+fn handle_change_password(req_text) {
+    var ctx = verify_access_ctx(req_text)
+    if (ctx.ok) {
+    } else {
+        ret json_error(ctx.code, ctx.message)
+    }
+
+    var old_password = body_string(req_text, "old_password")
+    var new_password = body_string(req_text, "new_password")
+    if (old_password == "") {
+        ret json_error("invalid_request", "old_password and new_password are required")
+    }
+    if (new_password == "") {
+        ret json_error("invalid_request", "old_password and new_password are required")
+    }
+    if (is_valid_password(new_password)) {
+    } else {
+        ret json_error("weak_password", "new password must have at least 8 chars")
+    }
+
+    var cols = row_cols(db.query("SELECT password_hash,password_salt,email FROM users WHERE id=" + ctx.user_id + " LIMIT 1;"))
+    if (arr_len(cols) < 3) {
+        ret json_error("user_not_found", "user does not exist")
+    }
+
+    var current_hash = cols[0]
+    var current_salt = cols[1]
+    var email = cols[2]
+    if (hash_password(old_password, current_salt) == current_hash) {
+    } else {
+        log_event(ctx.user_id, "change_password_failed", "bad_old_password", req_ip(req_text))
+        ret json_error("invalid_credentials", "old password is incorrect")
+    }
+
+    var now = time.now()
+    var new_salt = make_salt(email)
+    var new_hash = hash_password(new_password, new_salt)
+    db.query("UPDATE users SET password_hash=" + sql_quote(new_hash) +
+        ",password_salt=" + sql_quote(new_salt) +
+        ",updated_at=" + now +
+        " WHERE id=" + ctx.user_id + ";")
+    db.query("UPDATE auth_sessions SET revoked=1,last_seen_at=" + now + " WHERE user_id=" + ctx.user_id + ";")
+    log_event(ctx.user_id, "change_password_ok", "sessions_revoked", req_ip(req_text))
+
+    ret json_ok("password_changed_relogin_required")
+}
+
+fn handle_sessions(req_text) {
+    var ctx = verify_access_ctx(req_text)
+    if (ctx.ok) {
+    } else {
+        ret json_error(ctx.code, ctx.message)
+    }
+
+    var rows = db.query("SELECT id,session_id,expires_at,refresh_expires_at,revoked,created_at,last_seen_at,ip,user_agent " +
+        "FROM auth_sessions WHERE user_id=" + ctx.user_id + " ORDER BY id DESC LIMIT 20;")
+    ret "{\"ok\":true,\"sessions_raw\":" + json_quote(text_trim(rows)) + "}"
+}
+
+fn handle_audit(req_text) {
+    var ctx = verify_access_ctx(req_text)
+    if (ctx.ok) {
+    } else {
+        ret json_error(ctx.code, ctx.message)
+    }
+    if (ctx.role == "admin") {
+    } else {
+        ret json_error("forbidden", "admin role required")
+    }
+
+    var rows = db.query("SELECT id,user_id,event,meta,created_at,ip FROM audit_logs ORDER BY id DESC LIMIT 100;")
+    ret "{\"ok\":true,\"audit_raw\":" + json_quote(text_trim(rows)) + "}"
+}
+
+fn middleware_housekeeping(req_text) {
+    prune_expired_sessions()
+    ret "ok"
+}
+
+fn fallback_handler(req_text) {
+    ret "{\"ok\":true,\"service\":\"auth\",\"hint\":\"use /health or /auth/* endpoints\"}"
+}
+
+db_bootstrap()
+web.cors("*")
+web.middleware(middleware_housekeeping)
+
+web.route("/health", "GET", handle_health)
+web.route("/auth/register", "POST", handle_register)
+web.route("/auth/login", "POST", handle_login)
+web.route("/auth/refresh", "POST", handle_refresh)
+web.route("/auth/me", "GET", handle_me)
+web.route("/auth/logout", "POST", handle_logout)
+web.route("/auth/logout-all", "POST", handle_logout_all)
+web.route("/auth/change-password", "POST", handle_change_password)
+web.route("/auth/sessions", "GET", handle_sessions)
+web.route("/auth/audit", "GET", handle_audit)
+
+pr("Auth API starting on port ", PORT)
+pr("DB: ", DB_URL)
+web.serve(PORT, fallback_handler)

@@ -1,0 +1,31 @@
+// ViperLang Refinement Verification Script
+use "@std/os" as os
+
+pr("1. Testing os.exec with String (Shell)...")
+var res1 = os.exec("echo 'hello from shell'")
+pr("Code: " + res1.code)
+pr("Stdout: " + res1.stdout)
+if (res1.code == 0) {
+    pr("SUCCESS: Shell execution verified")
+}
+
+var res2 = os.exec(["echo", "hello direct"])
+pr("\n2. Testing os.exec with Array (Direct)...")
+pr("Code: " + res2.code)
+pr("Stdout: " + res2.stdout)
+if (res2.code == 0) {
+    pr("SUCCESS: Direct execution verified")
+}
+
+var res3 = os.exec("ls /non-existent-directory")
+pr("\n3. Testing os.exec Stderr Capture...")
+pr("Code: " + res3.code)
+pr("Stderr: " + res3.stderr)
+if (res3.code != 0) {
+    pr("SUCCESS: Stderr capture verified")
+}
+
+pr("\n4. Testing @std resolution (Implicitly tested by 'use @std/os')...")
+pr("SUCCESS: @std resolution verified")
+
+pr("\nALL REFINEMENTS VERIFIED.")

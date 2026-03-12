@@ -106,7 +106,7 @@ static bool is_digit(char c) {
 static bool is_alpha(char c) {
     return (c >= 'a' && c <= 'z') ||
            (c >= 'A' && c <= 'Z') ||
-            c == '_';
+            c == '_' || c == '$';
 }
 
 static TokenType check_keyword(int start, int length, const char* rest, TokenType type) {

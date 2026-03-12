@@ -36,6 +36,7 @@ typedef enum {
     AST_INDEX_EXPR,  // New: arr[i]
     AST_REGEX,       // New: /abc/
     AST_MATCH_EXPR,  // New: s match /abc/
+    AST_ERROR_PROPAGATE_EXPR, // New: expr?
     AST_RETURN_STMT,
     AST_PROGRAM
 } AstNodeType;
@@ -94,6 +95,8 @@ typedef struct AstNode {
             Token name;
             Token* params;
             int param_count;
+            Token* effects;
+            int effect_count;
             Token return_type; // New: Gradual Typing -> type
             struct AstNode* body;
             bool is_public;
@@ -159,6 +162,9 @@ typedef struct AstNode {
             struct AstNode* left;
             struct AstNode* right;
         } match_expr;
+        struct {
+            struct AstNode* expr;
+        } error_propagate;
     } data;
 } AstNode;
 
@@ -174,7 +180,9 @@ AstNode* ast_new_block_stmt();
 AstNode* ast_new_if_stmt(AstNode* condition, AstNode* then_branch, AstNode* else_branch);
 AstNode* ast_new_while_stmt(AstNode* condition, AstNode* body);
 AstNode* ast_new_sync_stmt(AstNode* body);
-AstNode* ast_new_func_decl(Token name, Token* params, int param_count, Token return_type, AstNode* body);
+AstNode* ast_new_func_decl(Token name, Token* params, int param_count,
+                           Token* effects, int effect_count,
+                           Token return_type, AstNode* body);
 AstNode* ast_new_call_expr(AstNode* callee, Token name, AstNode** args, int arg_count);
 AstNode* ast_new_return_stmt(AstNode* value);
 AstNode* ast_new_struct_decl(Token name, Token* fields, int field_count);
@@ -195,6 +203,7 @@ AstNode* ast_new_index_expr(AstNode* target, AstNode* index);
 AstNode* ast_new_set_index_expr(AstNode* target, AstNode* index, AstNode* value);
 AstNode* ast_new_regex(Token token);
 AstNode* ast_new_match_expr(AstNode* left, AstNode* right);
+AstNode* ast_new_error_propagate_expr(AstNode* expr);
 AstNode* ast_new_program();
 void ast_program_add(AstNode* program, AstNode* stmt);
 

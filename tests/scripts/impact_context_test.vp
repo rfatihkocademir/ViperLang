@@ -1,0 +1,11 @@
+use "./impact_lib.vp" as user
+
+fn route(user_id) -> str {
+    ret user.format_user(user_id)
+}
+
+fn render(user_id) -> str {
+    ret route(user_id)
+}
+
+pr(render("HOME"))

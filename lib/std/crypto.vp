@@ -1,0 +1,8 @@
+// ViperLang Standard Crypto Library (@std/crypto)
+pub fn hmac_sha256(key, data) {
+    ret crypto_hmac_sha256(key, data)
+}
+
+pub fn sha256(data) {
+    ret crypto_sha256(data)
+}

@@ -17,9 +17,7 @@
 
 VM* current_vm = NULL;
 
-static void runtime_error(VM* vm, const char* format, ...);
 static bool ensure_frame_capacity(VM* vm, int needed);
-static bool ensure_register_capacity(VM* vm, int needed);
 static bool ensure_register_capacity(VM* vm, int needed);
 static void vm_fatal_oom(void);
 static Value deep_clone_value(Value value);
@@ -27,6 +25,8 @@ static Value deep_clone_value(Value value);
 
 Value call_viper_function(ObjFunction* fn, int argCount, Value* args) {
     if (!current_vm) return (Value){VAL_NIL, {.number = 0}};
+    int previous_stop_count = current_vm->stop_frame_count;
+    int stop_count = current_vm->frame_count;
     
     // Push new frame
     if (!ensure_frame_capacity(current_vm, current_vm->frame_count + 1)) {
@@ -60,7 +60,9 @@ Value call_viper_function(ObjFunction* fn, int argCount, Value* args) {
     frame->return_dest = dest;
 
     // Run VM until this frame is popped (no yielding for C-ABI calls for now)
+    current_vm->stop_frame_count = stop_count;
     interpret(current_vm, NULL, -1); // -1 means infinite steps
+    current_vm->stop_frame_count = previous_stop_count;
     
     return current_vm->registers[dest];
 }
@@ -131,6 +133,7 @@ void init_vm(VM* vm) {
     vm->frame_capacity = 64;
     vm->frames = malloc(sizeof(CallFrame) * vm->frame_capacity);
     vm->frame_count = 0;
+    vm->stop_frame_count = 0;
     
     vm->register_capacity = 1024;
     vm->registers = malloc(sizeof(Value) * vm->register_capacity);
@@ -262,10 +265,11 @@ static Value deep_clone_value(Value value) {
 
 InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
     current_vm = vm;
-    int stop_count = vm->frame_count > 0 ? vm->frame_count - 1 : 0;
+    int stop_count = vm->stop_frame_count;
 
     if (main_fn) {
         vm->frame_count = 0;
+        vm->stop_frame_count = 0;
         stop_count = 0;
         if (!ensure_frame_capacity(vm, 1) || !ensure_register_capacity(vm, REGISTER_WINDOW)) {
              vm_fatal_oom();
@@ -849,7 +853,13 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
                 }
                 vm->registers[dest] = retVal;
 
-                if (vm->frame_count == 0) return INTERPRET_OK; // End of execution or top level return
+                if (vm->frame_count == 0) {
+                    if (vm->thread_obj) {
+                        vm->thread_obj->finished = true;
+                        vm->thread_obj->result = retVal;
+                    }
+                    return INTERPRET_OK; // End of execution or top level return
+                }
                 frame = &vm->frames[vm->frame_count - 1];
                 break;
             }
@@ -914,6 +924,30 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
             }
             case OP_TEARDOWN_TRY: {
                 vm->catch_count--;
+                break;
+            }
+            case OP_PROPAGATE_ERR: {
+                Value val = FRAME_REG(frame, rA);
+                if (IS_OBJ(val) && AS_OBJ(val)->type == OBJ_INSTANCE) {
+                    ObjInstance* instance = (ObjInstance*)AS_OBJ(val);
+                    if ((strncmp(instance->klass->name, "Error", 5) == 0) ||
+                        (strncmp(instance->klass->name, "ExecResult", 10) == 0 && instance->fields[0].type == VAL_NUMBER && instance->fields[0].as.number != 0)) { // Assuming code != 0 is an error here temporarily
+                        
+                        int dest = frame->return_dest;
+                        vm->frame_count--;
+                        if (!ensure_register_capacity(vm, dest + 1)) vm_fatal_oom();
+                        vm->registers[dest] = val;
+                        
+                        if (vm->frame_count == 0) {
+                            if (vm->thread_obj) {
+                                vm->thread_obj->finished = true;
+                                vm->thread_obj->result = val;
+                            }
+                            return INTERPRET_OK;
+                        }
+                        frame = &vm->frames[vm->frame_count - 1];
+                    }
+                }
                 break;
             }
             case OP_HAS: {
@@ -1019,11 +1053,15 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
                     memcmp(actual_type, expected->chars, expected->length) == 0) {
                     type_ok = true;
                 }
-                // Additional alias: "float" and "f" match numbers too
+                // Numeric aliases all map to the single runtime number representation.
                 if (!type_ok && val.type == VAL_NUMBER) {
                     if ((expected->length == 5 && memcmp(expected->chars, "float", 5) == 0) ||
+                        (expected->length == 6 && memcmp(expected->chars, "number", 6) == 0) ||
+                        (expected->length == 4 && memcmp(expected->chars, "char", 4) == 0) ||
+                        (expected->length == 2 && memcmp(expected->chars, "u8", 2) == 0) ||
                         (expected->length == 1 && expected->chars[0] == 'f') ||
-                        (expected->length == 1 && expected->chars[0] == 'i')) {
+                        (expected->length == 1 && expected->chars[0] == 'i') ||
+                        (expected->length == 1 && expected->chars[0] == 'c')) {
                         type_ok = true;
                     }
                 }
@@ -1031,15 +1069,33 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
                 if (!type_ok && expected->length == 3 && memcmp(expected->chars, "any", 3) == 0) {
                     type_ok = true;
                 }
-                // "s" is alias for "str"
+                // String aliases
                 if (!type_ok && val.type == VAL_OBJ && AS_OBJ(val)->type == OBJ_STRING) {
-                    if (expected->length == 1 && expected->chars[0] == 's') {
+                    if ((expected->length == 1 && expected->chars[0] == 's') ||
+                        (expected->length == 6 && memcmp(expected->chars, "string", 6) == 0)) {
                         type_ok = true;
                     }
                 }
                 // "b" is alias for "bool"
                 if (!type_ok && val.type == VAL_BOOL) {
                     if (expected->length == 1 && expected->chars[0] == 'b') {
+                        type_ok = true;
+                    }
+                }
+                // Function aliases
+                if (!type_ok && val.type == VAL_OBJ && AS_OBJ(val)->type == OBJ_FUNCTION) {
+                    if (expected->length == 8 && memcmp(expected->chars, "function", 8) == 0) {
+                        type_ok = true;
+                    }
+                }
+                // Custom struct names or generic "struct".
+                if (!type_ok && val.type == VAL_OBJ && AS_OBJ(val)->type == OBJ_INSTANCE) {
+                    ObjInstance* instance = (ObjInstance*)AS_OBJ(val);
+                    if (expected->length == 6 && memcmp(expected->chars, "struct", 6) == 0) {
+                        type_ok = true;
+                    } else if (instance->klass &&
+                               instance->klass->name_len == expected->length &&
+                               memcmp(instance->klass->name, expected->chars, expected->length) == 0) {
                         type_ok = true;
                     }
                 }

@@ -79,6 +79,7 @@ typedef enum {
     // Core Safety
     OP_SETUP_TRY,       // SETUP_TRY R_DEST, OFFSET_HIGH, OFFSET_LOW
     OP_TEARDOWN_TRY,    // TEARDOWN_TRY
+    OP_PROPAGATE_ERR,   // PROPAGATE_ERR R_VAL
     
     // Core Dynamic
     OP_EVAL,            // EVAL R_DEST, R_CODE_STR
@@ -141,6 +142,7 @@ typedef struct {
     CallFrame* frames;
     int frame_count;
     int frame_capacity;
+    int stop_frame_count;
     Value* registers; // Shared flat register space, dynamically grown
     int register_capacity;
 

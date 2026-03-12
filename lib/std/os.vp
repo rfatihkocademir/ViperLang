@@ -44,9 +44,11 @@ pub fn cron(spec, callback_fn) {
     ret os_cron(spec, callback_fn)
 }
 
-// Backward compatible aliases
+// Executes a command. If command is a string, it runs via shell.
+// If command is an array, it runs directly.
+// Returns an object with {stdout, stderr, code}
 pub fn exec(command) {
-    ret os_sh(command)
+    ret os_exec(command)
 }
 
 pub fn get_env(key) {

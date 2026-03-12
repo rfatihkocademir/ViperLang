@@ -1,9 +1,17 @@
 #define _POSIX_C_SOURCE 199309L
 #include "memory.h"
 #include "profiler.h"
+#include "native.h"
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
+
+#define NURSERY_SIZE (8 * 1024 * 1024) // 8MB Nursery
+
+static uint8_t* nursery_start = NULL;
+static uint8_t* nursery_top = NULL;
+static uint8_t* nursery_end = NULL;
 
 static uint64_t get_time_us_local(void) {
     struct timespec ts;
@@ -12,30 +20,62 @@ static uint64_t get_time_us_local(void) {
 }
 
 void init_memory(void) {
-    // Initialize memory pools or GC state here
+    nursery_start = malloc(NURSERY_SIZE);
+    if (!nursery_start) {
+        fprintf(stderr, "Fatal: Could not allocate nursery\n");
+        exit(1);
+    }
+    nursery_top = nursery_start;
+    nursery_end = nursery_start + NURSERY_SIZE;
+    
     profiler_init();
 }
 
 void free_memory(void) {
-    // Sweep everything remaining
+    if (nursery_start) free(nursery_start);
 }
 
 void* viper_allocate(size_t size, int type) {
+    // 1. Try to allocate in Nursery (Bump-pointer)
+    size_t aligned_size = (size + 7) & ~7;
+    if (nursery_top + aligned_size <= nursery_end) {
+        void* ptr = nursery_top;
+        nursery_top += aligned_size;
+        
+        // Basic object header initialization
+        Obj* obj = (Obj*)ptr;
+        obj->type = type;
+        obj->ref_count = 0;
+        
+        profiler_track_alloc(size, type);
+        return ptr;
+    }
+
+    // 2. Nursery Full -> Trigger Minor GC (Stub for now: just fallback to malloc)
+    // collect_garbage_minor();
+    
     void* ptr = malloc(size);
     if (!ptr) {
         fprintf(stderr, "Fatal: Out of memory\n");
         exit(1);
     }
+    
+    // Header for heap objects
+    Obj* obj = (Obj*)ptr;
+    obj->type = type;
+    obj->ref_count = 0;
+    
     profiler_track_alloc(size, type);
     return ptr;
 }
 
 void collect_garbage(VM* vm) {
-    (void)vm; // Placeholder for now
+    (void)vm;
     uint64_t start = get_time_us_local();
     
-    // In a real implementation, we'd mark and sweep here.
-    // For now, we just track the GC event for the profiler.
+    // Minor GC: Reset nursery bump pointer
+    // In a full implementation, we'd copy live objects from nursery to Gen1 first.
+    nursery_top = nursery_start;
     
     uint64_t end = get_time_us_local();
     profiler_track_gc(1, end - start);

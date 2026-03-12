@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
+#include <sqlite3.h>
 #include "native.h"
 #include "capabilities.h"
+#include "compiler.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +17,7 @@
 #include <arpa/inet.h>
 #include "memory.h"
 #include "profiler.h"
+#include "crypto.h"
 #include <fcntl.h>
 #include <errno.h>
 #include <dirent.h>
@@ -28,6 +31,9 @@
 #include <math.h>
 #include <limits.h>
 #include <stdint.h>
+#ifdef __linux__
+#include <sys/random.h>
+#endif
 
 Obj* objects = NULL;
 
@@ -40,7 +46,32 @@ Obj* objects = NULL;
 #define MAX_WS_CLIENTS 64
 #define MAX_AI_TOOLS 64
 
+static void fill_secure_random(void* buffer, size_t size) {
+#ifdef __linux__
+    if (getrandom(buffer, size, 0) == (ssize_t)size) return;
+#endif
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd != -1) {
+        read(fd, buffer, size);
+        close(fd);
+    } else {
+        unsigned char* b = (unsigned char*)buffer;
+        for (size_t i = 0; i < size; i++) b[i] = (unsigned char)(rand() & 0xFF);
+    }
+}
+
 static char g_db_path[MAX_DB_PATH_LEN] = "data.db";
+static sqlite3* g_db = NULL;
+static ObjStruct* g_web_request_struct = NULL;
+static ObjStruct* g_web_response_struct = NULL;
+static ObjStruct* g_os_exec_result_struct = NULL;
+
+extern __thread const char* last_panic_msg;
+
+static Value viper_panic(const char* msg) {
+    last_panic_msg = strdup(msg); // Leak here if multiple panics, but safe for shutdown
+    return (Value){VAL_NIL, {.number = 0}};
+}
 static bool g_os_features_notice_printed = false;
 static bool g_ai_features_notice_printed = false;
 static char g_ai_provider[64] = "";
@@ -86,6 +117,7 @@ static Value g_ai_tools[MAX_AI_TOOLS];
 static int g_ai_tool_count = 0;
 
 static Value native_json(int argCount, Value* args);
+static bool append_fmt(char* out, size_t out_size, size_t* len, const char* fmt, ...);
 static char* trim_inplace(char* s);
 
 // ---- Object Allocation & GC ------------------------------------------
@@ -439,31 +471,35 @@ static int run_shell_status(const char* cmd) {
 }
 
 static Value run_sql_capture(const char* sql) {
-    if (!sql) return (Value){VAL_NIL, {.number = 0}};
+    if (!sql || !g_db) return (Value){VAL_NIL, {.number = 0}};
 
-    char tmp_sql[] = "/tmp/viper-sql-XXXXXX";
-    int fd = mkstemp(tmp_sql);
-    if (fd < 0) return (Value){VAL_NIL, {.number = 0}};
-
-    size_t n = strlen(sql);
-    ssize_t wrote = write(fd, sql, n);
-    close(fd);
-    if (wrote < 0 || (size_t)wrote != n) {
-        unlink(tmp_sql);
+    sqlite3_stmt* stmt;
+    int rc = sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
         return (Value){VAL_NIL, {.number = 0}};
     }
 
-    char q_db[MAX_DB_PATH_LEN * 2];
-    if (!shell_quote_double(g_db_path, q_db, sizeof(q_db))) {
-        unlink(tmp_sql);
-        return (Value){VAL_NIL, {.number = 0}};
+    ObjArray* results = new_array();
+    
+    int cols = sqlite3_column_count(stmt);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        ObjArray* row = new_array();
+        for (int i = 0; i < cols; i++) {
+            int type = sqlite3_column_type(stmt, i);
+            Value val;
+            switch (type) {
+                case SQLITE_INTEGER: val = (Value){VAL_NUMBER, {.number = (double)sqlite3_column_int64(stmt, i)}}; break;
+                case SQLITE_FLOAT:   val = (Value){VAL_NUMBER, {.number = sqlite3_column_double(stmt, i)}}; break;
+                case SQLITE_TEXT:    val = string_value((const char*)sqlite3_column_text(stmt, i)); break;
+                default:             val = (Value){VAL_NIL, {.number = 0}}; break;
+            }
+            array_append(row, val);
+        }
+        array_append(results, (Value){VAL_OBJ, {.obj = (Obj*)row}});
     }
 
-    char cmd[8192];
-    snprintf(cmd, sizeof(cmd), "sqlite3 -batch %s < %s 2>&1", q_db, tmp_sql);
-    Value out = run_shell_capture(cmd);
-    unlink(tmp_sql);
-    return out;
+    sqlite3_finalize(stmt);
+    return (Value){VAL_OBJ, {.obj = (Obj*)results}};
 }
 
 static void web_clear_registry(void) {
@@ -696,6 +732,54 @@ static int web_find_route(const char* method, const char* path) {
         return i;
     }
     return -1;
+}
+
+static void web_map_api_directory(const char* base_dir, const char* current_dir) {
+    DIR* dir = opendir(current_dir);
+    if (!dir) return;
+
+    struct dirent* ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", current_dir, ent->d_name);
+
+        if (ent->d_type == DT_DIR) {
+            web_map_api_directory(base_dir, path);
+        } else if (ent->d_type == DT_REG) {
+            const char* ext = strrchr(ent->d_name, '.');
+            if (ext && strcmp(ext, ".vp") == 0) {
+                // Extract method: get.vp -> GET
+                char method[16] = {0};
+                size_t name_len = ext - ent->d_name;
+                if (name_len > 15) name_len = 15;
+                for (size_t i = 0; i < name_len; i++) {
+                    method[i] = toupper((unsigned char)ent->d_name[i]);
+                }
+                
+                // Extract route: api/users/get.vp -> /api/users
+                char route[PATH_MAX];
+                size_t prefix_len = strlen(base_dir);
+                if (strncmp(current_dir, base_dir, prefix_len) == 0) {
+                    snprintf(route, sizeof(route), "%s", current_dir + prefix_len);
+                    if (route[0] == '\0') strcpy(route, "/");
+                    
+                    // Route registration logic
+                    for (int i = 0; i < MAX_WEB_ROUTES; i++) {
+                        if (!g_web_routes[i].used) {
+                            g_web_routes[i].used = true;
+                            snprintf(g_web_routes[i].method, sizeof(g_web_routes[i].method), "%s", method);
+                            snprintf(g_web_routes[i].path, sizeof(g_web_routes[i].path), "%s", route);
+                            g_web_routes[i].handler = string_value(path); // File path marker
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    closedir(dir);
 }
 
 static int web_find_route_slot(void) {
@@ -1174,77 +1258,101 @@ static Value native_recover(int argCount, Value* args) {
     return (Value){VAL_NIL, {.number = 0}};
 }
 
-static Value native_sh(int argCount, Value* args) {
-    if (argCount != 1 || !is_string_value(args[0])) {
-        return (Value){VAL_NIL, {.number = 0}};
-    }
-    const char* cmd = AS_STRING(args[0])->chars;
+static ObjInstance* create_os_exec_result_obj(const char* out, const char* err, int code) {
+    if (!g_os_exec_result_struct) return NULL;
+    ObjInstance* inst = new_instance(g_os_exec_result_struct);
+    inst->fields[0] = string_value(out ? out : "");
+    inst->fields[1] = string_value(err ? err : "");
+    inst->fields[2] = (Value){VAL_NUMBER, {.number = (double)code}};
+    return inst;
+}
 
-    char tmp_out[] = "/tmp/viper-sh-out-XXXXXX";
-    char tmp_err[] = "/tmp/viper-sh-err-XXXXXX";
-    int out_fd = mkstemp(tmp_out);
-    int err_fd = mkstemp(tmp_err);
-    if (out_fd < 0 || err_fd < 0) {
-        if (out_fd >= 0) { close(out_fd); unlink(tmp_out); }
-        if (err_fd >= 0) { close(err_fd); unlink(tmp_err); }
-        return (Value){VAL_NIL, {.number = 0}};
-    }
-    close(out_fd);
-    close(err_fd);
+static Value native_os_exec(int argCount, Value* args) {
+    if (argCount < 1) return (Value){VAL_NIL, {.number = 0}};
 
-    char q_cmd[MAX_NATIVE_TEXT * 2];
-    char q_out[PATH_MAX * 2];
-    char q_err[PATH_MAX * 2];
-    if (!shell_quote_double(cmd, q_cmd, sizeof(q_cmd)) ||
-        !shell_quote_double(tmp_out, q_out, sizeof(q_out)) ||
-        !shell_quote_double(tmp_err, q_err, sizeof(q_err))) {
-        unlink(tmp_out);
-        unlink(tmp_err);
-        return (Value){VAL_NIL, {.number = 0}};
-    }
+    const char* cmd = NULL;
+    char** argv = NULL;
+    int argc = 0;
 
-    char run_cmd[MAX_NATIVE_TEXT * 4];
-    snprintf(run_cmd, sizeof(run_cmd), "/bin/sh -c %s > %s 2> %s", q_cmd, q_out, q_err);
-    int code = run_shell_status(run_cmd);
-
-    char* out_text = NULL;
-    char* err_text = NULL;
-    size_t out_len = 0;
-    size_t err_len = 0;
-    if (!read_file_alloc(tmp_out, &out_text, &out_len)) out_text = dup_cstr("");
-    if (!read_file_alloc(tmp_err, &err_text, &err_len)) err_text = dup_cstr("");
-    unlink(tmp_out);
-    unlink(tmp_err);
-
-    if (!out_text || !err_text) {
-        free(out_text);
-        free(err_text);
+    if (is_string_value(args[0])) {
+        cmd = AS_STRING(args[0])->chars;
+    } else if (IS_OBJ(args[0]) && AS_OBJ(args[0])->type == OBJ_ARRAY) {
+        ObjArray* arr = (ObjArray*)AS_OBJ(args[0]);
+        if (arr->count == 0) return (Value){VAL_NIL, {.number = 0}};
+        argc = arr->count;
+        argv = malloc(sizeof(char*) * (size_t)(argc + 1));
+        for (int i = 0; i < argc; i++) {
+            if (!is_string_value(arr->elements[i])) {
+                free(argv);
+                return (Value){VAL_NIL, {.number = 0}};
+            }
+            argv[i] = AS_STRING(arr->elements[i])->chars;
+        }
+        argv[argc] = NULL;
+    } else {
         return (Value){VAL_NIL, {.number = 0}};
     }
 
-    char* out_json = escape_json_alloc(out_text);
-    char* err_json = escape_json_alloc(err_text);
-    free(out_text);
-    free(err_text);
-    if (!out_json || !err_json) {
-        free(out_json);
-        free(err_json);
+    int pipe_out[2], pipe_err[2];
+    if (pipe(pipe_out) < 0 || pipe(pipe_err) < 0) {
+        if (argv) free(argv);
         return (Value){VAL_NIL, {.number = 0}};
     }
 
-    size_t cap = strlen(out_json) + strlen(err_json) + 128;
-    char* json = (char*)malloc(cap);
-    if (!json) {
-        free(out_json);
-        free(err_json);
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipe_out[0]); close(pipe_out[1]);
+        close(pipe_err[0]); close(pipe_err[1]);
+        if (argv) free(argv);
         return (Value){VAL_NIL, {.number = 0}};
     }
-    snprintf(json, cap, "{\"stdout\":\"%s\",\"stderr\":\"%s\",\"code\":%d}", out_json, err_json, code);
-    Value res = string_value(json);
-    free(json);
-    free(out_json);
-    free(err_json);
-    return res;
+
+    if (pid == 0) {
+        close(pipe_out[0]); close(pipe_err[0]);
+        dup2(pipe_out[1], STDOUT_FILENO);
+        dup2(pipe_err[1], STDERR_FILENO);
+        close(pipe_out[1]); close(pipe_err[1]);
+
+        if (cmd) {
+            execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
+        } else {
+            execvp(argv[0], argv);
+        }
+        exit(127);
+    }
+
+    close(pipe_out[1]); close(pipe_err[1]);
+    if (argv) free(argv);
+
+    char* stdout_text = NULL; size_t stdout_len = 0;
+    char* stderr_text = NULL; size_t stderr_len = 0;
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(pipe_out[0], buf, sizeof(buf))) > 0) {
+        char* next = realloc(stdout_text, stdout_len + (size_t)n + 1);
+        if (!next) break;
+        stdout_text = next;
+        memcpy(stdout_text + stdout_len, buf, (size_t)n);
+        stdout_len += (size_t)n;
+        stdout_text[stdout_len] = '\0';
+    }
+    while ((n = read(pipe_err[0], buf, sizeof(buf))) > 0) {
+        char* next = realloc(stderr_text, stderr_len + (size_t)n + 1);
+        if (!next) break;
+        stderr_text = next;
+        memcpy(stderr_text + stderr_len, buf, (size_t)n);
+        stderr_len += (size_t)n;
+        stderr_text[stderr_len] = '\0';
+    }
+    close(pipe_out[0]); close(pipe_err[0]);
+
+    int status;
+    waitpid(pid, &status, 0);
+    int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+
+    ObjInstance* res = create_os_exec_result_obj(stdout_text, stderr_text, exit_code);
+    free(stdout_text); free(stderr_text);
+    return (Value){VAL_OBJ, {.obj = (Obj*)res}};
 }
 
 static Value native_read(int argCount, Value* args) {
@@ -1294,24 +1402,48 @@ static Value native_clock(int argCount, Value* args) {
     return (Value){VAL_NUMBER, {.number = (double)clock() / CLOCKS_PER_SEC}};
 }
 
+static void* dlopen_relative_to(const char* base_dir, const char* path, char* resolved, size_t resolved_size) {
+    if (!base_dir || base_dir[0] == '\0' || !path || path[0] == '\0') return NULL;
+    if (path[0] == '/' || strchr(path, '/') == NULL) return NULL;
+    size_t base_len = strlen(base_dir);
+    size_t path_len = strlen(path);
+    if (base_len + 1 + path_len + 1 > resolved_size) return NULL;
+    memcpy(resolved, base_dir, base_len);
+    resolved[base_len] = '/';
+    memcpy(resolved + base_len + 1, path, path_len);
+    resolved[base_len + 1 + path_len] = '\0';
+    return dlopen(resolved, RTLD_LAZY);
+}
+
 static Value native_load_dl(int argCount, Value* args) {
     if (argCount != 1 || !IS_OBJ(args[0]) || AS_OBJ(args[0])->type != OBJ_STRING) {
-        printf("Runtime Error: load_dl expects a string argument.\n");
-        exit(1);
+        return viper_panic("load_dl expects a string argument.");
     }
     const char* path = AS_STRING(args[0])->chars;
     void* handle = dlopen(path, RTLD_LAZY);
+    char resolved[1024];
+
+    if (!handle) {
+        handle = dlopen_relative_to(compiler_get_entry_dir(), path, resolved, sizeof(resolved));
+    }
+
+    if (!handle) {
+        handle = dlopen_relative_to(compiler_get_project_root(), path, resolved, sizeof(resolved));
+    }
 
     // Fallback: if path starts with "lib/std/", try system install path
     if (!handle && strncmp(path, "lib/std/", 8) == 0) {
         char sys_path[1024];
-        snprintf(sys_path, sizeof(sys_path), "/usr/local/lib/viper/std/%s", path + 8);
-        handle = dlopen(sys_path, RTLD_LAZY);
+        size_t sys_len = 0;
+        if (append_fmt(sys_path, sizeof(sys_path), &sys_len, "/usr/local/lib/viper/std/%s", path + 8)) {
+            handle = dlopen(sys_path, RTLD_LAZY);
+        }
     }
 
     if (!handle) {
-        printf("Runtime Error: Failed to load library '%s': %s\n", path, dlerror());
-        exit(1);
+        char err[512];
+        snprintf(err, sizeof(err), "Failed to load library '%s': %s", path, dlerror());
+        return viper_panic(err);
     }
     return (Value){VAL_OBJ, {.obj = (Obj*)new_dl_handle(handle)}};
 }
@@ -1360,8 +1492,7 @@ static Value native_get_fn(int argCount, Value* args) {
     if (argCount != 3 || !IS_OBJ(args[0]) || AS_OBJ(args[0])->type != OBJ_DL_HANDLE ||
         !IS_OBJ(args[1]) || AS_OBJ(args[1])->type != OBJ_STRING || 
         !IS_OBJ(args[2]) || AS_OBJ(args[2])->type != OBJ_STRING) {
-        printf("Runtime Error: get_fn expects (dl_handle, fn_name, signature).\n");
-        exit(1);
+        return viper_panic("get_fn expects (dl_handle, fn_name, signature).");
     }
     
     ObjDlHandle* dl = (ObjDlHandle*)AS_OBJ(args[0]);
@@ -1371,23 +1502,22 @@ static Value native_get_fn(int argCount, Value* args) {
     
     void* fn_ptr = dlsym(dl->handle, fn_name);
     if (!fn_ptr) {
-        printf("Runtime Error: Symbol '%s' not found.\n", fn_name);
-        exit(1);
+        char err[256];
+        snprintf(err, sizeof(err), "Symbol '%s' not found.", fn_name);
+        return viper_panic(err);
     }
 
     // Parse simple signature like "i,d->d"
     // Find separator "->"
     const char* sep = strstr(signature, "->");
     if (!sep) {
-        printf("Runtime Error: Invalid signature format '%s'. Expected '...->type'.\n", signature);
-        exit(1);
+        return viper_panic("Invalid signature format. Expected '...->type'.");
     }
     
     const char* r_ptr = sep + 2;
     ffi_type* rtype = parse_ffi_type(&r_ptr);
     if (!rtype) {
-        printf("Runtime Error: Unknown return type in signature.\n");
-        exit(1);
+        return viper_panic("Unknown return type in signature.");
     }
     
     int arg_cap = 4;
@@ -1399,8 +1529,7 @@ static Value native_get_fn(int argCount, Value* args) {
         if (*p == ',') { p++; continue; }
         ffi_type* t = parse_ffi_type(&p);
         if (!t) {
-            printf("Runtime Error: Unknown argument type in signature.\n");
-            exit(1);
+            return viper_panic("Unknown argument type in signature.");
         }
         if (num_args == arg_cap) {
             arg_cap *= 2;
@@ -1411,8 +1540,7 @@ static Value native_get_fn(int argCount, Value* args) {
     
     ffi_cif* cif = malloc(sizeof(ffi_cif));
     if (ffi_prep_cif(cif, FFI_DEFAULT_ABI, num_args, rtype, arg_types) != FFI_OK) {
-        printf("Runtime Error: ffi_prep_cif failed.\n");
-        exit(1);
+        return viper_panic("ffi_prep_cif failed.");
     }
     
     // Copy signature string for GC to track correctly
@@ -1426,8 +1554,7 @@ static Value native_get_fn(int argCount, Value* args) {
 
 static Value native_serve(int argCount, Value* args) {
     if (argCount != 2 || !IS_NUMBER(args[0]) || !IS_OBJ(args[1])) {
-        printf("Runtime Error: serve expects (port: number, response: string|function).\n");
-        exit(1);
+        return viper_panic("serve expects (port: number, response: string|function).");
     }
     int port = (int)args[0].as.number;
     const char* response_body = (AS_OBJ(args[1])->type == OBJ_STRING) ? AS_STRING(args[1])->chars : "";
@@ -1444,9 +1571,9 @@ static Value native_serve(int argCount, Value* args) {
     address.sin_port = htons(port);
 
     if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        perror("bind failed"); exit(1);
+        return viper_panic("bind failed");
     }
-    if (listen(server_fd, 3) < 0) { perror("listen failed"); exit(1); }
+    if (listen(server_fd, 3) < 0) return viper_panic("listen failed");
 
     printf("ViperLang serving on port %d...\n", port);
     
@@ -1497,7 +1624,10 @@ static Value native_fetch(int argCount, Value* args) {
         return (Value){VAL_NIL, {.number = 0}};
     }
     char cmd[MAX_NATIVE_TEXT];
-    snprintf(cmd, sizeof(cmd), "curl -sL %s", q_url);
+    size_t cmd_len = 0;
+    if (!append_fmt(cmd, sizeof(cmd), &cmd_len, "curl -sL %s", q_url)) {
+        return (Value){VAL_NIL, {.number = 0}};
+    }
     return run_shell_capture(cmd);
 }
 
@@ -1943,7 +2073,9 @@ static Value native_math_rand(int argCount, Value* args) {
         max = tmp;
     }
     if (max == min) return (Value){VAL_NUMBER, {.number = (double)min}};
-    int r = rand() % (max - min + 1);
+    unsigned int r;
+    fill_secure_random(&r, sizeof(r));
+    r = r % (max - min + 1);
     return (Value){VAL_NUMBER, {.number = (double)(min + r)}};
 }
 
@@ -1951,7 +2083,7 @@ static Value native_math_uuid(int argCount, Value* args) {
     (void)argCount;
     (void)args;
     unsigned char b[16];
-    for (int i = 0; i < 16; i++) b[i] = (unsigned char)(rand() & 0xFF);
+    fill_secure_random(b, 16);
     b[6] = (unsigned char)((b[6] & 0x0F) | 0x40); // version 4
     b[8] = (unsigned char)((b[8] & 0x3F) | 0x80); // variant
 
@@ -2587,50 +2719,86 @@ static void skip_whitespace(const char** src) {
     while (**src == ' ' || **src == '\n' || **src == '\r' || **src == '\t') (*src)++;
 }
 
+static char* parse_json_string_token(const char** src) {
+    (*src)++; // skip '"'
+    size_t cap = 32;
+    size_t len = 0;
+    char* res = malloc(cap);
+    
+    while (**src != '"' && **src != '\0') {
+        if (len + 1 >= cap) {
+            cap *= 2;
+            res = realloc(res, cap);
+        }
+        
+        if (**src == '\\') {
+            (*src)++;
+            if (**src == '\0') break;
+            switch (**src) {
+                case 'n':  res[len++] = '\n'; break;
+                case 'r':  res[len++] = '\r'; break;
+                case 't':  res[len++] = '\t'; break;
+                case 'b':  res[len++] = '\b'; break;
+                case 'f':  res[len++] = '\f'; break;
+                case '"':  res[len++] = '"';  break;
+                case '\\': res[len++] = '\\'; break;
+                case '/':  res[len++] = '/';  break;
+                default:   res[len++] = **src; break;
+            }
+        } else {
+            res[len++] = **src;
+        }
+        (*src)++;
+    }
+    if (**src == '"') (*src)++;
+    res[len] = '\0';
+    return res;
+}
+
 static Value parse_json_value(const char** src);
 
 static Value parse_json_object(const char** src) {
     (*src)++; // skip '{'
-    const char* names[64];
-    Value values[64];
-    int count = 0;
+    size_t cap = 16;
+    size_t count = 0;
+    const char** names = malloc(sizeof(char*) * cap);
+    Value* values = malloc(sizeof(Value) * cap);
 
-    skip_whitespace(src);
-    if (**src == '}') {
-        (*src)++;
-        return (Value){VAL_OBJ, {.obj = (Obj*)create_dynamic_instance(0, NULL, NULL)}};
-    }
-
-    while (**src != '\0') {
+    while (true) {
         skip_whitespace(src);
-        if (**src != '"') break;
-        (*src)++; // skip '"'
-        const char* start = *src;
-        while (**src != '"' && **src != '\0') (*src)++;
-        int len = (int)(*src - start);
-        char* name = malloc(len + 1);
-        memcpy(name, start, len);
-        name[len] = '\0';
-        names[count] = name;
-        (*src)++; // skip '"'
+        if (**src == '}') {
+            (*src)++;
+            break;
+        }
+        if (count > 0) {
+            if (**src == ',') {
+                (*src)++;
+                skip_whitespace(src);
+            } else break;
+        }
 
+        if (**src != '"') break;
+        char* name = parse_json_string_token(src);
+        
         skip_whitespace(src);
         if (**src == ':') (*src)++;
         skip_whitespace(src);
 
         values[count] = parse_json_value(src);
+        names[count] = name;
         count++;
 
-        skip_whitespace(src);
-        if (**src == ',') (*src)++;
-        else if (**src == '}') {
-            (*src)++;
-            break;
+        if (count >= cap) {
+            cap *= 2;
+            names = realloc(names, sizeof(char*) * cap);
+            values = realloc(values, sizeof(Value) * cap);
         }
     }
 
-    ObjInstance* inst = create_dynamic_instance(count, names, values);
-    for (int i = 0; i < count; i++) free((void*)names[i]);
+    ObjInstance* inst = create_dynamic_instance((int)count, names, values);
+    for (size_t i = 0; i < count; i++) free((void*)names[i]);
+    free(names);
+    free(values);
     return (Value){VAL_OBJ, {.obj = (Obj*)inst}};
 }
 
@@ -2660,13 +2828,10 @@ static Value parse_json_value(const char** src) {
     if (**src == '{') return parse_json_object(src);
     if (**src == '[') return parse_json_array(src);
     if (**src == '"') {
-        (*src)++;
-        const char* start = *src;
-        while (**src != '"' && **src != '\0') (*src)++;
-        int len = (int)(*src - start);
-        ObjString* s = copy_string(start, len);
-        (*src)++;
-        return (Value){VAL_OBJ, {.obj = (Obj*)s}};
+        char* str = parse_json_string_token(src);
+        Value val = string_value(str);
+        free(str);
+        return val;
     }
     if ((**src >= '0' && **src <= '9') || **src == '-') {
         char* end;
@@ -2721,7 +2886,20 @@ static void stringify_value(Value val, char** buf, int* cap, int* len) {
         Obj* obj = AS_OBJ(val);
         if (obj->type == OBJ_STRING) {
             ObjString* s = (ObjString*)obj;
-            *len += sprintf(*buf + *len, "\"%s\"", s->chars);
+            (*buf)[(*len)++] = '"';
+            for (int j = 0; j < s->length; j++) {
+                char c = s->chars[j];
+                if (*len + 2 >= *cap) { *cap *= 2; *buf = realloc(*buf, *cap); }
+                switch (c) {
+                    case '"':  (*buf)[(*len)++] = '\\'; (*buf)[(*len)++] = '"'; break;
+                    case '\\': (*buf)[(*len)++] = '\\'; (*buf)[(*len)++] = '\\'; break;
+                    case '\n': (*buf)[(*len)++] = '\\'; (*buf)[(*len)++] = 'n'; break;
+                    case '\r': (*buf)[(*len)++] = '\\'; (*buf)[(*len)++] = 'r'; break;
+                    case '\t': (*buf)[(*len)++] = '\\'; (*buf)[(*len)++] = 't'; break;
+                    default:   (*buf)[(*len)++] = c; break;
+                }
+            }
+            (*buf)[(*len)++] = '"';
         } else if (obj->type == OBJ_INSTANCE) {
             ObjInstance* inst = (ObjInstance*)obj;
             (*buf)[(*len)++] = '{';
@@ -3093,10 +3271,55 @@ static Value native_web_ws_send(int argCount, Value* args) {
     return (Value){VAL_BOOL, {.boolean = ok}};
 }
 
+static ObjInstance* create_web_request_obj(const char* method, const char* path, const char* body, int client_fd) {
+    if (!g_web_request_struct) return NULL;
+    ObjInstance* inst = new_instance(g_web_request_struct);
+    inst->fields[0] = string_value(method);
+    inst->fields[1] = string_value(path);
+    inst->fields[2] = string_value(body);
+    inst->fields[3] = (Value){VAL_NUMBER, {.number = (double)client_fd}};
+    return inst;
+}
+
+static ObjInstance* create_web_response_obj(int client_fd) {
+    if (!g_web_response_struct) return NULL;
+    ObjInstance* inst = new_instance(g_web_response_struct);
+    inst->fields[0] = (Value){VAL_NUMBER, {.number = (double)client_fd}};
+    inst->fields[1] = (Value){VAL_NUMBER, {.number = 200.0}};
+    return inst;
+}
+
+static Value native_web_res_status(int argCount, Value* args) {
+    if (argCount < 2 || !IS_OBJ(args[0]) || !IS_NUMBER(args[1])) return (Value){VAL_NIL, {.number = 0}};
+    ObjInstance* res = (ObjInstance*)AS_OBJ(args[0]);
+    res->fields[1] = args[1];
+    return args[0];
+}
+
+static Value native_web_res_send(int argCount, Value* args) {
+    if (argCount < 2 || !IS_OBJ(args[0]) || !is_string_value(args[1])) return (Value){VAL_NIL, {.number = 0}};
+    ObjInstance* res = (ObjInstance*)AS_OBJ(args[0]);
+    int fd = (int)res->fields[0].as.number;
+    int status = (int)res->fields[1].as.number;
+    const char* body = AS_STRING(args[1])->chars;
+    
+    char head[512];
+    int head_len = snprintf(head, sizeof(head),
+        "HTTP/1.1 %d OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n\r\n",
+        status, strlen(body));
+    
+    send(fd, head, head_len, 0);
+    send(fd, body, strlen(body), 0);
+    close(fd);
+    return (Value){VAL_NIL, {.number = 0}};
+}
+
 static Value native_web_serve(int argCount, Value* args) {
     if (argCount < 1 || !IS_NUMBER(args[0])) {
-        printf("Runtime Error: web.serve expects (port, handler?).\n");
-        exit(1);
+        return viper_panic("web.serve expects (port, handler?).");
     }
     int port = (int)args[0].as.number;
     Value fallback = (argCount >= 2) ? args[1] : string_value("<h1>Viper Web</h1>");
@@ -3113,15 +3336,19 @@ static Value native_web_serve(int argCount, Value* args) {
     address.sin_port = htons(port);
 
     if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        perror("bind failed");
-        exit(1);
+        return viper_panic("bind failed");
     }
     if (listen(server_fd, 16) < 0) {
-        perror("listen failed");
-        exit(1);
+        return viper_panic("listen failed");
     }
 
     printf("ViperLang web server listening on port %d...\n", port);
+    
+    // Phase 5: O(1) LLM API Directory Scanning
+    if (access("api", F_OK) == 0) {
+        printf("Scanning 'api/' directory for auto-routes...\n");
+        web_map_api_directory("api", "api");
+    }
 
     while (true) {
         int client_fd = accept(server_fd, NULL, NULL);
@@ -3139,11 +3366,14 @@ static Value native_web_serve(int argCount, Value* args) {
         char path[256];
         parse_http_request_line(req_buf, method, sizeof(method), path, sizeof(path));
 
-        Value req_val = string_value(req_buf);
+        Value req_val = (Value){VAL_OBJ, {.obj = (Obj*)create_web_request_obj(method, path, "", client_fd)}};
+        Value res_val = (Value){VAL_OBJ, {.obj = (Obj*)create_web_response_obj(client_fd)}};
+        Value h_args[2] = {req_val, res_val};
+
         for (int i = 0; i < g_web_middleware_count; i++) {
             if (!IS_OBJ(g_web_middlewares[i]) || AS_OBJ(g_web_middlewares[i])->type != OBJ_FUNCTION) continue;
             ObjFunction* mw = (ObjFunction*)AS_OBJ(g_web_middlewares[i]);
-            (void)call_viper_function(mw, 1, &req_val);
+            (void)call_viper_function(mw, 2, h_args);
         }
 
         char* static_body = NULL;
@@ -3162,11 +3392,33 @@ static Value native_web_serve(int argCount, Value* args) {
                 Value out = call_viper_function((ObjFunction*)AS_OBJ(handler), 1, &req_val);
                 if (is_string_value(out)) {
                     web_send_response(client_fd, 200, "text/html; charset=utf-8", AS_STRING(out)->chars);
-                } else {
-                    web_send_response(client_fd, 200, "text/plain; charset=utf-8", "ok");
+                } else if (out.type != VAL_NIL) {
+                    // Send JSON if possible (we'll expand this later)
+                    web_send_response(client_fd, 200, "application/json; charset=utf-8", "{\"status\":\"ok\"}");
                 }
             } else if (is_string_value(handler)) {
-                web_send_response(client_fd, 200, "text/html; charset=utf-8", AS_STRING(handler)->chars);
+                // If the handler is a string ending in .vp, it's an auto-route file
+                const char* h_str = AS_STRING(handler)->chars;
+                const char* ext = strrchr(h_str, '.');
+                if (ext && strcmp(ext, ".vp") == 0) {
+                    // Temporarily compile and run the file (in full version we'd cache the compilation)
+                    char* source = NULL;
+                    ObjFunction* endpoint_fn = compile_file(h_str, &source);
+                    if (endpoint_fn) {
+                        Value out = call_viper_function(endpoint_fn, 1, &req_val);
+                        // For Phase 5, if it's not NIL, assume it's JSON serialization success
+                        if (is_string_value(out)) {
+                             web_send_response(client_fd, 200, "application/json; charset=utf-8", AS_STRING(out)->chars);
+                        } else {
+                             web_send_response(client_fd, 200, "application/json; charset=utf-8", "{\"status\":\"executed\"}");    
+                        }
+                        if (source) free(source);
+                    } else {
+                        web_send_response(client_fd, 500, "application/json; charset=utf-8", "{\"error\":\"compile failed\"}");
+                    }
+                } else {
+                    web_send_response(client_fd, 200, "text/html; charset=utf-8", h_str);
+                }
             } else {
                 web_send_response(client_fd, 200, "text/plain; charset=utf-8", "ok");
             }
@@ -3194,25 +3446,60 @@ static Value native_web_serve(int argCount, Value* args) {
 static Value native_web_hash(int argCount, Value* args) {
     if (argCount < 1 || !is_string_value(args[0])) return (Value){VAL_NIL, {.number = 0}};
     ObjString* s = AS_STRING(args[0]);
-    uint32_t h = hash_string(s->chars, s->length);
-    char out[16];
-    snprintf(out, sizeof(out), "%08x", h);
+    uint8_t hash[32];
+    viper_sha256((const uint8_t*)s->chars, s->length, hash);
+    char out[65];
+    for (int i = 0; i < 32; i++) sprintf(out + (i * 2), "%02x", hash[i]);
     return string_value(out);
+}
+
+static Value native_crypto_hmac_sha256(int argCount, Value* args) {
+    if (argCount != 2 || !is_string_value(args[0]) || !is_string_value(args[1])) {
+        return (Value){VAL_NIL, {.number = 0}};
+    }
+    const char* key = AS_STRING(args[0])->chars;
+    const char* data = AS_STRING(args[1])->chars;
+    
+    uint8_t hash[32];
+    viper_hmac_sha256((const uint8_t*)key, (int)strlen(key), (const uint8_t*)data, (int)strlen(data), hash);
+    
+    char hex[65];
+    for (int i = 0; i < 32; i++) sprintf(hex + (i * 2), "%02x", hash[i]);
+    hex[64] = '\0';
+    
+    return string_value(hex);
+}
+
+static Value native_crypto_sha256(int argCount, Value* args) {
+    if (argCount != 1 || !is_string_value(args[0])) return (Value){VAL_NIL, {.number = 0}};
+    const char* data = AS_STRING(args[0])->chars;
+    
+    uint8_t hash[32];
+    viper_sha256((const uint8_t*)data, (int)strlen(data), hash);
+    
+    char hex[65];
+    for (int i = 0; i < 32; i++) sprintf(hex + (i * 2), "%02x", hash[i]);
+    hex[64] = '\0';
+    
+    return string_value(hex);
 }
 
 static Value native_web_jwt_sign(int argCount, Value* args) {
     if (argCount != 2 || !is_string_value(args[0]) || !is_string_value(args[1])) {
         return (Value){VAL_NIL, {.number = 0}};
     }
-    const char* payload = AS_STRING(args[0])->chars;
-    const char* secret = AS_STRING(args[1])->chars;
+    ObjString* payload = AS_STRING(args[0]);
+    ObjString* secret = AS_STRING(args[1]);
 
-    char sign_input[MAX_NATIVE_TEXT];
-    snprintf(sign_input, sizeof(sign_input), "%s:%s", secret, payload);
-    uint32_t sig = hash_string(sign_input, (int)strlen(sign_input));
+    uint8_t mac[32];
+    viper_hmac_sha256((const uint8_t*)secret->chars, secret->length, 
+                      (const uint8_t*)payload->chars, payload->length, mac);
+
+    char sig_hex[65];
+    for (int i = 0; i < 32; i++) sprintf(sig_hex + (i * 2), "%02x", mac[i]);
 
     char token[MAX_NATIVE_TEXT];
-    snprintf(token, sizeof(token), "v1.%08x.%s", sig, payload);
+    snprintf(token, sizeof(token), "v2.%s.%s", sig_hex, payload->chars);
     return string_value(token);
 }
 
@@ -3220,39 +3507,35 @@ static Value native_web_jwt_verify(int argCount, Value* args) {
     if (argCount != 2 || !is_string_value(args[0]) || !is_string_value(args[1])) {
         return (Value){VAL_NIL, {.number = 0}};
     }
-    char* tok = dup_cstr(AS_STRING(args[0])->chars);
-    if (!tok) return (Value){VAL_NIL, {.number = 0}};
+    const char* token_str = AS_STRING(args[0])->chars;
     const char* secret = AS_STRING(args[1])->chars;
+    size_t secret_len = AS_STRING(args[1])->length;
 
-    char* p1 = strchr(tok, '.');
-    if (!p1) {
-        free(tok);
-        return (Value){VAL_NIL, {.number = 0}};
-    }
-    *p1 = '\0';
-    char* p2 = strchr(p1 + 1, '.');
-    if (!p2) {
-        free(tok);
-        return (Value){VAL_NIL, {.number = 0}};
-    }
-    *p2 = '\0';
-    const char* version = tok;
-    const char* sig_hex = p1 + 1;
-    const char* payload = p2 + 1;
-    if (strcmp(version, "v1") != 0) {
-        free(tok);
-        return (Value){VAL_NIL, {.number = 0}};
+    if (strncmp(token_str, "v2.", 3) != 0) return (Value){VAL_NIL, {.number = 0}};
+
+    const char* sig_ptr = token_str + 3;
+    const char* dot_ptr = strchr(sig_ptr, '.');
+    if (!dot_ptr || (dot_ptr - sig_ptr) != 64) return (Value){VAL_NIL, {.number = 0}};
+
+    char sig_hex[65];
+    memcpy(sig_hex, sig_ptr, 64);
+    sig_hex[64] = '\0';
+
+    const char* payload = dot_ptr + 1;
+    size_t payload_len = strlen(payload);
+
+    uint8_t mac[32];
+    viper_hmac_sha256((const uint8_t*)secret, secret_len, 
+                      (const uint8_t*)payload, payload_len, mac);
+
+    char expected_sig[65];
+    for (int i = 0; i < 32; i++) sprintf(expected_sig + (i * 2), "%02x", mac[i]);
+
+    if (strcmp(sig_hex, expected_sig) == 0) {
+        return string_value(payload);
     }
 
-    char sign_input[MAX_NATIVE_TEXT];
-    snprintf(sign_input, sizeof(sign_input), "%s:%s", secret, payload);
-    uint32_t expected = hash_string(sign_input, (int)strlen(sign_input));
-    char expected_hex[16];
-    snprintf(expected_hex, sizeof(expected_hex), "%08x", expected);
-    bool ok = strcmp(expected_hex, sig_hex) == 0;
-    Value out = ok ? string_value(payload) : (Value){VAL_NIL, {.number = 0}};
-    free(tok);
-    return out;
+    return (Value){VAL_NIL, {.number = 0}};
 }
 
 static Value native_http_method(const char* method, int argCount, Value* args) {
@@ -3263,14 +3546,18 @@ static Value native_http_method(const char* method, int argCount, Value* args) {
     }
 
     char cmd[8192];
-    snprintf(cmd, sizeof(cmd), "curl -sL -X %s %s", method, q_url);
+    size_t cmd_len = 0;
+    if (!append_fmt(cmd, sizeof(cmd), &cmd_len, "curl -sL -X %s %s", method, q_url)) {
+        return (Value){VAL_NIL, {.number = 0}};
+    }
     if (argCount >= 2 && is_string_value(args[1])) {
         char q_data[MAX_NATIVE_TEXT];
         if (!shell_quote_double(AS_STRING(args[1])->chars, q_data, sizeof(q_data))) {
             return (Value){VAL_NIL, {.number = 0}};
         }
-        strncat(cmd, " --data ", sizeof(cmd) - strlen(cmd) - 1);
-        strncat(cmd, q_data, sizeof(cmd) - strlen(cmd) - 1);
+        if (!append_fmt(cmd, sizeof(cmd), &cmd_len, " --data %s", q_data)) {
+            return (Value){VAL_NIL, {.number = 0}};
+        }
     }
     return run_shell_capture(cmd);
 }
@@ -3291,7 +3578,10 @@ static Value native_web_download(int argCount, Value* args) {
         return (Value){VAL_BOOL, {.boolean = false}};
     }
     char cmd[MAX_NATIVE_TEXT * 2];
-    snprintf(cmd, sizeof(cmd), "curl -sL %s -o %s", q_url, q_path);
+    size_t cmd_len = 0;
+    if (!append_fmt(cmd, sizeof(cmd), &cmd_len, "curl -sL %s -o %s", q_url, q_path)) {
+        return (Value){VAL_BOOL, {.boolean = false}};
+    }
     return (Value){VAL_BOOL, {.boolean = run_shell_status(cmd) == 0}};
 }
 
@@ -3306,7 +3596,10 @@ static Value native_web_upload(int argCount, Value* args) {
         return (Value){VAL_NIL, {.number = 0}};
     }
     char cmd[MAX_NATIVE_TEXT * 2];
-    snprintf(cmd, sizeof(cmd), "curl -sL -F file=@%s %s", q_path, q_url);
+    size_t cmd_len = 0;
+    if (!append_fmt(cmd, sizeof(cmd), &cmd_len, "curl -sL -F file=@%s %s", q_path, q_url)) {
+        return (Value){VAL_NIL, {.number = 0}};
+    }
     return run_shell_capture(cmd);
 }
 
@@ -3316,9 +3609,25 @@ static Value vdb_connect(int argCount, Value* args) {
     if (strncmp(raw, "sqlite://", 9) == 0) {
         raw += 9;
     } else if (strstr(raw, "://") != NULL) {
+        // We only support sqlite in the hardening phase v4 for now
         return (Value){VAL_BOOL, {.boolean = false}};
     }
     if (raw[0] == '\0' || strlen(raw) >= sizeof(g_db_path)) return (Value){VAL_BOOL, {.boolean = false}};
+    
+    if (g_db) {
+        sqlite3_close(g_db);
+        g_db = NULL;
+    }
+    
+    int rc = sqlite3_open_v2(raw, &g_db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
+    if (rc != SQLITE_OK) {
+        if (g_db) {
+            sqlite3_close(g_db);
+            g_db = NULL;
+        }
+        return (Value){VAL_BOOL, {.boolean = false}};
+    }
+    
     snprintf(g_db_path, sizeof(g_db_path), "%s", raw);
     return (Value){VAL_BOOL, {.boolean = true}};
 }
@@ -3353,7 +3662,12 @@ static Value vdb_insert(int argCount, Value* args) {
     }
 
     char sql[8192];
-    snprintf(sql, sizeof(sql), "INSERT INTO %s (%s) VALUES (%s); SELECT last_insert_rowid();", table, cols, vals);
+    size_t sql_len = 0;
+    if (!append_fmt(sql, sizeof(sql), &sql_len,
+                    "INSERT INTO %s (%s) VALUES (%s); SELECT last_insert_rowid();",
+                    table, cols, vals)) {
+        return (Value){VAL_NIL, {.number = 0}};
+    }
     return run_sql_capture(sql);
 }
 
@@ -3372,7 +3686,10 @@ static Value vdb_update(int argCount, Value* args) {
     }
     int id = (int)args[1].as.number;
     char sql[8192];
-    snprintf(sql, sizeof(sql), "UPDATE %s SET %s WHERE id=%d;", table, sets, id);
+    size_t sql_len = 0;
+    if (!append_fmt(sql, sizeof(sql), &sql_len, "UPDATE %s SET %s WHERE id=%d;", table, sets, id)) {
+        return (Value){VAL_BOOL, {.boolean = false}};
+    }
     Value out = run_sql_capture(sql);
     return (Value){VAL_BOOL, {.boolean = !output_has_sql_error(out)}};
 }
@@ -3392,10 +3709,19 @@ static Value vdb_save(int argCount, Value* args) {
     }
 
     char sql[8192];
+    size_t sql_len = 0;
     if (has_id) {
-        snprintf(sql, sizeof(sql), "UPDATE %s SET %s WHERE id=%d; SELECT %d;", table, sets, id_val, id_val);
+        if (!append_fmt(sql, sizeof(sql), &sql_len,
+                        "UPDATE %s SET %s WHERE id=%d; SELECT %d;",
+                        table, sets, id_val, id_val)) {
+            return (Value){VAL_NIL, {.number = 0}};
+        }
     } else {
-        snprintf(sql, sizeof(sql), "INSERT INTO %s (%s) VALUES (%s); SELECT last_insert_rowid();", table, cols, vals);
+        if (!append_fmt(sql, sizeof(sql), &sql_len,
+                        "INSERT INTO %s (%s) VALUES (%s); SELECT last_insert_rowid();",
+                        table, cols, vals)) {
+            return (Value){VAL_NIL, {.number = 0}};
+        }
     }
     return run_sql_capture(sql);
 }
@@ -3445,9 +3771,12 @@ static Value vdb_upsert(int argCount, Value* args) {
         return (Value){VAL_NIL, {.number = 0}};
     }
     char sql[8192];
-    snprintf(sql, sizeof(sql),
-             "INSERT INTO %s (%s) VALUES (%s) ON CONFLICT(%s) DO UPDATE SET %s;",
-             table, cols, vals, conflict_key, sets);
+    size_t sql_len = 0;
+    if (!append_fmt(sql, sizeof(sql), &sql_len,
+                    "INSERT INTO %s (%s) VALUES (%s) ON CONFLICT(%s) DO UPDATE SET %s;",
+                    table, cols, vals, conflict_key, sets)) {
+        return (Value){VAL_NIL, {.number = 0}};
+    }
     return run_sql_capture(sql);
 }
 
@@ -3880,7 +4209,6 @@ static Value native_profile(int argCount, Value* args) {
 
 void init_native_core() {
     _native_count = 0;
-    srand((unsigned int)time(NULL));
     for (int i = 0; i < MAX_CACHE_ENTRIES; i++) {
         g_cache[i].used = false;
         g_cache[i].key = NULL;
@@ -3918,10 +4246,11 @@ void init_native_core() {
 
     // OS primitives
 #if VIPER_CAP_OS
-    push_native_cap("os_sh", native_sh, "os", true);
+    push_native_cap("os_sh", native_os_exec, "os", true);
     push_native_cap("os_env", native_env, "os", true);
     push_native_cap("os_setenv", native_setenv, "os", true);
     push_native_cap("os_args", native_args, "os", true);
+    push_native_cap("os_exec", native_os_exec, "os", true);
     push_native_cap("os_exit", native_exit_now, "os", true);
     push_native_cap("os_cwd", native_cwd, "os", true);
     push_native_cap("os_pid", native_pid, "os", true);
@@ -3931,6 +4260,7 @@ void init_native_core() {
     push_native_cap("os_cron", native_os_cron, "os", true);
 #else
     push_native_cap("os_sh", native_disabled_os, "os", false);
+    push_native_cap("os_exec", native_disabled_os, "os", false);
     push_native_cap("os_env", native_disabled_os, "os", false);
     push_native_cap("os_setenv", native_disabled_os, "os", false);
     push_native_cap("os_args", native_disabled_os, "os", false);
@@ -4178,4 +4508,27 @@ void init_native_core() {
     push_native_cap("arr_reduce", native_disabled_util, "util", false);
     push_native_cap("arr_join", native_disabled_util, "util", false);
 #endif
+
+    // Register Web response helpers (used by high-level net.vp)
+    push_native_cap("vweb_status", native_web_res_status, "web", true);
+    push_native_cap("vweb_send", native_web_res_send, "web", true);
+    
+    // Register standalone crypto
+    push_native_cap("crypto_hmac_sha256", native_crypto_hmac_sha256, "util", true);
+    push_native_cap("crypto_sha256", native_crypto_sha256, "util", true);
+    
+    // Initialize Web Structs
+    static const char* req_fields[] = {"method", "path", "body", "fd"};
+    static int req_lens[] = {6, 4, 4, 2};
+    g_web_request_struct = new_struct("WebRequest", 10, 4, req_fields, req_lens);
+    
+    static const char* res_fields[] = {"fd", "status_code"};
+    static int res_lens[] = {2, 11};
+    g_web_response_struct = new_struct("WebResponse", 11, 2, res_fields, res_lens);
+
+    // OS Exec Result Struct
+    static const char* exec_fields[] = {"stdout", "stderr", "code"};
+    static int exec_lens[] = {6, 6, 4};
+    g_os_exec_result_struct = new_struct("ExecResult", 10, 3, exec_fields, exec_lens);
+    retain_obj((Obj*)g_os_exec_result_struct);
 }

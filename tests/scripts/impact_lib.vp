@@ -1,0 +1,8 @@
+@effect(os)
+pub fn read_user(user_id) -> str {
+    ret os_env(user_id)
+}
+
+pub fn format_user(user_id) -> str {
+    ret read_user(user_id)
+}

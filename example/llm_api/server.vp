@@ -1,0 +1,3 @@
+use "@std/web" as web
+
+web.serve(9090, nil)

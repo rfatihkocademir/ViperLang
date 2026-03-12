@@ -44,9 +44,15 @@ void run_scheduler_loop(void) {
     while (atomic_load(&running)) {
         VM* fiber = pop_fiber();
         if (!fiber) {
-            usleep(100); // Wait for work
-            if (atomic_load(&queue_head) == atomic_load(&queue_tail)) break; // Exit if empty for now
-            continue;
+            int empty_waits = 0;
+            while (empty_waits < 100) {
+                fiber = pop_fiber();
+                if (fiber) break;
+                usleep(100); 
+                empty_waits++;
+                if (!atomic_load(&running)) break;
+            }
+            if (!fiber) break; // Exhausted
         }
         
         InterpretResult res = interpret(fiber, NULL, 500); // 500 steps per slice

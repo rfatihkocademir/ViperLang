@@ -9,6 +9,8 @@
 *.exe
 *.out
 /viper
+/build/
+/.build/
 /docs
 /examples/
 # Viper bytecode and package artifacts

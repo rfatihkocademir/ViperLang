@@ -1,0 +1,15 @@
+var fallback: str = "guest"
+
+@effect(os, auth)
+pub fn read_user(user_id) -> str {
+    ret os_env("USER")
+}
+
+@effect(ffi)
+fn open_plugin(path) {
+    ret load_dl(path)
+}
+
+fn risky() {
+    panic("boom")
+}

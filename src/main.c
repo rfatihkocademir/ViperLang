@@ -63,7 +63,7 @@ static char* read_file(const char* path) {
     return buffer;
 }
 
-static ObjFunction* compile_file(const char* path, char** out_source) {
+ObjFunction* compile_file(const char* path, char** out_source) {
     char* source = read_file(path);
 
     compiler_set_entry_file(path);
@@ -413,7 +413,7 @@ static int cmd_build_app(int argc, const char* argv[]) {
 }
 
 static void print_usage(void) {
-    printf("Usage: viper [--emit-index-json[=out.json]] [--emit-bytecode=out.vbb] [script.vp]\n");
+    printf("Usage: viper [--emit-index-json[=out.json]] [--emit-project-state[=out.vstate] [--focus=symbol] [--impact]] [--resume-project-state=state.vstate] [--verify-project-state=state.vstate] [--refresh-project-state=state.vstate] [--emit-context-pack[=out.ctx] [--focus=symbol] [--impact]] [--emit-semantic-diff=before.vp --focus=symbol [--impact]] [--emit-bytecode=out.vbb] [script.vp]\n");
     printf("       viper --run-bytecode=app.vbb\n");
     printf("       viper build <entry.vp> [--out-dir=build] [--name=app]\n");
     printf("       viper pkg <init|add|remove|install|lock|list|build|abi> [...args]\n");
@@ -436,7 +436,17 @@ int main(int argc, const char* argv[]) {
     }
 
     bool emit_index = false;
+    bool emit_project_state_flag = false;
+    bool emit_context = false;
     const char* index_out = NULL;
+    const char* project_state_out = NULL;
+    const char* resume_project_state_in = NULL;
+    const char* verify_project_state_in = NULL;
+    const char* refresh_project_state_in = NULL;
+    const char* context_out = NULL;
+    const char* semantic_diff_before = NULL;
+    const char* focus_symbol = NULL;
+    bool include_impact = false;
     const char* emit_bytecode_out = NULL;
     const char* run_bytecode_in = NULL;
     const char* script_path = NULL;
@@ -449,6 +459,48 @@ int main(int argc, const char* argv[]) {
         if (strncmp(argv[i], "--emit-index-json=", 18) == 0) {
             emit_index = true;
             index_out = argv[i] + 18;
+            continue;
+        }
+        if (strcmp(argv[i], "--emit-project-state") == 0) {
+            emit_project_state_flag = true;
+            continue;
+        }
+        if (strncmp(argv[i], "--emit-project-state=", 21) == 0) {
+            emit_project_state_flag = true;
+            project_state_out = argv[i] + 21;
+            continue;
+        }
+        if (strncmp(argv[i], "--resume-project-state=", 23) == 0) {
+            resume_project_state_in = argv[i] + 23;
+            continue;
+        }
+        if (strncmp(argv[i], "--verify-project-state=", 23) == 0) {
+            verify_project_state_in = argv[i] + 23;
+            continue;
+        }
+        if (strncmp(argv[i], "--refresh-project-state=", 24) == 0) {
+            refresh_project_state_in = argv[i] + 24;
+            continue;
+        }
+        if (strcmp(argv[i], "--emit-context-pack") == 0) {
+            emit_context = true;
+            continue;
+        }
+        if (strncmp(argv[i], "--emit-context-pack=", 20) == 0) {
+            emit_context = true;
+            context_out = argv[i] + 20;
+            continue;
+        }
+        if (strncmp(argv[i], "--focus=", 8) == 0) {
+            focus_symbol = argv[i] + 8;
+            continue;
+        }
+        if (strncmp(argv[i], "--emit-semantic-diff=", 21) == 0) {
+            semantic_diff_before = argv[i] + 21;
+            continue;
+        }
+        if (strcmp(argv[i], "--impact") == 0) {
+            include_impact = true;
             continue;
         }
         if (strncmp(argv[i], "--emit-bytecode=", 16) == 0) {
@@ -468,7 +520,9 @@ int main(int argc, const char* argv[]) {
     }
 
     if (run_bytecode_in != NULL) {
-        if (script_path != NULL || emit_index || emit_bytecode_out != NULL) {
+        if (script_path != NULL || emit_index || emit_project_state_flag || emit_context || emit_bytecode_out != NULL ||
+            semantic_diff_before != NULL || resume_project_state_in != NULL || verify_project_state_in != NULL ||
+            refresh_project_state_in != NULL || focus_symbol != NULL || include_impact) {
             printf("Usage: viper --run-bytecode=app.vbb\n");
             exit(64);
         }
@@ -478,13 +532,85 @@ int main(int argc, const char* argv[]) {
         return 0;
     }
 
+    if (resume_project_state_in != NULL || verify_project_state_in != NULL || refresh_project_state_in != NULL) {
+        if (script_path != NULL || emit_index || emit_project_state_flag || emit_context ||
+            emit_bytecode_out != NULL || semantic_diff_before != NULL || focus_symbol != NULL ||
+            include_impact) {
+            print_usage();
+            exit(64);
+        }
+
+        bool ok = true;
+        if (resume_project_state_in != NULL) {
+            ok = resume_project_state(resume_project_state_in, NULL);
+        } else if (verify_project_state_in != NULL) {
+            ok = verify_project_state(verify_project_state_in, NULL);
+        } else if (refresh_project_state_in != NULL) {
+            ok = refresh_project_state(refresh_project_state_in, NULL);
+        }
+        if (!ok) exit(1);
+        free_memory();
+        return 0;
+    }
+
     if (script_path == NULL) {
+        print_usage();
+        exit(64);
+    }
+
+    if (semantic_diff_before != NULL && (emit_index || emit_project_state_flag || emit_context || emit_bytecode_out != NULL)) {
+        print_usage();
+        exit(64);
+    }
+
+    if (focus_symbol != NULL && !emit_context && !emit_project_state_flag) {
+        if (semantic_diff_before == NULL) {
+            print_usage();
+            exit(64);
+        }
+    }
+
+    if (semantic_diff_before != NULL && focus_symbol == NULL) {
+        print_usage();
+        exit(64);
+    }
+
+    if (include_impact && (!emit_context && !emit_project_state_flag && semantic_diff_before == NULL)) {
+        print_usage();
+        exit(64);
+    }
+
+    if (include_impact && semantic_diff_before != NULL && focus_symbol == NULL) {
         print_usage();
         exit(64);
     }
 
     if (emit_index) {
         if (!emit_semantic_index_json(script_path, index_out)) {
+            exit(1);
+        }
+        free_memory();
+        return 0;
+    }
+
+    if (emit_project_state_flag) {
+        if (!emit_project_state(script_path, project_state_out, focus_symbol, include_impact)) {
+            exit(1);
+        }
+        free_memory();
+        return 0;
+    }
+
+    if (emit_context) {
+        if (!emit_context_pack(script_path, context_out, focus_symbol, include_impact)) {
+            exit(1);
+        }
+        free_memory();
+        return 0;
+    }
+
+    if (semantic_diff_before != NULL) {
+        if (!emit_semantic_diff(semantic_diff_before, script_path, NULL, focus_symbol, include_impact)) {
             exit(1);
         }
         free_memory();

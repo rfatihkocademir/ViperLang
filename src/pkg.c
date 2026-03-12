@@ -12,6 +12,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -22,6 +23,7 @@
 #define MAX_LINE_LEN 1024
 #define MAX_NAME_LEN 256
 #define MAX_VERSION_LEN 64
+#define MAX_ABI_EFFECTS_LEN 256
 #define ABI_KIND_FUNCTION 1
 #define ABI_KIND_STRUCT 2
 
@@ -34,6 +36,8 @@ typedef struct {
     int kind; // 1=function, 2=struct
     char name[MAX_NAME_LEN];
     int metric; // arity or field_count
+    char return_type[MAX_NAME_LEN];
+    char effects[MAX_ABI_EFFECTS_LEN];
 } AbiSymbol;
 
 typedef struct {
@@ -41,6 +45,8 @@ typedef struct {
     int kind;
     char name[MAX_NAME_LEN];
     int metric;
+    char return_type[MAX_NAME_LEN];
+    char effects[MAX_ABI_EFFECTS_LEN];
 } AbiEntry;
 
 static void copy_text(char* dst, size_t dst_size, const char* src) {
@@ -50,6 +56,73 @@ static void copy_text(char* dst, size_t dst_size, const char* src) {
         return;
     }
     snprintf(dst, dst_size, "%s", src);
+}
+
+static bool append_fmt(char* out, size_t out_size, size_t* len, const char* fmt, ...);
+
+static void copy_token_text(char* dst, size_t dst_size, Token token) {
+    if (!dst || dst_size == 0) return;
+    if (!token.start || token.length <= 0) {
+        dst[0] = '\0';
+        return;
+    }
+    size_t n = (size_t)token.length;
+    if (n >= dst_size) n = dst_size - 1;
+    memcpy(dst, token.start, n);
+    dst[n] = '\0';
+}
+
+static bool format_ast_effects(Token* effects, int effect_count, char* out, size_t out_size) {
+    if (!out || out_size == 0) return false;
+    out[0] = '\0';
+    if (!effects || effect_count <= 0) {
+        copy_text(out, out_size, "-");
+        return true;
+    }
+
+    size_t len = 0;
+    for (int i = 0; i < effect_count; i++) {
+        if (!append_fmt(out, out_size, &len, "%s%.*s",
+                        i > 0 ? "," : "",
+                        effects[i].length, effects[i].start)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool append_fmt(char* out, size_t out_size, size_t* len, const char* fmt, ...) {
+    if (!out || !len || !fmt || *len >= out_size) return false;
+    va_list ap;
+    va_start(ap, fmt);
+    int wrote = vsnprintf(out + *len, out_size - *len, fmt, ap);
+    va_end(ap);
+    if (wrote < 0) return false;
+    size_t n = (size_t)wrote;
+    if (*len + n >= out_size) return false;
+    *len += n;
+    return true;
+}
+
+static bool shell_quote_double(const char* in, char* out, size_t out_size) {
+    if (!in || !out || out_size < 3) return false;
+    size_t j = 0;
+    out[j++] = '"';
+    for (size_t i = 0; in[i] != '\0'; i++) {
+        char c = in[i];
+        if (c == '"' || c == '\\' || c == '$' || c == '`') {
+            if (j + 2 >= out_size) return false;
+            out[j++] = '\\';
+            out[j++] = c;
+        } else {
+            if (j + 1 >= out_size) return false;
+            out[j++] = c;
+        }
+    }
+    if (j + 2 > out_size) return false;
+    out[j++] = '"';
+    out[j] = '\0';
+    return true;
 }
 
 static bool ensure_capacity(void** ptr, int* cap, int needed, size_t elem_size) {
@@ -351,7 +424,8 @@ static bool vp_to_vabi_path(const char* vp_path, char* out, size_t out_size) {
 }
 
 static bool append_abi_symbol(AbiSymbol** syms, int* count, int* cap,
-                              int kind, const char* name, int name_len, int metric) {
+                              int kind, const char* name, int name_len, int metric,
+                              const char* return_type, const char* effects) {
     if (!name || name_len <= 0 || name_len >= MAX_NAME_LEN) return false;
 
     for (int i = 0; i < *count; i++) {
@@ -359,6 +433,8 @@ static bool append_abi_symbol(AbiSymbol** syms, int* count, int* cap,
             (int)strlen((*syms)[i].name) == name_len &&
             memcmp((*syms)[i].name, name, (size_t)name_len) == 0) {
             (*syms)[i].metric = metric;
+            copy_text((*syms)[i].return_type, sizeof((*syms)[i].return_type), return_type ? return_type : "");
+            copy_text((*syms)[i].effects, sizeof((*syms)[i].effects), effects ? effects : "-");
             return true;
         }
     }
@@ -376,6 +452,8 @@ static bool append_abi_symbol(AbiSymbol** syms, int* count, int* cap,
     memcpy(out_sym->name, name, (size_t)name_len);
     out_sym->name[name_len] = '\0';
     out_sym->metric = metric;
+    copy_text(out_sym->return_type, sizeof(out_sym->return_type), return_type ? return_type : "");
+    copy_text(out_sym->effects, sizeof(out_sym->effects), effects ? effects : "-");
     (*count)++;
     return true;
 }
@@ -389,12 +467,17 @@ static int find_abi_symbol(const AbiSymbol* syms, int count, int kind, const cha
 }
 
 static bool append_abi_symbol_strict(AbiSymbol** syms, int* count, int* cap,
-                                     int kind, const char* name, int name_len, int metric) {
+                                     int kind, const char* name, int name_len, int metric,
+                                     const char* return_type, const char* effects) {
     if (!name || name_len <= 0 || name_len >= MAX_NAME_LEN || metric < 0) return false;
 
     int existing = find_abi_symbol(*syms, *count, kind, name);
     if (existing >= 0) {
-        if ((*syms)[existing].metric != metric) return false;
+        if ((*syms)[existing].metric != metric ||
+            strcmp((*syms)[existing].return_type, return_type ? return_type : "") != 0 ||
+            strcmp((*syms)[existing].effects, effects ? effects : "-") != 0) {
+            return false;
+        }
         return true;
     }
 
@@ -411,6 +494,8 @@ static bool append_abi_symbol_strict(AbiSymbol** syms, int* count, int* cap,
     memcpy(out_sym->name, name, (size_t)name_len);
     out_sym->name[name_len] = '\0';
     out_sym->metric = metric;
+    copy_text(out_sym->return_type, sizeof(out_sym->return_type), return_type ? return_type : "");
+    copy_text(out_sym->effects, sizeof(out_sym->effects), effects ? effects : "-");
     (*count)++;
     return true;
 }
@@ -435,6 +520,17 @@ static bool abi_symbol_has_name(const AbiSymbol* syms, int count, int kind,
     return false;
 }
 
+static const AbiSymbol* find_abi_symbol_by_name_len(const AbiSymbol* syms, int count, int kind,
+                                                    const char* name, int name_len) {
+    if (!syms || !name || name_len <= 0) return NULL;
+    for (int i = 0; i < count; i++) {
+        if (syms[i].kind != kind) continue;
+        if ((int)strlen(syms[i].name) != name_len) continue;
+        if (memcmp(syms[i].name, name, (size_t)name_len) == 0) return &syms[i];
+    }
+    return NULL;
+}
+
 static bool collect_public_exports_from_ast(AstNode* ast, AbiSymbol** out_syms, int* out_count, bool* out_has_public) {
     *out_syms = NULL;
     *out_count = 0;
@@ -448,9 +544,20 @@ static bool collect_public_exports_from_ast(AstNode* ast, AbiSymbol** out_syms, 
 
         if (stmt->type == AST_FUNC_DECL && stmt->data.func_decl.is_public) {
             *out_has_public = true;
+            char return_type[MAX_NAME_LEN];
+            char effects[MAX_ABI_EFFECTS_LEN];
+            copy_token_text(return_type, sizeof(return_type), stmt->data.func_decl.return_type);
+            if (!format_ast_effects(stmt->data.func_decl.effects, stmt->data.func_decl.effect_count,
+                                    effects, sizeof(effects))) {
+                free(*out_syms);
+                *out_syms = NULL;
+                *out_count = 0;
+                return false;
+            }
             if (!append_abi_symbol(out_syms, out_count, &cap, ABI_KIND_FUNCTION,
                                    stmt->data.func_decl.name.start,
-                                   stmt->data.func_decl.name.length, 0)) {
+                                   stmt->data.func_decl.name.length, 0,
+                                   return_type, effects)) {
                 free(*out_syms);
                 *out_syms = NULL;
                 *out_count = 0;
@@ -460,7 +567,8 @@ static bool collect_public_exports_from_ast(AstNode* ast, AbiSymbol** out_syms, 
             *out_has_public = true;
             if (!append_abi_symbol(out_syms, out_count, &cap, ABI_KIND_STRUCT,
                                    stmt->data.struct_decl.name.start,
-                                   stmt->data.struct_decl.name.length, 0)) {
+                                   stmt->data.struct_decl.name.length, 0,
+                                   "", "-")) {
                 free(*out_syms);
                 *out_syms = NULL;
                 *out_count = 0;
@@ -492,6 +600,39 @@ static bool abi_change_is_breaking(int kind, int old_metric, int new_metric, con
     return true;
 }
 
+static bool abi_entry_contract_equal(const AbiEntry* lhs, const AbiEntry* rhs) {
+    if (!lhs || !rhs) return false;
+    return lhs->metric == rhs->metric &&
+           strcmp(lhs->return_type, rhs->return_type) == 0 &&
+           strcmp(lhs->effects, rhs->effects) == 0;
+}
+
+static bool format_abi_contract(const char* return_type, const char* effects,
+                                char* out, size_t out_size) {
+    size_t len = 0;
+    if (!out || out_size == 0) return false;
+    out[0] = '\0';
+    return append_fmt(out, out_size, &len, "ret=%s eff=%s",
+                      (return_type && return_type[0] != '\0') ? return_type : "-",
+                      (effects && effects[0] != '\0') ? effects : "-");
+}
+
+static bool parse_abi_optional_fields(char* token, char* out_return_type, size_t return_type_size,
+                                      char* out_effects, size_t effects_size) {
+    if (!out_return_type || !out_effects || return_type_size == 0 || effects_size == 0) return false;
+    if (!token) return true;
+
+    if (strncmp(token, "ret=", 4) == 0) {
+        copy_text(out_return_type, return_type_size, token + 4);
+        return true;
+    }
+    if (strncmp(token, "eff=", 4) == 0) {
+        copy_text(out_effects, effects_size, token + 4);
+        return true;
+    }
+    return false;
+}
+
 static bool write_module_abi_file(const char* path, ObjFunction* main_fn,
                                   const AbiSymbol* public_exports, int public_count, bool only_public) {
     if (!path || !main_fn) return false;
@@ -513,8 +654,12 @@ static bool write_module_abi_file(const char* path, ObjFunction* main_fn,
                                      fn->name, fn->name_len)) {
                 continue;
             }
+            const AbiSymbol* meta = find_abi_symbol_by_name_len(public_exports, public_count,
+                                                                ABI_KIND_FUNCTION, fn->name, fn->name_len);
             if (!append_abi_symbol(&syms, &sym_count, &sym_cap, ABI_KIND_FUNCTION,
-                                   fn->name, fn->name_len, fn->arity)) {
+                                   fn->name, fn->name_len, fn->arity,
+                                   meta ? meta->return_type : "",
+                                   meta ? meta->effects : "-")) {
                 free(syms);
                 return false;
             }
@@ -526,7 +671,7 @@ static bool write_module_abi_file(const char* path, ObjFunction* main_fn,
                 continue;
             }
             if (!append_abi_symbol(&syms, &sym_count, &sym_cap, ABI_KIND_STRUCT,
-                                   st->name, st->name_len, st->field_count)) {
+                                   st->name, st->name_len, st->field_count, "", "-")) {
                 free(syms);
                 return false;
             }
@@ -543,10 +688,13 @@ static bool write_module_abi_file(const char* path, ObjFunction* main_fn,
         return false;
     }
 
-    bool ok = fprintf(out, "# viper abi v1\n") > 0;
+    bool ok = fprintf(out, "# viper abi v2\n") > 0;
     for (int i = 0; ok && i < sym_count; i++) {
         if (syms[i].kind == ABI_KIND_FUNCTION) {
-            ok = fprintf(out, "fn %s %d\n", syms[i].name, syms[i].metric) > 0;
+            ok = fprintf(out, "fn %s %d ret=%s eff=%s\n",
+                         syms[i].name, syms[i].metric,
+                         syms[i].return_type[0] != '\0' ? syms[i].return_type : "-",
+                         syms[i].effects[0] != '\0' ? syms[i].effects : "-") > 0;
         } else {
             ok = fprintf(out, "st %s %d\n", syms[i].name, syms[i].metric) > 0;
         }
@@ -700,8 +848,7 @@ static bool load_abi_file_symbols(const char* path, AbiSymbol** out_syms, int* o
         char* kind_tok = strtok(p, " \t\r\n");
         char* name_tok = strtok(NULL, " \t\r\n");
         char* metric_tok = strtok(NULL, " \t\r\n");
-        char* extra_tok = strtok(NULL, " \t\r\n");
-        if (!kind_tok || !name_tok || !metric_tok || extra_tok) {
+        if (!kind_tok || !name_tok || !metric_tok) {
             fprintf(stderr, "vpm: invalid ABI line at %s:%d\n", path, line_no);
             ok = false;
             break;
@@ -725,8 +872,24 @@ static bool load_abi_file_symbols(const char* path, AbiSymbol** out_syms, int* o
             break;
         }
 
+        char return_type[MAX_NAME_LEN];
+        char effects[MAX_ABI_EFFECTS_LEN];
+        return_type[0] = '\0';
+        copy_text(effects, sizeof(effects), "-");
+        char* extra_tok = NULL;
+        while ((extra_tok = strtok(NULL, " \t\r\n")) != NULL) {
+            if (!parse_abi_optional_fields(extra_tok, return_type, sizeof(return_type),
+                                           effects, sizeof(effects))) {
+                fprintf(stderr, "vpm: invalid ABI line at %s:%d\n", path, line_no);
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) break;
+
         int name_len = (int)strlen(name_tok);
-        if (!append_abi_symbol_strict(out_syms, out_count, &cap, kind, name_tok, name_len, metric)) {
+        if (!append_abi_symbol_strict(out_syms, out_count, &cap, kind, name_tok, name_len, metric,
+                                      return_type, effects)) {
             fprintf(stderr, "vpm: conflicting ABI symbol at %s:%d\n", path, line_no);
             ok = false;
             break;
@@ -768,7 +931,8 @@ static bool collect_bytecode_symbols(ObjFunction* root, AbiSymbol** out_syms, in
             bool is_main = fn->name_len == 8 && memcmp(fn->name, "__main__", 8) == 0;
             if (!is_main &&
                 !append_abi_symbol_strict(out_syms, out_count, &sym_cap,
-                                          ABI_KIND_FUNCTION, fn->name, fn->name_len, fn->arity)) {
+                                          ABI_KIND_FUNCTION, fn->name, fn->name_len, fn->arity,
+                                          "", "-")) {
                 ok = false;
                 break;
             }
@@ -797,7 +961,8 @@ static bool collect_bytecode_symbols(ObjFunction* root, AbiSymbol** out_syms, in
         } else if (obj->type == OBJ_STRUCT) {
             ObjStruct* st = (ObjStruct*)obj;
             if (!append_abi_symbol_strict(out_syms, out_count, &sym_cap,
-                                          ABI_KIND_STRUCT, st->name, st->name_len, st->field_count)) {
+                                          ABI_KIND_STRUCT, st->name, st->name_len, st->field_count,
+                                          "", "-")) {
                 ok = false;
                 break;
             }
@@ -941,13 +1106,18 @@ static int find_abi_entry(const AbiEntry* entries, int count, const char* module
 }
 
 static bool append_abi_entry(AbiEntry** entries, int* count, int* cap,
-                             const char* module, int kind, const char* name, int metric) {
+                             const char* module, int kind, const char* name, int metric,
+                             const char* return_type, const char* effects) {
     if (!entries || !count || !cap || !module || !name || metric < 0) return false;
     if (strlen(module) >= MAX_PATH_LEN || strlen(name) >= MAX_NAME_LEN) return false;
 
     int existing = find_abi_entry(*entries, *count, module, kind, name);
     if (existing >= 0) {
-        if ((*entries)[existing].metric != metric) return false;
+        if ((*entries)[existing].metric != metric ||
+            strcmp((*entries)[existing].return_type, return_type ? return_type : "") != 0 ||
+            strcmp((*entries)[existing].effects, effects ? effects : "-") != 0) {
+            return false;
+        }
         return true;
     }
 
@@ -964,6 +1134,8 @@ static bool append_abi_entry(AbiEntry** entries, int* count, int* cap,
     out->kind = kind;
     copy_text(out->name, sizeof(out->name), name);
     out->metric = metric;
+    copy_text(out->return_type, sizeof(out->return_type), return_type ? return_type : "");
+    copy_text(out->effects, sizeof(out->effects), effects ? effects : "-");
     (*count)++;
     return true;
 }
@@ -1036,7 +1208,8 @@ static bool collect_package_abi_entries_tree(const char* root_dir, const char* b
 
         for (int i = 0; i < symbol_count; i++) {
             if (!append_abi_entry(entries, count, cap, module_rel,
-                                  symbols[i].kind, symbols[i].name, symbols[i].metric)) {
+                                  symbols[i].kind, symbols[i].name, symbols[i].metric,
+                                  symbols[i].return_type, symbols[i].effects)) {
                 fprintf(stderr, "vpm: conflicting ABI entry in %s\n", path);
                 free(symbols);
                 ok = false;
@@ -1282,19 +1455,43 @@ static bool install_dependency_stub(const char* project_root, const char* pkg, c
         if (!file_exists(index_file)) {
             char clone_cmd[2048];
             char url[1024];
+            char q_branch[128];
+            char q_url[1200];
+            char q_version_dir[1200];
             if (strncmp(pkg, "http", 4) == 0) snprintf(url, sizeof(url), "%s", pkg);
             else snprintf(url, sizeof(url), "https://%s", pkg);
+            const char* primary_branch = (strcmp(ver, "latest") == 0) ? "main" : ver;
+            const char* fallback_branch = (strcmp(ver, "latest") == 0) ? "master" : ver;
+
+            if (!shell_quote_double(primary_branch, q_branch, sizeof(q_branch)) ||
+                !shell_quote_double(url, q_url, sizeof(q_url)) ||
+                !shell_quote_double(version_dir, q_version_dir, sizeof(q_version_dir))) {
+                fprintf(stderr, "vpm: package path is too long for shell command.\n");
+                return false;
+            }
             
-            snprintf(clone_cmd, sizeof(clone_cmd), "git clone --depth 1 --branch %s %s %s", 
-                     strcmp(ver, "latest") == 0 ? "main" : ver, 
-                     url, version_dir);
+            size_t clone_len = 0;
+            if (!append_fmt(clone_cmd, sizeof(clone_cmd), &clone_len,
+                            "git clone --depth 1 --branch %s %s %s",
+                            q_branch, q_url, q_version_dir)) {
+                fprintf(stderr, "vpm: clone command is too long.\n");
+                return false;
+            }
             printf("vpm: Fetching remote package %s...\n", pkg);
             int res = system(clone_cmd);
             if (res != 0) {
                 // fallback to master if main fails
-                snprintf(clone_cmd, sizeof(clone_cmd), "git clone --depth 1 --branch %s %s %s", 
-                     strcmp(ver, "latest") == 0 ? "master" : ver, 
-                     url, version_dir);
+                if (!shell_quote_double(fallback_branch, q_branch, sizeof(q_branch))) {
+                    fprintf(stderr, "vpm: package branch is too long for shell command.\n");
+                    return false;
+                }
+                clone_len = 0;
+                if (!append_fmt(clone_cmd, sizeof(clone_cmd), &clone_len,
+                                "git clone --depth 1 --branch %s %s %s",
+                                q_branch, q_url, q_version_dir)) {
+                    fprintf(stderr, "vpm: clone command is too long.\n");
+                    return false;
+                }
                 res = system(clone_cmd);
             }
             if (res != 0) {
@@ -1873,13 +2070,18 @@ static int cmd_abi_diff(const char* pkg, const char* from_ver, const char* to_ve
             breaking++;
             continue;
         }
-        if (lhs[i].metric != rhs[j].metric) {
+        if (!abi_entry_contract_equal(&lhs[i], &rhs[j])) {
             const char* reason = NULL;
             bool is_breaking = abi_change_is_breaking(lhs[i].kind, lhs[i].metric, rhs[j].metric, &reason);
-            printf("%s CHANGED %s %s %s %d -> %d",
+            char lhs_contract[512];
+            char rhs_contract[512];
+            format_abi_contract(lhs[i].return_type, lhs[i].effects, lhs_contract, sizeof(lhs_contract));
+            format_abi_contract(rhs[j].return_type, rhs[j].effects, rhs_contract, sizeof(rhs_contract));
+            printf("%s CHANGED %s %s %s %d -> %d [%s -> %s]",
                    is_breaking ? "BREAKING" : "NON_BREAKING",
                    lhs[i].module, abi_kind_tag(lhs[i].kind),
-                   lhs[i].name, lhs[i].metric, rhs[j].metric);
+                   lhs[i].name, lhs[i].metric, rhs[j].metric,
+                   lhs_contract, rhs_contract);
             if (reason && reason[0] != '\0') printf(" (%s)", reason);
             printf("\n");
             changed++;
@@ -1891,8 +2093,11 @@ static int cmd_abi_diff(const char* pkg, const char* from_ver, const char* to_ve
     for (int i = 0; i < rhs_count; i++) {
         int j = find_abi_entry(lhs, lhs_count, rhs[i].module, rhs[i].kind, rhs[i].name);
         if (j < 0) {
-            printf("NON_BREAKING ADDED %s %s %s %d\n",
-                   rhs[i].module, abi_kind_tag(rhs[i].kind), rhs[i].name, rhs[i].metric);
+            char rhs_contract[512];
+            format_abi_contract(rhs[i].return_type, rhs[i].effects, rhs_contract, sizeof(rhs_contract));
+            printf("NON_BREAKING ADDED %s %s %s %d [%s]\n",
+                   rhs[i].module, abi_kind_tag(rhs[i].kind), rhs[i].name, rhs[i].metric,
+                   rhs_contract);
             added++;
             non_breaking++;
         }

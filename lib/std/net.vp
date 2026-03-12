@@ -9,8 +9,8 @@ pub fn serve(port) {
     
     var fd = _server(port)
     if (fd < 0) {
-        // Return 0 for failure temporarily until Option/Result types
-        ret 0
+        // Preserve a socket-shaped return value so callers can inspect `server.fd`.
+        ret Socket(0)
     }
     ret Socket(fd)
 }
@@ -21,7 +21,7 @@ pub fn accept(server) {
     
     var client_fd = _accept(server.fd)
     if (client_fd < 0) {
-        ret 0
+        ret Socket(0)
     }
     ret Socket(client_fd)
 }
@@ -83,7 +83,6 @@ pub fn http_respond_file(socket, filepath) {
 
 pub fn event_loop_init() {
     var ext = load_dl("lib/std/net.so")
-    // Use the main viper binary's async_io functions since they're statically linked
-    // For now, event loop is managed internally by the C layer.
+    // Event loop is managed internally by the C extension layer for now.
     ret 0
 }

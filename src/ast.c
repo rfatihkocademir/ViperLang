@@ -89,11 +89,15 @@ AstNode* ast_new_sync_stmt(AstNode* body) {
     return node;
 }
 
-AstNode* ast_new_func_decl(Token name, Token* params, int param_count, Token return_type, AstNode* body) {
+AstNode* ast_new_func_decl(Token name, Token* params, int param_count,
+                           Token* effects, int effect_count,
+                           Token return_type, AstNode* body) {
     AstNode* node = ast_alloc(AST_FUNC_DECL);
     node->data.func_decl.name = name;
     node->data.func_decl.params = params;
     node->data.func_decl.param_count = param_count;
+    node->data.func_decl.effects = effects;
+    node->data.func_decl.effect_count = effect_count;
     node->data.func_decl.return_type = return_type;
     node->data.func_decl.body = body;
     node->data.func_decl.is_public = false;
@@ -240,6 +244,12 @@ AstNode* ast_new_try_expr(AstNode* try_block, AstNode* catch_block) {
     return node;
 }
 
+AstNode* ast_new_error_propagate_expr(AstNode* expr) {
+    AstNode* node = ast_alloc(AST_ERROR_PROPAGATE_EXPR);
+    node->data.error_propagate.expr = expr;
+    return node;
+}
+
 AstNode* ast_new_program() {
     AstNode* node = ast_alloc(AST_PROGRAM);
     node->data.block.statements = NULL;
@@ -276,10 +286,20 @@ void ast_print(AstNode* node, int depth) {
             ast_print(node->data.var_decl.initializer, depth + 1);
             break;
         case AST_FUNC_DECL:
-            printf("%sFunction '%.*s' (%d params)\n",
+            printf("%sFunction '%.*s' (%d params",
                    node->data.func_decl.is_public ? "Pub " : "",
                    node->data.func_decl.name.length, node->data.func_decl.name.start,
                    node->data.func_decl.param_count);
+            if (node->data.func_decl.effect_count > 0) {
+                printf(", effects=");
+                for (int i = 0; i < node->data.func_decl.effect_count; i++) {
+                    printf("%s%.*s",
+                           (i == 0) ? "" : "|",
+                           node->data.func_decl.effects[i].length,
+                           node->data.func_decl.effects[i].start);
+                }
+            }
+            printf(")\n");
             ast_print(node->data.func_decl.body, depth + 1);
             break;
         case AST_STRUCT_DECL:
