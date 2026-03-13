@@ -11,8 +11,8 @@
 /viper
 /build/
 /.build/
-/docs
-/examples/
+
+/example
 # Viper bytecode and package artifacts
 *.vbb
 *.vbc

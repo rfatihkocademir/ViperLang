@@ -91,6 +91,14 @@ viper pkg add github.com/username/cool-viper-package
 
 VPM will automatically download the package, and you can instantly `use` it in your `.vp` files.
 
+## 🤖 LLM Onboarding
+
+If you want to teach ViperLang to LLMs or agentic coding systems, start here:
+
+* `docs/llm/MODEL_SPEC.md`
+* `docs/llm/WORKFLOW.md`
+* `docs/llm/PROMPTS.md`
+
 ---
 
 ## 📚 Standard Library (`@std`)
@@ -112,12 +120,11 @@ ViperLang comes fully equipped with the tools you need right out of the box.
 
 ---
 
-## 🎮 Hardware & Graphics (FFI Examples)
+## 📏 Token Benchmark Workspace
 
-ViperLang's **True Dynamic FFI** can call **any** C library directly — no glue code needed. Check the `examples/` folder for ready-to-run scripts:
+The repository's runnable cross-language context benchmark now lives in:
 
-* **`examples/raylib_demo.vp`** — Open a game window and draw shapes with Raylib.
-* **`examples/sdl2_demo.vp`** — Create an SDL2 window and manage events.
+* `example/README.md`
 
 ---
 
