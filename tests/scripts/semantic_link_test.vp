@@ -1,0 +1,3 @@
+// @covers semantic_diff_after.vp read_user route
+
+pr("semantic-link")

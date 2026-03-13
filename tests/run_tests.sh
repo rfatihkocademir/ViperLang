@@ -318,6 +318,256 @@ else
 fi
 echo
 
+echo "=== project_state_test_links ==="
+TOTAL_COUNT=$((TOTAL_COUNT + 1))
+: > "${OUT_FILE}"
+: > "${ERR_FILE}"
+TEST_LINK_STATE="$(mktemp /tmp/viper-test-links-XXXXXX.vstate)"
+if "${BIN_ABS}" --emit-project-state="${TEST_LINK_STATE}" --focus=read_user --impact "tests/fixtures/semantic_diff_after.vp" >"${OUT_FILE}" 2>"${ERR_FILE}" &&
+   grep -q "^tracked_tests:$" "${TEST_LINK_STATE}" &&
+   grep -q "^  tests/scripts/semantic_link_test.vp sha256=" "${TEST_LINK_STATE}" &&
+   grep -q "^test_index:$" "${TEST_LINK_STATE}" &&
+   grep -Eq "^  tests/scripts/semantic_link_test.vp covers=s[0-9a-f]{16},s[0-9a-f]{16}$" "${TEST_LINK_STATE}" &&
+   "${BIN_ABS}" --resume-project-state="${TEST_LINK_STATE}" --focus=read_user --impact >/tmp/vresume-tests.out 2>/tmp/vresume-tests.err &&
+   grep -q "^PRESUMEv6$" /tmp/vresume-tests.out &&
+   grep -q "^resume_focus: read_user$" /tmp/vresume-tests.out &&
+   grep -q "^resume_impact: yes$" /tmp/vresume-tests.out &&
+   grep -q "^tests:$" /tmp/vresume-tests.out &&
+   grep -q "^  1|test=tests/scripts/semantic_link_test.vp|hits=2|symbols=read_user,route$" /tmp/vresume-tests.out &&
+   "${BIN_ABS}" --query-project-state="${TEST_LINK_STATE}" --query-name=read_user --impact >/tmp/vquery-tests.out 2>/tmp/vquery-tests.err &&
+   grep -q "^PQUERYv3$" /tmp/vquery-tests.out &&
+   grep -q "^query_impact: yes$" /tmp/vquery-tests.out &&
+   grep -q "^tests:$" /tmp/vquery-tests.out &&
+   grep -q "^  1|test=tests/scripts/semantic_link_test.vp|hits=2|symbols=read_user,route$" /tmp/vquery-tests.out; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo "PASS"
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "FAIL(project-state-test-links)"
+    sed -n '1,140p' "${OUT_FILE}"
+    sed -n '1,80p' "${ERR_FILE}"
+    sed -n '1,120p' /tmp/vresume-tests.out 2>/dev/null || true
+    sed -n '1,80p' /tmp/vresume-tests.err 2>/dev/null || true
+    sed -n '1,120p' /tmp/vquery-tests.out 2>/dev/null || true
+    sed -n '1,80p' /tmp/vquery-tests.err 2>/dev/null || true
+fi
+rm -f "${TEST_LINK_STATE}"
+echo
+
+echo "=== state_plan ==="
+TOTAL_COUNT=$((TOTAL_COUNT + 1))
+: > "${OUT_FILE}"
+: > "${ERR_FILE}"
+TMP_STATE_PLAN_DIR="$(mktemp -d /tmp/viper-state-plan-XXXXXX)"
+mkdir -p "${TMP_STATE_PLAN_DIR}/tests/scripts"
+cp "tests/fixtures/semantic_diff_before.vp" "${TMP_STATE_PLAN_DIR}/semantic_diff_before.vp"
+cp "tests/fixtures/semantic_diff_after.vp" "${TMP_STATE_PLAN_DIR}/semantic_diff_after.vp"
+cp "tests/scripts/semantic_link_test.vp" "${TMP_STATE_PLAN_DIR}/tests/scripts/semantic_link_test.vp"
+STATE_PLAN_BEFORE="${TMP_STATE_PLAN_DIR}/before.vstate"
+STATE_PLAN_AFTER="${TMP_STATE_PLAN_DIR}/after.vstate"
+STATE_PLAN_OK=1
+if ! "${BIN_ABS}" --emit-project-state="${STATE_PLAN_BEFORE}" --focus=read_user --impact "${TMP_STATE_PLAN_DIR}/semantic_diff_before.vp" >/tmp/vstate-plan-before.out 2>/tmp/vstate-plan-before.err; then
+    STATE_PLAN_OK=0
+fi
+if [ "${STATE_PLAN_OK}" -eq 1 ] && ! "${BIN_ABS}" --emit-project-state="${STATE_PLAN_AFTER}" --focus=read_user --impact "${TMP_STATE_PLAN_DIR}/semantic_diff_after.vp" >/tmp/vstate-plan-after.out 2>/tmp/vstate-plan-after.err; then
+    STATE_PLAN_OK=0
+fi
+if [ "${STATE_PLAN_OK}" -eq 1 ]; then
+    cat > "${TMP_STATE_PLAN_DIR}/semantic_diff_before.vp" <<'EOF'
+fn broken(
+EOF
+    cat > "${TMP_STATE_PLAN_DIR}/semantic_diff_after.vp" <<'EOF'
+fn broken(
+EOF
+    cat > "${TMP_STATE_PLAN_DIR}/tests/scripts/semantic_link_test.vp" <<'EOF'
+fn broken(
+EOF
+fi
+if [ "${STATE_PLAN_OK}" -eq 1 ] && "${BIN_ABS}" --emit-state-plan="${STATE_PLAN_BEFORE}" "${STATE_PLAN_AFTER}" >"${OUT_FILE}" 2>"${ERR_FILE}" &&
+   grep -q "^PSTATEPLANv1$" "${OUT_FILE}" &&
+   grep -q "^focus: read_user$" "${OUT_FILE}" &&
+   grep -q "^impact: yes$" "${OUT_FILE}" &&
+   grep -q "^summary: before=2 after=3 added=2 removed=1 unchanged=1$" "${OUT_FILE}" &&
+   grep -q "^change_plan:$" "${OUT_FILE}" &&
+   grep -q "^  1|status=changed|kind=target|name=read_user|score=35|blast=2|depfx=os,panic|checks=contract,effects,callers$" "${OUT_FILE}" &&
+   grep -q "^  2|status=added|kind=caller|name=route|score=12|blast=0|depfx=os,panic|checks=new_surface,effects$" "${OUT_FILE}" &&
+   grep -q "^test_plan:$" "${OUT_FILE}" &&
+   grep -q "^  1|test=tests/scripts/semantic_link_test.vp|hits=2|max_score=35|symbols=read_user,route|checks=contract,new_surface,effects,callers$" "${OUT_FILE}"; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo "PASS"
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "FAIL(state-plan)"
+    sed -n '1,140p' "${OUT_FILE}"
+    sed -n '1,80p' "${ERR_FILE}"
+    sed -n '1,80p' /tmp/vstate-plan-before.err 2>/dev/null || true
+    sed -n '1,80p' /tmp/vstate-plan-after.err 2>/dev/null || true
+fi
+rm -rf "${TMP_STATE_PLAN_DIR}"
+echo
+
+echo "=== state_plan_run ==="
+TOTAL_COUNT=$((TOTAL_COUNT + 1))
+: > "${OUT_FILE}"
+: > "${ERR_FILE}"
+TMP_STATE_RUN_DIR="$(mktemp -d /tmp/viper-state-run-XXXXXX)"
+mkdir -p "${TMP_STATE_RUN_DIR}/tests/scripts"
+cp "tests/fixtures/semantic_diff_before.vp" "${TMP_STATE_RUN_DIR}/semantic_diff_before.vp"
+cp "tests/fixtures/semantic_diff_after.vp" "${TMP_STATE_RUN_DIR}/semantic_diff_after.vp"
+cp "tests/scripts/semantic_link_test.vp" "${TMP_STATE_RUN_DIR}/tests/scripts/semantic_link_test.vp"
+STATE_RUN_BEFORE="${TMP_STATE_RUN_DIR}/before.vstate"
+STATE_RUN_AFTER="${TMP_STATE_RUN_DIR}/after.vstate"
+STATE_RUN_OK=1
+if ! "${BIN_ABS}" --emit-project-state="${STATE_RUN_BEFORE}" --focus=read_user --impact "${TMP_STATE_RUN_DIR}/semantic_diff_before.vp" >/tmp/vstate-run-before.out 2>/tmp/vstate-run-before.err; then
+    STATE_RUN_OK=0
+fi
+if [ "${STATE_RUN_OK}" -eq 1 ] && ! "${BIN_ABS}" --emit-project-state="${STATE_RUN_AFTER}" --focus=read_user --impact "${TMP_STATE_RUN_DIR}/semantic_diff_after.vp" >/tmp/vstate-run-after.out 2>/tmp/vstate-run-after.err; then
+    STATE_RUN_OK=0
+fi
+if [ "${STATE_RUN_OK}" -eq 1 ]; then
+    cat > "${TMP_STATE_RUN_DIR}/semantic_diff_before.vp" <<'EOF'
+fn broken(
+EOF
+    cat > "${TMP_STATE_RUN_DIR}/semantic_diff_after.vp" <<'EOF'
+fn broken(
+EOF
+fi
+if [ "${STATE_RUN_OK}" -eq 1 ] && "${BIN_ABS}" --run-state-plan="${STATE_RUN_BEFORE}" "${STATE_RUN_AFTER}" >"${OUT_FILE}" 2>"${ERR_FILE}" &&
+   grep -q "^PSTATEEXECv2$" "${OUT_FILE}" &&
+   grep -q "^focus: read_user$" "${OUT_FILE}" &&
+   grep -q "^impact: yes$" "${OUT_FILE}" &&
+   grep -q "^semantic_fingerprint: " "${OUT_FILE}" &&
+   grep -q "^tests_planned: 1$" "${OUT_FILE}" &&
+   grep -q "^results:$" "${OUT_FILE}" &&
+   grep -q "^  1|test=tests/scripts/semantic_link_test.vp|status=pass|exit=0|hits=2|max_score=35|symbols=read_user,route|checks=contract,new_surface,effects,callers$" "${OUT_FILE}" &&
+   grep -q "^tests_failed: 0$" "${OUT_FILE}"; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo "PASS"
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "FAIL(state-plan-run)"
+    sed -n '1,140p' "${OUT_FILE}"
+    sed -n '1,80p' "${ERR_FILE}"
+    sed -n '1,80p' /tmp/vstate-run-before.err 2>/dev/null || true
+    sed -n '1,80p' /tmp/vstate-run-after.err 2>/dev/null || true
+fi
+rm -rf "${TMP_STATE_RUN_DIR}"
+echo
+
+echo "=== state_proof_resume ==="
+TOTAL_COUNT=$((TOTAL_COUNT + 1))
+: > "${OUT_FILE}"
+: > "${ERR_FILE}"
+TMP_STATE_PROOF_DIR="$(mktemp -d /tmp/viper-state-proof-XXXXXX)"
+mkdir -p "${TMP_STATE_PROOF_DIR}/tests/scripts"
+cp "tests/fixtures/semantic_diff_before.vp" "${TMP_STATE_PROOF_DIR}/semantic_diff_before.vp"
+cp "tests/fixtures/semantic_diff_after.vp" "${TMP_STATE_PROOF_DIR}/semantic_diff_after.vp"
+cp "tests/scripts/semantic_link_test.vp" "${TMP_STATE_PROOF_DIR}/tests/scripts/semantic_link_test.vp"
+STATE_PROOF_BEFORE="${TMP_STATE_PROOF_DIR}/before.vstate"
+STATE_PROOF_AFTER="${TMP_STATE_PROOF_DIR}/after.vstate"
+STATE_PROOF_OK=1
+if ! "${BIN_ABS}" --emit-project-state="${STATE_PROOF_BEFORE}" --focus=read_user --impact "${TMP_STATE_PROOF_DIR}/semantic_diff_before.vp" >/tmp/vstate-proof-before.out 2>/tmp/vstate-proof-before.err; then
+    STATE_PROOF_OK=0
+fi
+if [ "${STATE_PROOF_OK}" -eq 1 ] && ! "${BIN_ABS}" --emit-project-state="${STATE_PROOF_AFTER}" --focus=read_user --impact "${TMP_STATE_PROOF_DIR}/semantic_diff_after.vp" >/tmp/vstate-proof-after.out 2>/tmp/vstate-proof-after.err; then
+    STATE_PROOF_OK=0
+fi
+if [ "${STATE_PROOF_OK}" -eq 1 ] && ! "${BIN_ABS}" --run-state-plan="${STATE_PROOF_BEFORE}" "${STATE_PROOF_AFTER}" > "${STATE_PROOF_AFTER}.vproof" 2>/tmp/vstate-proof-run.err; then
+    STATE_PROOF_OK=0
+fi
+if [ "${STATE_PROOF_OK}" -eq 1 ] && "${BIN_ABS}" --resume-project-state="${STATE_PROOF_AFTER}" --focus=read_user --impact >"${OUT_FILE}" 2>"${ERR_FILE}" &&
+   grep -q "^verified: yes$" "${OUT_FILE}" &&
+   grep -q "^verified_tests: 1$" "${OUT_FILE}" &&
+   grep -q "^verified_failed: 0$" "${OUT_FILE}" &&
+   grep -q "^verification:$" "${OUT_FILE}" &&
+   grep -q "^  1|tests/scripts/semantic_link_test.vp status=pass$" "${OUT_FILE}" &&
+   "${BIN_ABS}" --query-project-state="${STATE_PROOF_AFTER}" --query-name=read_user --impact >/tmp/vproof-query.out 2>/tmp/vproof-query.err &&
+   grep -q "^verified: yes$" /tmp/vproof-query.out &&
+   grep -q "^verified_tests: 1$" /tmp/vproof-query.out &&
+   grep -q "^verified_failed: 0$" /tmp/vproof-query.out &&
+   grep -q "^  1|tests/scripts/semantic_link_test.vp status=pass$" /tmp/vproof-query.out; then
+    cat > "${TMP_STATE_PROOF_DIR}/semantic_diff_after.vp" <<'EOF'
+@effect(os)
+pub fn read_user(user_id) -> str {
+    panic("boom")
+    ret os_env(user_id)
+}
+
+fn render(user_id) -> str {
+    panic("later")
+    ret read_user(user_id)
+}
+
+fn route(user_id) -> str {
+    ret read_user(user_id)
+}
+EOF
+    if "${BIN_ABS}" --resume-project-state="${STATE_PROOF_AFTER}" --focus=read_user --impact >/tmp/vproof-stale-resume.out 2>/tmp/vproof-stale-resume.err &&
+       grep -q "^valid: no$" /tmp/vproof-stale-resume.out &&
+       grep -q "^verified: yes$" /tmp/vproof-stale-resume.out &&
+       grep -q "^verification_stale: yes$" /tmp/vproof-stale-resume.out &&
+       grep -q "^verification_stale_symbols:$" /tmp/vproof-stale-resume.out &&
+       grep -A4 "^verification_stale_symbols:$" /tmp/vproof-stale-resume.out | grep -Eq "^  s[0-9a-f]{16}$" &&
+       grep -q "^verification_stale_tests:$" /tmp/vproof-stale-resume.out &&
+       grep -q "^  tests/scripts/semantic_link_test.vp$" /tmp/vproof-stale-resume.out &&
+       "${BIN_ABS}" --query-project-state="${STATE_PROOF_AFTER}" --query-name=read_user --impact >/tmp/vproof-stale-query.out 2>/tmp/vproof-stale-query.err &&
+       grep -q "^valid: no$" /tmp/vproof-stale-query.out &&
+       grep -q "^verified: yes$" /tmp/vproof-stale-query.out &&
+       grep -q "^verification_stale: yes$" /tmp/vproof-stale-query.out &&
+       grep -q "^  tests/scripts/semantic_link_test.vp$" /tmp/vproof-stale-query.out &&
+       "${BIN_ABS}" --verify-project-state="${STATE_PROOF_AFTER}" >/tmp/vproof-stale-check.out 2>/tmp/vproof-stale-check.err &&
+       grep -q "^valid: no$" /tmp/vproof-stale-check.out &&
+       grep -q "^verified: yes$" /tmp/vproof-stale-check.out &&
+       grep -q "^verification_stale: yes$" /tmp/vproof-stale-check.out &&
+       grep -q "^  tests/scripts/semantic_link_test.vp$" /tmp/vproof-stale-check.out &&
+       "${BIN_ABS}" --refresh-project-state="${STATE_PROOF_AFTER}" >/tmp/vproof-stale-refresh.out 2>/tmp/vproof-stale-refresh.err &&
+       grep -q "^status: refreshed$" /tmp/vproof-stale-refresh.out &&
+       grep -q "^verified: yes$" /tmp/vproof-stale-refresh.out &&
+       grep -q "^verification_stale: yes$" /tmp/vproof-stale-refresh.out &&
+       grep -q "^  tests/scripts/semantic_link_test.vp$" /tmp/vproof-stale-refresh.out &&
+       grep -q "^proof: refreshed$" /tmp/vproof-stale-refresh.out &&
+       grep -q "^proof_tests: 1$" /tmp/vproof-stale-refresh.out &&
+       grep -q "^proof_failed: 0$" /tmp/vproof-stale-refresh.out &&
+       "${BIN_ABS}" --resume-project-state="${STATE_PROOF_AFTER}" --focus=read_user --impact >/tmp/vproof-fresh-resume.out 2>/tmp/vproof-fresh-resume.err &&
+       grep -q "^valid: yes$" /tmp/vproof-fresh-resume.out &&
+       grep -q "^verified: yes$" /tmp/vproof-fresh-resume.out &&
+       ! grep -q "^verification_stale: yes$" /tmp/vproof-fresh-resume.out &&
+       grep -q "^  1|tests/scripts/semantic_link_test.vp status=pass$" /tmp/vproof-fresh-resume.out; then
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo "PASS"
+    else
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        echo "FAIL(state-proof-resume)"
+        sed -n '1,160p' "${OUT_FILE}"
+        sed -n '1,80p' "${ERR_FILE}"
+        sed -n '1,120p' "${STATE_PROOF_AFTER}.vproof" 2>/dev/null || true
+        sed -n '1,120p' /tmp/vproof-query.out 2>/dev/null || true
+        sed -n '1,80p' /tmp/vproof-query.err 2>/dev/null || true
+        sed -n '1,120p' /tmp/vproof-stale-resume.out 2>/dev/null || true
+        sed -n '1,80p' /tmp/vproof-stale-resume.err 2>/dev/null || true
+        sed -n '1,120p' /tmp/vproof-stale-query.out 2>/dev/null || true
+        sed -n '1,80p' /tmp/vproof-stale-query.err 2>/dev/null || true
+        sed -n '1,120p' /tmp/vproof-stale-check.out 2>/dev/null || true
+        sed -n '1,80p' /tmp/vproof-stale-check.err 2>/dev/null || true
+        sed -n '1,120p' /tmp/vproof-stale-refresh.out 2>/dev/null || true
+        sed -n '1,80p' /tmp/vproof-stale-refresh.err 2>/dev/null || true
+        sed -n '1,120p' /tmp/vproof-fresh-resume.out 2>/dev/null || true
+        sed -n '1,80p' /tmp/vproof-fresh-resume.err 2>/dev/null || true
+        sed -n '1,80p' /tmp/vstate-proof-run.err 2>/dev/null || true
+    fi
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "FAIL(state-proof-resume)"
+    sed -n '1,160p' "${OUT_FILE}"
+    sed -n '1,80p' "${ERR_FILE}"
+    sed -n '1,120p' "${STATE_PROOF_AFTER}.vproof" 2>/dev/null || true
+    sed -n '1,80p' /tmp/vproof-query.out 2>/dev/null || true
+    sed -n '1,80p' /tmp/vproof-query.err 2>/dev/null || true
+    sed -n '1,80p' /tmp/vstate-proof-run.err 2>/dev/null || true
+fi
+rm -rf "${TMP_STATE_PROOF_DIR}"
+echo
+
 echo "=== project_state_refresh ==="
 TOTAL_COUNT=$((TOTAL_COUNT + 1))
 : > "${OUT_FILE}"
@@ -418,10 +668,10 @@ fi
 if [ "${STATE_OK}" -eq 1 ] && ! grep -Eq "^  s[0-9a-f]{16}\\|T\\|m[0-9a-f]{16}\\|\\+\\|read_user\\(user_id\\)\\|r1\\|e1\\|e2,e1\\|c1,c2$" /tmp/vstate-refresh.out; then
     STATE_OK=0
 fi
-if [ "${STATE_OK}" -eq 1 ] && ! grep -Eq "^  s[0-9a-f]{16}\\|C\\|m[0-9a-f]{16}\\|\\+\\|format_user\\(user_id\\)\\|r1\\|-\\|-\\|c3$" /tmp/vstate-refresh.out; then
+if [ "${STATE_OK}" -eq 1 ] && grep -Eq "^  s[0-9a-f]{16}\\|C\\|m[0-9a-f]{16}\\|\\+\\|format_user\\(user_id\\)\\|r1\\|-\\|-\\|c3$" /tmp/vstate-refresh.out; then
     STATE_OK=0
 fi
-if [ "${STATE_OK}" -eq 1 ] && ! grep -q "^patched_symbols: 2$" /tmp/vstate-refresh.out; then
+if [ "${STATE_OK}" -eq 1 ] && ! grep -q "^patched_symbols: 1$" /tmp/vstate-refresh.out; then
     STATE_OK=0
 fi
 if [ "${STATE_OK}" -eq 1 ] && ! "${BIN_ABS}" --verify-project-state="${STATE_FILE}" >/tmp/vstate-check-3.out 2>/tmp/vstate-check-3.err; then
@@ -544,6 +794,63 @@ fi
 if [ "${RESUME_OK}" -eq 1 ] && ! grep -Eq "^  s[0-9a-f]{16}\\|C\\|m[0-9a-f]{16}\\|-\\|route\\(user_id\\)\\|r1\\|-\\|-\\|c2$" /tmp/vresume-1.out; then
     RESUME_OK=0
 fi
+if [ "${RESUME_OK}" -eq 1 ] && ! "${BIN_ABS}" --resume-project-state="${RESUME_STATE}" --focus=read_user >/tmp/vresume-focus.out 2>/tmp/vresume-focus.err; then
+    RESUME_OK=0
+fi
+if [ "${RESUME_OK}" -eq 1 ] && ! grep -q "^PRESUMEv6$" /tmp/vresume-focus.out; then
+    RESUME_OK=0
+fi
+if [ "${RESUME_OK}" -eq 1 ] && ! grep -q "^resume_focus: read_user$" /tmp/vresume-focus.out; then
+    RESUME_OK=0
+fi
+if [ "${RESUME_OK}" -eq 1 ] && ! grep -q "^resume_impact: no$" /tmp/vresume-focus.out; then
+    RESUME_OK=0
+fi
+if [ "${RESUME_OK}" -eq 1 ] && [ "$(grep -Ec "^  s[0-9a-f]{16}\\|" /tmp/vresume-focus.out)" -ne 1 ]; then
+    RESUME_OK=0
+fi
+if [ "${RESUME_OK}" -eq 1 ] && ! grep -Eq "^  s[0-9a-f]{16}\\|T\\|m[0-9a-f]{16}\\|\\+\\|read_user\\(user_id\\)\\|r1\\|e1\\|e1\\|c1$" /tmp/vresume-focus.out; then
+    RESUME_OK=0
+fi
+if [ "${RESUME_OK}" -eq 1 ] && grep -q "route(user_id)" /tmp/vresume-focus.out; then
+    RESUME_OK=0
+fi
+if [ "${RESUME_OK}" -eq 1 ] && grep -q "format_user(user_id)" /tmp/vresume-focus.out; then
+    RESUME_OK=0
+fi
+if [ "${RESUME_OK}" -eq 1 ] && ! "${BIN_ABS}" --resume-project-state="${RESUME_STATE}" --focus=read_user --impact --brief >/tmp/vresume-brief.out 2>/tmp/vresume-brief.err; then
+    RESUME_OK=0
+fi
+if [ "${RESUME_OK}" -eq 1 ] && ! grep -q "^brief: yes$" /tmp/vresume-brief.out; then
+    RESUME_OK=0
+fi
+if [ "${RESUME_OK}" -eq 1 ] && ! grep -q "^mods:$" /tmp/vresume-brief.out; then
+    RESUME_OK=0
+fi
+if [ "${RESUME_OK}" -eq 1 ] && ! grep -q "^brief_syms:$" /tmp/vresume-brief.out; then
+    RESUME_OK=0
+fi
+if [ "${RESUME_OK}" -eq 1 ] && ! grep -Eq "^ledger_bytes: [1-9][0-9]*$" /tmp/vresume-brief.out; then
+    RESUME_OK=0
+fi
+if [ "${RESUME_OK}" -eq 1 ] && ! grep -Eq "^ledger_full_bytes: [1-9][0-9]*$" /tmp/vresume-brief.out; then
+    RESUME_OK=0
+fi
+if [ "${RESUME_OK}" -eq 1 ] && ! grep -Eq "^ledger_saved_bytes: [1-9][0-9]*$" /tmp/vresume-brief.out; then
+    RESUME_OK=0
+fi
+if [ "${RESUME_OK}" -eq 1 ] && ! grep -Eq "^ledger_saved_pct: [1-9][0-9]*$" /tmp/vresume-brief.out; then
+    RESUME_OK=0
+fi
+if [ "${RESUME_OK}" -eq 1 ] && grep -q "^rets:$" /tmp/vresume-brief.out; then
+    RESUME_OK=0
+fi
+if [ "${RESUME_OK}" -eq 1 ] && grep -q "^syms:$" /tmp/vresume-brief.out; then
+    RESUME_OK=0
+fi
+if [ "${RESUME_OK}" -eq 1 ] && [ "$(grep -Ec "^  [0-9]+\\|s[0-9a-f]{16}\\|[TC]\\|m[0-9a-f]{16}\\|[^|]+\\|[^|]+\\|[+-]\\|[^|]*\\|[0-9]+$" /tmp/vresume-brief.out)" -ne 4 ]; then
+    RESUME_OK=0
+fi
 if [ "${RESUME_OK}" -eq 1 ]; then
     cat > "${TMP_RESUME_DIR}/impact_lib.vp" <<'EOF'
 @effect(os)
@@ -598,10 +905,443 @@ else
     sed -n '1,40p' /tmp/vresume-emit.err 2>/dev/null || true
     sed -n '1,120p' /tmp/vresume-1.out 2>/dev/null || true
     sed -n '1,40p' /tmp/vresume-1.err 2>/dev/null || true
+    sed -n '1,120p' /tmp/vresume-focus.out 2>/dev/null || true
+    sed -n '1,40p' /tmp/vresume-focus.err 2>/dev/null || true
     sed -n '1,120p' /tmp/vresume-2.out 2>/dev/null || true
     sed -n '1,40p' /tmp/vresume-2.err 2>/dev/null || true
 fi
 rm -rf "${TMP_RESUME_DIR}"
+echo
+
+echo "=== query_project_state ==="
+TOTAL_COUNT=$((TOTAL_COUNT + 1))
+: > "${OUT_FILE}"
+: > "${ERR_FILE}"
+TMP_QUERY_DIR="$(mktemp -d /tmp/viper-query-XXXXXX)"
+QUERY_OK=1
+cp "${SCRIPTS_DIR}/impact_context_test.vp" "${TMP_QUERY_DIR}/entry.vp"
+cp "${SCRIPTS_DIR}/impact_lib.vp" "${TMP_QUERY_DIR}/impact_lib.vp"
+QUERY_STATE="${TMP_QUERY_DIR}/agent.vstate"
+if ! "${BIN_ABS}" --emit-project-state="${QUERY_STATE}" --focus=read_user --impact "${TMP_QUERY_DIR}/entry.vp" >/tmp/vquery-emit.out 2>/tmp/vquery-emit.err; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! "${BIN_ABS}" --query-project-state="${QUERY_STATE}" --query-name=read_user >/tmp/vquery-name.out 2>/tmp/vquery-name.err; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^PQUERYv3$" /tmp/vquery-name.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^query_name: read_user$" /tmp/vquery-name.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^query_effect: -$" /tmp/vquery-name.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^query_call: -$" /tmp/vquery-name.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^query_impact: no$" /tmp/vquery-name.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^query_deps: no$" /tmp/vquery-name.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^seed_matches: 1$" /tmp/vquery-name.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^matches: 1$" /tmp/vquery-name.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && grep -q "^paths:$" /tmp/vquery-name.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq "^  s[0-9a-f]{16}\\|T\\|m[0-9a-f]{16}\\|\\+\\|read_user\\(user_id\\)\\|r1\\|e1\\|e1\\|c1$" /tmp/vquery-name.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && grep -q "route(user_id)" /tmp/vquery-name.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! "${BIN_ABS}" --query-project-state="${QUERY_STATE}" --query-effect=os >/tmp/vquery-effect.out 2>/tmp/vquery-effect.err; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^query_effect: os$" /tmp/vquery-effect.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^seed_matches: 1$" /tmp/vquery-effect.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^matches: 1$" /tmp/vquery-effect.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq "^  s[0-9a-f]{16}\\|T\\|m[0-9a-f]{16}\\|\\+\\|read_user\\(user_id\\)\\|r1\\|e1\\|e1\\|c1$" /tmp/vquery-effect.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! "${BIN_ABS}" --query-project-state="${QUERY_STATE}" --query-call=read_user >/tmp/vquery-call.out 2>/tmp/vquery-call.err; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^query_call: read_user$" /tmp/vquery-call.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^seed_matches: 1$" /tmp/vquery-call.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^matches: 1$" /tmp/vquery-call.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq "^  s[0-9a-f]{16}\\|C\\|m[0-9a-f]{16}\\|\\+\\|format_user\\(user_id\\)\\|r1\\|-\\|-\\|c1$" /tmp/vquery-call.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && grep -q "read_user(user_id)|r1|e1|e1|c1" /tmp/vquery-call.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! "${BIN_ABS}" --query-project-state="${QUERY_STATE}" --query-name=read_user --impact >/tmp/vquery-impact.out 2>/tmp/vquery-impact.err; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^query_impact: yes$" /tmp/vquery-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^query_deps: no$" /tmp/vquery-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^seed_matches: 1$" /tmp/vquery-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^matches: 4$" /tmp/vquery-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^paths:$" /tmp/vquery-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^explain:$" /tmp/vquery-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^risk_top:$" /tmp/vquery-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && [ "$(awk '/^paths:/{flag=1;next}/^explain:/{flag=0} flag && /^  s[0-9a-f]{16}=/{count++} END{print count+0}' /tmp/vquery-impact.out)" -ne 4 ]; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && [ "$(awk '/^explain:/{flag=1;next}/^mods:/{flag=0} flag && /^  s[0-9a-f]{16}=/{count++} END{print count+0}' /tmp/vquery-impact.out)" -ne 4 ]; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && [ "$(awk '/^risk_top:/{flag=1;next}/^mods:/{flag=0} flag && /^  [0-9]+\|s[0-9a-f]{16}\|/{count++} END{print count+0}' /tmp/vquery-impact.out)" -ne 4 ]; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  s[0-9a-f]{16}=seed$' /tmp/vquery-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  s[0-9a-f]{16}=s[0-9a-f]{16}->s[0-9a-f]{16}$' /tmp/vquery-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  s[0-9a-f]{16}=s[0-9a-f]{16}->s[0-9a-f]{16}->s[0-9a-f]{16}$' /tmp/vquery-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  s[0-9a-f]{16}=s[0-9a-f]{16}->s[0-9a-f]{16}->s[0-9a-f]{16}->s[0-9a-f]{16}$' /tmp/vquery-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  s[0-9a-f]{16}=seed\(name=read_user\)$' /tmp/vquery-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  s[0-9a-f]{16}=impact\(from=s[0-9a-f]{16},depth=1\)$' /tmp/vquery-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  s[0-9a-f]{16}=impact\(from=s[0-9a-f]{16},depth=2\)$' /tmp/vquery-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  s[0-9a-f]{16}=impact\(from=s[0-9a-f]{16},depth=3\)$' /tmp/vquery-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  1\|s[0-9a-f]{16}\|name=read_user\|score=39\|blast=3\|depfx=os\|pub=1$' /tmp/vquery-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  2\|s[0-9a-f]{16}\|name=format_user\|score=28\|blast=2\|depfx=os\|pub=1$' /tmp/vquery-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  3\|s[0-9a-f]{16}\|name=route\|score=16\|blast=1\|depfx=os\|pub=0$' /tmp/vquery-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  4\|s[0-9a-f]{16}\|name=render\|score=6\|blast=0\|depfx=os\|pub=0$' /tmp/vquery-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "route(user_id)" /tmp/vquery-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "render(user_id)" /tmp/vquery-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "format_user(user_id)" /tmp/vquery-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! "${BIN_ABS}" --query-project-state="${QUERY_STATE}" --query-name=read_user --impact --brief >/tmp/vquery-brief.out 2>/tmp/vquery-brief.err; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^brief: yes$" /tmp/vquery-brief.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^mods:$" /tmp/vquery-brief.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^brief_syms:$" /tmp/vquery-brief.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq "^ledger_bytes: [1-9][0-9]*$" /tmp/vquery-brief.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq "^ledger_full_bytes: [1-9][0-9]*$" /tmp/vquery-brief.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq "^ledger_saved_bytes: [1-9][0-9]*$" /tmp/vquery-brief.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq "^ledger_saved_pct: [1-9][0-9]*$" /tmp/vquery-brief.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^risk_top:$" /tmp/vquery-brief.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && grep -q "^rets:$" /tmp/vquery-brief.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && grep -q "^syms:$" /tmp/vquery-brief.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && [ "$(grep -Ec "^  [0-9]+\\|s[0-9a-f]{16}\\|[TC]\\|m[0-9a-f]{16}\\|[^|]+\\|[^|]+\\|[+-]\\|[^|]*\\|[0-9]+$" /tmp/vquery-brief.out)" -ne 4 ]; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! "${BIN_ABS}" --query-project-state="${QUERY_STATE}" --query-name=render --query-deps >/tmp/vquery-deps.out 2>/tmp/vquery-deps.err; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^query_impact: no$" /tmp/vquery-deps.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^query_deps: yes$" /tmp/vquery-deps.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^seed_matches: 1$" /tmp/vquery-deps.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^matches: 4$" /tmp/vquery-deps.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^paths:$" /tmp/vquery-deps.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^explain:$" /tmp/vquery-deps.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^risk_top:$" /tmp/vquery-deps.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && [ "$(awk '/^paths:/{flag=1;next}/^explain:/{flag=0} flag && /^  s[0-9a-f]{16}=/{count++} END{print count+0}' /tmp/vquery-deps.out)" -ne 4 ]; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && [ "$(awk '/^explain:/{flag=1;next}/^mods:/{flag=0} flag && /^  s[0-9a-f]{16}=/{count++} END{print count+0}' /tmp/vquery-deps.out)" -ne 4 ]; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && [ "$(awk '/^risk_top:/{flag=1;next}/^mods:/{flag=0} flag && /^  [0-9]+\|s[0-9a-f]{16}\|/{count++} END{print count+0}' /tmp/vquery-deps.out)" -ne 4 ]; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  s[0-9a-f]{16}=seed$' /tmp/vquery-deps.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  s[0-9a-f]{16}=s[0-9a-f]{16}->s[0-9a-f]{16}$' /tmp/vquery-deps.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  s[0-9a-f]{16}=s[0-9a-f]{16}->s[0-9a-f]{16}->s[0-9a-f]{16}$' /tmp/vquery-deps.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  s[0-9a-f]{16}=s[0-9a-f]{16}->s[0-9a-f]{16}->s[0-9a-f]{16}->s[0-9a-f]{16}$' /tmp/vquery-deps.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  s[0-9a-f]{16}=seed\(name=render\)$' /tmp/vquery-deps.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  s[0-9a-f]{16}=deps\(from=s[0-9a-f]{16},depth=1\)$' /tmp/vquery-deps.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  s[0-9a-f]{16}=deps\(from=s[0-9a-f]{16},depth=2\)$' /tmp/vquery-deps.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  s[0-9a-f]{16}=deps\(from=s[0-9a-f]{16},depth=3\)$' /tmp/vquery-deps.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  1\|s[0-9a-f]{16}\|name=read_user\|score=39\|blast=3\|depfx=os\|pub=1$' /tmp/vquery-deps.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  2\|s[0-9a-f]{16}\|name=format_user\|score=28\|blast=2\|depfx=os\|pub=1$' /tmp/vquery-deps.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  3\|s[0-9a-f]{16}\|name=route\|score=16\|blast=1\|depfx=os\|pub=0$' /tmp/vquery-deps.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  4\|s[0-9a-f]{16}\|name=render\|score=6\|blast=0\|depfx=os\|pub=0$' /tmp/vquery-deps.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "route(user_id)" /tmp/vquery-deps.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "format_user(user_id)" /tmp/vquery-deps.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "read_user(user_id)" /tmp/vquery-deps.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! "${BIN_ABS}" --query-project-state="${QUERY_STATE}" --query-effect=os --impact >/tmp/vquery-effect-impact.out 2>/tmp/vquery-effect-impact.err; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^query_effect: os$" /tmp/vquery-effect-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^query_impact: yes$" /tmp/vquery-effect-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^matches: 4$" /tmp/vquery-effect-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -q "^risk_top:$" /tmp/vquery-effect-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  s[0-9a-f]{16}=seed\(effect=os\)$' /tmp/vquery-effect-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  s[0-9a-f]{16}=impact\(from=s[0-9a-f]{16},depth=1,effect=os\)$' /tmp/vquery-effect-impact.out; then
+    QUERY_OK=0
+fi
+if [ "${QUERY_OK}" -eq 1 ] && ! grep -Eq '^  1\|s[0-9a-f]{16}\|name=read_user\|score=39\|blast=3\|depfx=os\|pub=1$' /tmp/vquery-effect-impact.out; then
+    QUERY_OK=0
+fi
+
+if [ "${QUERY_OK}" -eq 1 ]; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo "PASS"
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "FAIL(query-state)"
+    sed -n '1,80p' /tmp/vquery-emit.out 2>/dev/null || true
+    sed -n '1,40p' /tmp/vquery-emit.err 2>/dev/null || true
+    sed -n '1,120p' /tmp/vquery-name.out 2>/dev/null || true
+    sed -n '1,40p' /tmp/vquery-name.err 2>/dev/null || true
+    sed -n '1,120p' /tmp/vquery-effect.out 2>/dev/null || true
+    sed -n '1,40p' /tmp/vquery-effect.err 2>/dev/null || true
+    sed -n '1,120p' /tmp/vquery-call.out 2>/dev/null || true
+    sed -n '1,40p' /tmp/vquery-call.err 2>/dev/null || true
+    sed -n '1,120p' /tmp/vquery-impact.out 2>/dev/null || true
+    sed -n '1,40p' /tmp/vquery-impact.err 2>/dev/null || true
+    sed -n '1,120p' /tmp/vquery-deps.out 2>/dev/null || true
+    sed -n '1,40p' /tmp/vquery-deps.err 2>/dev/null || true
+fi
+rm -rf "${TMP_QUERY_DIR}"
+echo
+
+echo "=== bench_project_state ==="
+TOTAL_COUNT=$((TOTAL_COUNT + 1))
+: > "${OUT_FILE}"
+: > "${ERR_FILE}"
+TMP_BENCH_DIR="$(mktemp -d /tmp/viper-bench-XXXXXX)"
+BENCH_OK=1
+cp "${SCRIPTS_DIR}/impact_context_test.vp" "${TMP_BENCH_DIR}/entry.vp"
+cp "${SCRIPTS_DIR}/impact_lib.vp" "${TMP_BENCH_DIR}/impact_lib.vp"
+BENCH_STATE="${TMP_BENCH_DIR}/agent.vstate"
+if ! "${BIN_ABS}" --emit-project-state="${BENCH_STATE}" --focus=read_user --impact "${TMP_BENCH_DIR}/entry.vp" >/tmp/vbench-emit.out 2>/tmp/vbench-emit.err; then
+    BENCH_OK=0
+fi
+if [ "${BENCH_OK}" -eq 1 ] && ! "${BIN_ABS}" --bench-project-state="${BENCH_STATE}" --focus=read_user --impact >/tmp/vbench-resume.out 2>/tmp/vbench-resume.err; then
+    BENCH_OK=0
+fi
+if [ "${BENCH_OK}" -eq 1 ] && ! grep -q "^PBENCHv1$" /tmp/vbench-resume.out; then
+    BENCH_OK=0
+fi
+if [ "${BENCH_OK}" -eq 1 ] && ! grep -q "^mode: resume$" /tmp/vbench-resume.out; then
+    BENCH_OK=0
+fi
+if [ "${BENCH_OK}" -eq 1 ] && ! grep -q "^scope: ledger$" /tmp/vbench-resume.out; then
+    BENCH_OK=0
+fi
+if [ "${BENCH_OK}" -eq 1 ] && ! grep -q "^resume_focus: read_user$" /tmp/vbench-resume.out; then
+    BENCH_OK=0
+fi
+if [ "${BENCH_OK}" -eq 1 ] && ! grep -q "^resume_impact: yes$" /tmp/vbench-resume.out; then
+    BENCH_OK=0
+fi
+if [ "${BENCH_OK}" -eq 1 ] && ! grep -q "^selection_symbols: 4$" /tmp/vbench-resume.out; then
+    BENCH_OK=0
+fi
+if [ "${BENCH_OK}" -eq 1 ] && ! grep -q "^selection_modules: 2$" /tmp/vbench-resume.out; then
+    BENCH_OK=0
+fi
+if [ "${BENCH_OK}" -eq 1 ] && ! grep -q "^include_tests: yes$" /tmp/vbench-resume.out; then
+    BENCH_OK=0
+fi
+if [ "${BENCH_OK}" -eq 1 ]; then
+    BENCH_BRIEF_BYTES="$(awk -F': ' '/^brief_bytes:/{print $2}' /tmp/vbench-resume.out)"
+    BENCH_FULL_BYTES="$(awk -F': ' '/^full_bytes:/{print $2}' /tmp/vbench-resume.out)"
+    BENCH_SAVED_BYTES="$(awk -F': ' '/^saved_bytes:/{print $2}' /tmp/vbench-resume.out)"
+    BENCH_SAVED_PCT="$(awk -F': ' '/^saved_pct:/{print $2}' /tmp/vbench-resume.out)"
+    BENCH_BRIEF_TOKENS="$(awk -F': ' '/^brief_tokens_est:/{print $2}' /tmp/vbench-resume.out)"
+    BENCH_FULL_TOKENS="$(awk -F': ' '/^full_tokens_est:/{print $2}' /tmp/vbench-resume.out)"
+    BENCH_SAVED_TOKENS="$(awk -F': ' '/^saved_tokens_est:/{print $2}' /tmp/vbench-resume.out)"
+    if [ -z "${BENCH_BRIEF_BYTES}" ] || [ -z "${BENCH_FULL_BYTES}" ] || [ -z "${BENCH_SAVED_BYTES}" ] || [ -z "${BENCH_SAVED_PCT}" ] || \
+       [ -z "${BENCH_BRIEF_TOKENS}" ] || [ -z "${BENCH_FULL_TOKENS}" ] || [ -z "${BENCH_SAVED_TOKENS}" ] || \
+       [ "${BENCH_BRIEF_BYTES}" -ge "${BENCH_FULL_BYTES}" ] || [ "${BENCH_SAVED_BYTES}" -le 0 ] || \
+       [ "${BENCH_SAVED_PCT}" -le 0 ] || [ "${BENCH_BRIEF_TOKENS}" -ge "${BENCH_FULL_TOKENS}" ] || \
+       [ "${BENCH_SAVED_TOKENS}" -le 0 ]; then
+        BENCH_OK=0
+    fi
+fi
+if [ "${BENCH_OK}" -eq 1 ] && ! grep -Eq "^brief_emit_us: [0-9]+$" /tmp/vbench-resume.out; then
+    BENCH_OK=0
+fi
+if [ "${BENCH_OK}" -eq 1 ] && ! grep -Eq "^full_emit_us: [0-9]+$" /tmp/vbench-resume.out; then
+    BENCH_OK=0
+fi
+if [ "${BENCH_OK}" -eq 1 ] && ! "${BIN_ABS}" --bench-project-state="${BENCH_STATE}" --query-name=read_user --impact >/tmp/vbench-query.out 2>/tmp/vbench-query.err; then
+    BENCH_OK=0
+fi
+if [ "${BENCH_OK}" -eq 1 ] && ! grep -q "^mode: query$" /tmp/vbench-query.out; then
+    BENCH_OK=0
+fi
+if [ "${BENCH_OK}" -eq 1 ] && ! grep -q "^query_name: read_user$" /tmp/vbench-query.out; then
+    BENCH_OK=0
+fi
+if [ "${BENCH_OK}" -eq 1 ] && ! grep -q "^query_impact: yes$" /tmp/vbench-query.out; then
+    BENCH_OK=0
+fi
+if [ "${BENCH_OK}" -eq 1 ] && ! grep -q "^query_deps: no$" /tmp/vbench-query.out; then
+    BENCH_OK=0
+fi
+if [ "${BENCH_OK}" -eq 1 ] && ! grep -q "^seed_matches: 1$" /tmp/vbench-query.out; then
+    BENCH_OK=0
+fi
+if [ "${BENCH_OK}" -eq 1 ] && ! grep -q "^selection_symbols: 4$" /tmp/vbench-query.out; then
+    BENCH_OK=0
+fi
+if [ "${BENCH_OK}" -eq 1 ] && ! grep -q "^include_tests: yes$" /tmp/vbench-query.out; then
+    BENCH_OK=0
+fi
+if [ "${BENCH_OK}" -eq 1 ]; then
+    BENCH_QUERY_BRIEF_BYTES="$(awk -F': ' '/^brief_bytes:/{print $2}' /tmp/vbench-query.out)"
+    BENCH_QUERY_FULL_BYTES="$(awk -F': ' '/^full_bytes:/{print $2}' /tmp/vbench-query.out)"
+    BENCH_QUERY_SAVED_TOKENS="$(awk -F': ' '/^saved_tokens_est:/{print $2}' /tmp/vbench-query.out)"
+    if [ -z "${BENCH_QUERY_BRIEF_BYTES}" ] || [ -z "${BENCH_QUERY_FULL_BYTES}" ] || [ -z "${BENCH_QUERY_SAVED_TOKENS}" ] || \
+       [ "${BENCH_QUERY_BRIEF_BYTES}" -ge "${BENCH_QUERY_FULL_BYTES}" ] || [ "${BENCH_QUERY_SAVED_TOKENS}" -le 0 ]; then
+        BENCH_OK=0
+    fi
+fi
+
+if [ "${BENCH_OK}" -eq 1 ]; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo "PASS"
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "FAIL(bench-state)"
+    sed -n '1,80p' /tmp/vbench-emit.out 2>/dev/null || true
+    sed -n '1,40p' /tmp/vbench-emit.err 2>/dev/null || true
+    sed -n '1,120p' /tmp/vbench-resume.out 2>/dev/null || true
+    sed -n '1,40p' /tmp/vbench-resume.err 2>/dev/null || true
+    sed -n '1,120p' /tmp/vbench-query.out 2>/dev/null || true
+    sed -n '1,40p' /tmp/vbench-query.err 2>/dev/null || true
+fi
+rm -rf "${TMP_BENCH_DIR}"
 echo
 
 echo "=== semantic_diff ==="
@@ -609,10 +1349,15 @@ TOTAL_COUNT=$((TOTAL_COUNT + 1))
 : > "${OUT_FILE}"
 : > "${ERR_FILE}"
 if "${BIN_PATH}" --emit-semantic-diff="tests/fixtures/semantic_diff_before.vp" --focus=read_user --impact "tests/fixtures/semantic_diff_after.vp" >"${OUT_FILE}" 2>"${ERR_FILE}" &&
-   grep -q "^SDIFFv1$" "${OUT_FILE}" &&
+   grep -q "^SDIFFv2$" "${OUT_FILE}" &&
    grep -q "^focus: read_user$" "${OUT_FILE}" &&
    grep -q "^presence: before=yes after=yes$" "${OUT_FILE}" &&
    grep -q "^summary: before=2 after=3 added=2 removed=1 unchanged=1$" "${OUT_FILE}" &&
+   grep -q "^change_plan:$" "${OUT_FILE}" &&
+   grep -q "^  1|status=changed|kind=target|name=read_user|score=35|blast=2|depfx=os,panic|checks=contract,effects,callers$" "${OUT_FILE}" &&
+   grep -q "^  2|status=added|kind=caller|name=route|score=12|blast=0|depfx=os,panic|checks=new_surface,effects$" "${OUT_FILE}" &&
+   grep -q "^test_plan:$" "${OUT_FILE}" &&
+   grep -q "^  1|test=tests/scripts/semantic_link_test.vp|hits=2|max_score=35|symbols=read_user,route|checks=contract,new_surface,effects,callers$" "${OUT_FILE}" &&
    grep -q "^removed:$" "${OUT_FILE}" &&
    grep -q "^  target tests/fixtures/semantic_diff_before.vp::pub fn read_user(user_id) -> str effects=os inferred=os calls=os_env/1$" "${OUT_FILE}" &&
    grep -q "^added:$" "${OUT_FILE}" &&

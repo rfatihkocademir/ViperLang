@@ -413,7 +413,7 @@ static int cmd_build_app(int argc, const char* argv[]) {
 }
 
 static void print_usage(void) {
-    printf("Usage: viper [--emit-index-json[=out.json]] [--emit-project-state[=out.vstate] [--focus=symbol] [--impact]] [--resume-project-state=state.vstate] [--verify-project-state=state.vstate] [--refresh-project-state=state.vstate] [--emit-context-pack[=out.ctx] [--focus=symbol] [--impact]] [--emit-semantic-diff=before.vp --focus=symbol [--impact]] [--emit-bytecode=out.vbb] [script.vp]\n");
+    printf("Usage: viper [--emit-index-json[=out.json]] [--emit-project-state[=out.vstate] [--focus=symbol] [--impact]] [--resume-project-state=state.vstate [--focus=symbol] [--impact] [--brief]] [--query-project-state=state.vstate (--query-name=symbol|--query-effect=effect|--query-call=callee) [--impact] [--query-deps] [--brief]] [--bench-project-state=state.vstate [--focus=symbol] [--impact] [--query-name=symbol|--query-effect=effect|--query-call=callee] [--query-deps]] [--verify-project-state=state.vstate] [--refresh-project-state=state.vstate] [--emit-state-plan=before.vstate after.vstate] [--run-state-plan=before.vstate after.vstate] [--emit-context-pack[=out.ctx] [--focus=symbol] [--impact]] [--emit-semantic-diff=before.vp --focus=symbol [--impact]] [--emit-bytecode=out.vbb] [script.vp]\n");
     printf("       viper --run-bytecode=app.vbb\n");
     printf("       viper build <entry.vp> [--out-dir=build] [--name=app]\n");
     printf("       viper pkg <init|add|remove|install|lock|list|build|abi> [...args]\n");
@@ -441,12 +441,21 @@ int main(int argc, const char* argv[]) {
     const char* index_out = NULL;
     const char* project_state_out = NULL;
     const char* resume_project_state_in = NULL;
+    const char* query_project_state_in = NULL;
+    const char* bench_project_state_in = NULL;
     const char* verify_project_state_in = NULL;
     const char* refresh_project_state_in = NULL;
     const char* context_out = NULL;
     const char* semantic_diff_before = NULL;
+    const char* state_plan_before = NULL;
+    const char* run_state_plan_before = NULL;
     const char* focus_symbol = NULL;
+    const char* query_name = NULL;
+    const char* query_effect = NULL;
+    const char* query_call = NULL;
+    bool query_dependencies = false;
     bool include_impact = false;
+    bool brief_output = false;
     const char* emit_bytecode_out = NULL;
     const char* run_bytecode_in = NULL;
     const char* script_path = NULL;
@@ -474,6 +483,14 @@ int main(int argc, const char* argv[]) {
             resume_project_state_in = argv[i] + 23;
             continue;
         }
+        if (strncmp(argv[i], "--query-project-state=", 22) == 0) {
+            query_project_state_in = argv[i] + 22;
+            continue;
+        }
+        if (strncmp(argv[i], "--bench-project-state=", 22) == 0) {
+            bench_project_state_in = argv[i] + 22;
+            continue;
+        }
         if (strncmp(argv[i], "--verify-project-state=", 23) == 0) {
             verify_project_state_in = argv[i] + 23;
             continue;
@@ -495,8 +512,36 @@ int main(int argc, const char* argv[]) {
             focus_symbol = argv[i] + 8;
             continue;
         }
+        if (strncmp(argv[i], "--query-name=", 13) == 0) {
+            query_name = argv[i] + 13;
+            continue;
+        }
+        if (strncmp(argv[i], "--query-effect=", 15) == 0) {
+            query_effect = argv[i] + 15;
+            continue;
+        }
+        if (strncmp(argv[i], "--query-call=", 13) == 0) {
+            query_call = argv[i] + 13;
+            continue;
+        }
+        if (strcmp(argv[i], "--query-deps") == 0) {
+            query_dependencies = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--brief") == 0) {
+            brief_output = true;
+            continue;
+        }
         if (strncmp(argv[i], "--emit-semantic-diff=", 21) == 0) {
             semantic_diff_before = argv[i] + 21;
+            continue;
+        }
+        if (strncmp(argv[i], "--emit-state-plan=", 18) == 0) {
+            state_plan_before = argv[i] + 18;
+            continue;
+        }
+        if (strncmp(argv[i], "--run-state-plan=", 17) == 0) {
+            run_state_plan_before = argv[i] + 17;
             continue;
         }
         if (strcmp(argv[i], "--impact") == 0) {
@@ -519,10 +564,15 @@ int main(int argc, const char* argv[]) {
         exit(64);
     }
 
-    if (run_bytecode_in != NULL) {
+        if (run_bytecode_in != NULL) {
         if (script_path != NULL || emit_index || emit_project_state_flag || emit_context || emit_bytecode_out != NULL ||
-            semantic_diff_before != NULL || resume_project_state_in != NULL || verify_project_state_in != NULL ||
-            refresh_project_state_in != NULL || focus_symbol != NULL || include_impact) {
+            semantic_diff_before != NULL || resume_project_state_in != NULL || query_project_state_in != NULL ||
+            bench_project_state_in != NULL ||
+            verify_project_state_in != NULL || refresh_project_state_in != NULL || state_plan_before != NULL ||
+            run_state_plan_before != NULL ||
+            focus_symbol != NULL ||
+            query_name != NULL || query_effect != NULL || query_call != NULL || query_dependencies ||
+            include_impact || brief_output) {
             printf("Usage: viper --run-bytecode=app.vbb\n");
             exit(64);
         }
@@ -532,17 +582,85 @@ int main(int argc, const char* argv[]) {
         return 0;
     }
 
-    if (resume_project_state_in != NULL || verify_project_state_in != NULL || refresh_project_state_in != NULL) {
+    if (resume_project_state_in != NULL || query_project_state_in != NULL ||
+        bench_project_state_in != NULL ||
+        verify_project_state_in != NULL || refresh_project_state_in != NULL) {
         if (script_path != NULL || emit_index || emit_project_state_flag || emit_context ||
-            emit_bytecode_out != NULL || semantic_diff_before != NULL || focus_symbol != NULL ||
-            include_impact) {
+            emit_bytecode_out != NULL || semantic_diff_before != NULL || state_plan_before != NULL ||
+            run_state_plan_before != NULL) {
+            print_usage();
+            exit(64);
+        }
+
+        if (resume_project_state_in != NULL &&
+            (query_project_state_in != NULL || bench_project_state_in != NULL || verify_project_state_in != NULL ||
+             refresh_project_state_in != NULL || query_name != NULL ||
+             query_effect != NULL || query_call != NULL || query_dependencies)) {
+            print_usage();
+            exit(64);
+        }
+
+        if (query_project_state_in != NULL &&
+            (resume_project_state_in != NULL || bench_project_state_in != NULL || verify_project_state_in != NULL ||
+             refresh_project_state_in != NULL || focus_symbol != NULL)) {
+            print_usage();
+            exit(64);
+        }
+
+        if (bench_project_state_in != NULL &&
+            (resume_project_state_in != NULL || query_project_state_in != NULL ||
+             verify_project_state_in != NULL || refresh_project_state_in != NULL)) {
+            print_usage();
+            exit(64);
+        }
+
+        if (query_project_state_in != NULL &&
+            query_name == NULL && query_effect == NULL && query_call == NULL) {
+            print_usage();
+            exit(64);
+        }
+        if (query_project_state_in == NULL && bench_project_state_in == NULL &&
+            (query_name != NULL || query_effect != NULL || query_call != NULL || query_dependencies)) {
+            print_usage();
+            exit(64);
+        }
+        if (bench_project_state_in != NULL &&
+            (query_name != NULL || query_effect != NULL || query_call != NULL) &&
+            focus_symbol != NULL) {
+            print_usage();
+            exit(64);
+        }
+        if (bench_project_state_in != NULL &&
+            query_name == NULL && query_effect == NULL && query_call == NULL && query_dependencies) {
+            print_usage();
+            exit(64);
+        }
+
+        if ((verify_project_state_in != NULL || refresh_project_state_in != NULL) &&
+            (focus_symbol != NULL || include_impact || query_name != NULL ||
+             query_effect != NULL || query_call != NULL || query_dependencies || brief_output)) {
+            print_usage();
+            exit(64);
+        }
+        if (brief_output && resume_project_state_in == NULL && query_project_state_in == NULL) {
+            print_usage();
+            exit(64);
+        }
+        if (bench_project_state_in != NULL && brief_output) {
             print_usage();
             exit(64);
         }
 
         bool ok = true;
         if (resume_project_state_in != NULL) {
-            ok = resume_project_state(resume_project_state_in, NULL);
+            ok = resume_project_state(resume_project_state_in, NULL, focus_symbol, include_impact,
+                                      brief_output);
+        } else if (query_project_state_in != NULL) {
+            ok = query_project_state(query_project_state_in, NULL, query_name, query_effect,
+                                     query_call, include_impact, query_dependencies, brief_output);
+        } else if (bench_project_state_in != NULL) {
+            ok = bench_project_state(bench_project_state_in, NULL, focus_symbol, query_name,
+                                     query_effect, query_call, include_impact, query_dependencies);
         } else if (verify_project_state_in != NULL) {
             ok = verify_project_state(verify_project_state_in, NULL);
         } else if (refresh_project_state_in != NULL) {
@@ -553,12 +671,45 @@ int main(int argc, const char* argv[]) {
         return 0;
     }
 
+    if (state_plan_before != NULL) {
+        if (script_path == NULL || emit_index || emit_project_state_flag || emit_context ||
+            emit_bytecode_out != NULL || semantic_diff_before != NULL || run_state_plan_before != NULL ||
+            focus_symbol != NULL ||
+            include_impact || query_name != NULL || query_effect != NULL || query_call != NULL ||
+            brief_output ||
+            query_dependencies) {
+            print_usage();
+            exit(64);
+        }
+        if (!emit_state_plan(state_plan_before, script_path, NULL)) {
+            exit(1);
+        }
+        free_memory();
+        return 0;
+    }
+
+    if (run_state_plan_before != NULL) {
+        if (script_path == NULL || emit_index || emit_project_state_flag || emit_context ||
+            emit_bytecode_out != NULL || semantic_diff_before != NULL || state_plan_before != NULL ||
+            focus_symbol != NULL || include_impact || query_name != NULL || query_effect != NULL ||
+            brief_output ||
+            query_call != NULL || query_dependencies) {
+            print_usage();
+            exit(64);
+        }
+        if (!run_state_plan(run_state_plan_before, script_path, NULL)) {
+            exit(1);
+        }
+        free_memory();
+        return 0;
+    }
+
     if (script_path == NULL) {
         print_usage();
         exit(64);
     }
 
-    if (semantic_diff_before != NULL && (emit_index || emit_project_state_flag || emit_context || emit_bytecode_out != NULL)) {
+    if (semantic_diff_before != NULL && (emit_index || emit_project_state_flag || emit_context || emit_bytecode_out != NULL || brief_output)) {
         print_usage();
         exit(64);
     }
@@ -581,6 +732,10 @@ int main(int argc, const char* argv[]) {
     }
 
     if (include_impact && semantic_diff_before != NULL && focus_symbol == NULL) {
+        print_usage();
+        exit(64);
+    }
+    if (brief_output) {
         print_usage();
         exit(64);
     }

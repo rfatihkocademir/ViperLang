@@ -5,10 +5,15 @@
 #include "bytecode.h"
 
 #include <ctype.h>
+#include <dirent.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define MAX_PATH_LEN 1024
@@ -136,6 +141,83 @@ typedef struct {
 } CompactSymbolRow;
 
 typedef struct {
+    char symbol_id[32];
+    char module_ref[32];
+    char kind[16];
+    char contract[4608];
+} StateSymbolRow;
+
+typedef struct {
+    StateSymbolRow* items;
+    int count;
+    int cap;
+} StateSymbolRowList;
+
+typedef struct {
+    char name[MAX_NAME_LEN];
+    bool is_public;
+    StringList call_basenames;
+    StringList self_effects;
+} QueryGraphNode;
+
+typedef struct {
+    QueryGraphNode* nodes;
+    int* scores;
+    int* blast;
+    int* dep_effect_counts;
+    StringList* dep_effects;
+    int count;
+} QueryRiskStats;
+
+typedef struct {
+    char diff_identity[256];
+    char status[16];
+    int before_index;
+    int after_index;
+} SemanticChangePlanItem;
+
+typedef struct {
+    char diff_identity[256];
+    char module_path[MAX_PATH_LEN];
+    char module_symbol_identity[4608];
+    char name[MAX_NAME_LEN];
+    char status[16];
+    int score;
+    int blast;
+    int dep_effect_count;
+} SemanticChangeCandidate;
+
+typedef struct {
+    char path[MAX_PATH_LEN];
+    char hash_hex[65];
+    StringList covered_symbol_ids;
+} StateTestLink;
+
+typedef struct {
+    StateTestLink* items;
+    int count;
+    int cap;
+} StateTestLinkList;
+
+typedef struct {
+    char path[MAX_PATH_LEN];
+    int hits;
+    int max_score;
+    bool has_changed;
+    bool has_added;
+    bool has_removed;
+    bool has_effects;
+    bool has_callers;
+    StringList symbols;
+} StatePlanTestCandidate;
+
+typedef struct {
+    StatePlanTestCandidate* items;
+    int count;
+    int cap;
+} StatePlanTestCandidateList;
+
+typedef struct {
     char root[MAX_PATH_LEN];
     char entry[MAX_PATH_LEN];
     char focus[MAX_NAME_LEN];
@@ -144,7 +226,32 @@ typedef struct {
     char semantic_fingerprint[65];
     StringList tracked_paths;
     StringList tracked_hashes;
+    StringList tracked_test_paths;
+    StringList tracked_test_hashes;
 } ProjectStateManifest;
+
+typedef struct {
+    bool present;
+    bool matches_state;
+    char focus[MAX_NAME_LEN];
+    bool include_impact;
+    int tests_planned;
+    int tests_failed;
+    char semantic_fingerprint[65];
+    StringList executed_tests;
+} StateProofSummary;
+
+typedef struct {
+    long brief_bytes;
+    long full_bytes;
+    long saved_bytes;
+    long saved_pct;
+    long brief_tokens_est;
+    long full_tokens_est;
+    long saved_tokens_est;
+    unsigned long long brief_emit_us;
+    unsigned long long full_emit_us;
+} StatePayloadMetrics;
 
 static char index_project_root[MAX_PATH_LEN];
 static void path_dirname(const char* path, char* out, size_t out_size);
@@ -158,7 +265,69 @@ static bool collect_impact_semantic_items(const ProjectIndex* project, const Foc
 static bool emit_project_state_from_project(const ProjectIndex* project, const char* entry_path,
                                             const char* out_path, const char* focus_symbol,
                                             bool include_impact);
+static bool build_project_index(const char* entry_file, ProjectIndex* project,
+                                char* entry_path_out, size_t entry_path_out_size);
 static int string_list_index_of(const StringList* list, const char* text);
+static bool parse_compact_symbol_row(const char* kind, const char* contract, CompactSymbolRow* row);
+static bool collect_symbol_tables_from_rows(const StateSymbolRowList* rows,
+                                            StringList* returns, StringList* effects,
+                                            StringList* calls, int* symbol_count);
+static bool emit_compact_symbol_row_from_state(FILE* out, const StateSymbolRow* state_row,
+                                               const StringList* returns, const StringList* effects,
+                                               const StringList* calls);
+static bool state_symbol_row_diff_identity(const StateSymbolRow* row, char* out, size_t out_size);
+static int state_symbol_rows_index_of_diff_identity(const StateSymbolRowList* rows,
+                                                    const char* diff_identity);
+static bool build_module_symbol_identity(const char* module_path, const char* contract,
+                                         char* out, size_t out_size);
+static bool collect_project_symbol_identities(const ProjectIndex* project, StringList* out);
+static bool collect_candidate_test_files(const char* project_root, StringList* out);
+static bool canonicalize_existing_path(const char* path, char* out, size_t out_size);
+static bool collect_module_rows_from_semantic_items(const SemanticItemList* items,
+                                                    StringList* module_refs, StringList* module_paths);
+static bool collect_state_test_links(const char* project_root, const SemanticItemList* items,
+                                     StateTestLinkList* out);
+static bool emit_state_test_sections(FILE* out, const StateTestLinkList* links);
+static bool emit_state_linked_tests(const char* state_path, const StateSymbolRowList* selected_rows,
+                                    FILE* out);
+static bool emit_state_brief_rows(FILE* out, const StateSymbolRowList* rows);
+static bool emit_state_module_section_from_rows(const char* state_path, const StateSymbolRowList* rows,
+                                                FILE* out);
+static long measure_state_payload_bytes(const char* state_path, const StateSymbolRowList* rows,
+                                        bool brief_output, bool include_tests);
+static bool compute_state_payload_metrics(const char* state_path, const StateSymbolRowList* rows,
+                                          bool include_tests, StatePayloadMetrics* metrics);
+static bool emit_state_verification_summary(const char* state_path,
+                                            const ProjectStateManifest* manifest,
+                                            const StringList* stale_lines,
+                                            const StringList* stale_module_refs,
+                                            FILE* out);
+static bool load_state_semantic_items(const char* state_path, SemanticItemList* items);
+static bool emit_state_test_plan(FILE* out, const char* before_state_path, const char* after_state_path,
+                                 const SemanticItemList* before_items, const SemanticItemList* after_items,
+                                 const StateSymbolRowList* before_rows, const StateSymbolRowList* after_rows);
+static bool build_state_test_plan_candidates(const char* before_state_path, const char* after_state_path,
+                                             const SemanticItemList* before_items, const SemanticItemList* after_items,
+                                             const StateSymbolRowList* before_rows, const StateSymbolRowList* after_rows,
+                                             StatePlanTestCandidateList* out);
+static bool collect_state_linked_test_candidates(const char* state_path, const StateSymbolRowList* selected_rows,
+                                                 StatePlanTestCandidateList* out);
+static bool stale_lines_include_tracked_test_change(const ProjectStateManifest* manifest,
+                                                    const StringList* stale_lines);
+static bool write_state_linked_proof(const char* before_state, const char* after_state,
+                                     const char* out_path, int* tests_planned_out,
+                                     int* tests_failed_out);
+
+static unsigned long long monotonic_time_us(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (unsigned long long)tv.tv_sec * 1000000ULL + (unsigned long long)tv.tv_usec;
+}
+
+static long estimate_payload_tokens(long bytes) {
+    if (bytes <= 0) return 0;
+    return (bytes + 3) / 4;
+}
 
 static void copy_text(char* dst, size_t dst_size, const char* src) {
     if (dst_size == 0) return;
@@ -247,6 +416,8 @@ static void free_project_state_manifest(ProjectStateManifest* manifest) {
     if (!manifest) return;
     free_string_list(&manifest->tracked_paths);
     free_string_list(&manifest->tracked_hashes);
+    free_string_list(&manifest->tracked_test_paths);
+    free_string_list(&manifest->tracked_test_hashes);
     memset(manifest, 0, sizeof(*manifest));
 }
 
@@ -256,6 +427,66 @@ static void free_compact_symbol_row(CompactSymbolRow* row) {
     free_string_list(&row->inferred_effects);
     free_string_list(&row->calls);
     memset(row, 0, sizeof(*row));
+}
+
+static void free_state_symbol_rows(StateSymbolRowList* list) {
+    if (!list) return;
+    free(list->items);
+    memset(list, 0, sizeof(*list));
+}
+
+static void free_state_test_links(StateTestLinkList* list) {
+    if (!list) return;
+    for (int i = 0; i < list->count; i++) {
+        free_string_list(&list->items[i].covered_symbol_ids);
+    }
+    free(list->items);
+    memset(list, 0, sizeof(*list));
+}
+
+static void free_state_proof_summary(StateProofSummary* summary) {
+    if (!summary) return;
+    free_string_list(&summary->executed_tests);
+    memset(summary, 0, sizeof(*summary));
+}
+
+static void free_state_plan_test_candidates(StatePlanTestCandidateList* list) {
+    if (!list) return;
+    for (int i = 0; i < list->count; i++) {
+        free_string_list(&list->items[i].symbols);
+    }
+    free(list->items);
+    memset(list, 0, sizeof(*list));
+}
+
+static void free_query_graph_nodes(QueryGraphNode* nodes, int count) {
+    if (!nodes) return;
+    for (int i = 0; i < count; i++) {
+        free_string_list(&nodes[i].call_basenames);
+        free_string_list(&nodes[i].self_effects);
+    }
+    free(nodes);
+}
+
+static void free_query_risk_stats(QueryRiskStats* stats) {
+    if (!stats) return;
+    if (stats->dep_effects) {
+        for (int i = 0; i < stats->count; i++) {
+            free_string_list(&stats->dep_effects[i]);
+        }
+    }
+    free(stats->dep_effects);
+    free(stats->scores);
+    free(stats->blast);
+    free(stats->dep_effect_counts);
+    free_query_graph_nodes(stats->nodes, stats->count);
+    memset(stats, 0, sizeof(*stats));
+}
+
+static bool string_list_append_unique(StringList* list, const char* text) {
+    if (!list || !text || text[0] == '\0') return false;
+    if (string_list_index_of(list, text) != -1) return true;
+    return string_list_append(list, text);
 }
 
 static bool semantic_items_add(SemanticItemList* list, const char* key, const char* text) {
@@ -276,6 +507,22 @@ static bool semantic_items_add(SemanticItemList* list, const char* key, const ch
         return false;
     }
     return true;
+}
+
+static bool state_symbol_rows_add(StateSymbolRowList* list, const char* symbol_id,
+                                  const char* module_ref, const char* kind, const char* contract) {
+    if (!list || !symbol_id || !module_ref || !kind || !contract) return false;
+    if (!ensure_capacity((void**)&list->items, &list->cap, list->count + 1, sizeof(StateSymbolRow))) {
+        return false;
+    }
+    StateSymbolRow* row = &list->items[list->count++];
+    memset(row, 0, sizeof(*row));
+    copy_text(row->symbol_id, sizeof(row->symbol_id), symbol_id);
+    copy_text(row->module_ref, sizeof(row->module_ref), module_ref);
+    copy_text(row->kind, sizeof(row->kind), kind);
+    copy_text(row->contract, sizeof(row->contract), contract);
+    return row->symbol_id[0] != '\0' && row->module_ref[0] != '\0' &&
+           row->kind[0] != '\0' && row->contract[0] != '\0';
 }
 
 static bool semantic_items_contains(const SemanticItemList* list, const char* key) {
@@ -1569,6 +1816,11 @@ static bool resolve_state_path(const char* base_dir, const char* path, char* out
     return join_path(base_dir, path, out, out_size);
 }
 
+static bool build_state_proof_path(const char* state_path, char* out, size_t out_size) {
+    if (!state_path || !out || out_size == 0) return false;
+    return snprintf(out, out_size, "%s.vproof", state_path) < (int)out_size;
+}
+
 static bool load_project_state_manifest(const char* state_path, ProjectStateManifest* manifest) {
     if (!state_path || !manifest) return false;
     memset(manifest, 0, sizeof(*manifest));
@@ -1594,6 +1846,7 @@ static bool load_project_state_manifest(const char* state_path, ProjectStateMani
     }
 
     bool in_tracked_files = false;
+    bool in_tracked_tests = false;
     while (fgets(line, sizeof(line), file)) {
         n = strlen(line);
         while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
@@ -1601,6 +1854,12 @@ static bool load_project_state_manifest(const char* state_path, ProjectStateMani
         if (strcmp(line, "context:") == 0) break;
         if (strcmp(line, "tracked_files:") == 0) {
             in_tracked_files = true;
+            in_tracked_tests = false;
+            continue;
+        }
+        if (strcmp(line, "tracked_tests:") == 0) {
+            in_tracked_files = false;
+            in_tracked_tests = true;
             continue;
         }
 
@@ -1625,7 +1884,29 @@ static bool load_project_state_manifest(const char* state_path, ProjectStateMani
             continue;
         }
 
+        if (in_tracked_tests && strncmp(line, "  ", 2) == 0) {
+            char* marker = strstr(line + 2, " sha256=");
+            if (!marker) {
+                fclose(file);
+                free_project_state_manifest(manifest);
+                fprintf(stderr, "Indexer Error: Malformed tracked test entry in \"%s\".\n", state_path);
+                return false;
+            }
+            *marker = '\0';
+            const char* rel_path = line + 2;
+            const char* hash = marker + 8;
+            if (!string_list_append(&manifest->tracked_test_paths, rel_path) ||
+                !string_list_append(&manifest->tracked_test_hashes, hash)) {
+                fclose(file);
+                free_project_state_manifest(manifest);
+                fprintf(stderr, "Indexer Error: Out of memory while reading state file.\n");
+                return false;
+            }
+            continue;
+        }
+
         in_tracked_files = false;
+        in_tracked_tests = false;
         if (strncmp(line, "root: ", 6) == 0) {
             copy_text(manifest->root, sizeof(manifest->root), line + 6);
         } else if (strncmp(line, "entry: ", 7) == 0) {
@@ -1652,6 +1933,11 @@ static bool load_project_state_manifest(const char* state_path, ProjectStateMani
     if (manifest->tracked_paths.count != manifest->tracked_hashes.count) {
         free_project_state_manifest(manifest);
         fprintf(stderr, "Indexer Error: Corrupt tracked file list in \"%s\".\n", state_path);
+        return false;
+    }
+    if (manifest->tracked_test_paths.count != manifest->tracked_test_hashes.count) {
+        free_project_state_manifest(manifest);
+        fprintf(stderr, "Indexer Error: Corrupt tracked test list in \"%s\".\n", state_path);
         return false;
     }
     return true;
@@ -1731,6 +2017,36 @@ static bool check_project_state_manifest(const char* state_path, const ProjectSt
             } else {
                 if (snprintf(line, sizeof(line), "%s expected=%s actual=%s",
                              manifest->tracked_paths.items[i], manifest->tracked_hashes.items[i],
+                             actual_hash) >= (int)sizeof(line)) {
+                    return false;
+                }
+            }
+            if (!string_list_add_unique(stale_lines, line)) return false;
+        }
+    }
+
+    for (int i = 0; i < manifest->tracked_test_paths.count; i++) {
+        char test_path[MAX_PATH_LEN];
+        if (!resolve_state_path(root_path, manifest->tracked_test_paths.items[i], test_path, sizeof(test_path))) {
+            return false;
+        }
+
+        char actual_hash[65];
+        bool ok = compute_module_hash_hex(test_path, actual_hash);
+        if (ok && strcmp(actual_hash, manifest->tracked_test_hashes.items[i]) == 0) continue;
+
+        (*stale_count)++;
+        if (stale_lines) {
+            char line[2048];
+            if (!ok) {
+                if (snprintf(line, sizeof(line), "%s expected=%s actual=missing",
+                             manifest->tracked_test_paths.items[i], manifest->tracked_test_hashes.items[i]) >=
+                    (int)sizeof(line)) {
+                    return false;
+                }
+            } else {
+                if (snprintf(line, sizeof(line), "%s expected=%s actual=%s",
+                             manifest->tracked_test_paths.items[i], manifest->tracked_test_hashes.items[i],
                              actual_hash) >= (int)sizeof(line)) {
                     return false;
                 }
@@ -1832,6 +2148,41 @@ static bool build_stable_ref(const char* prefix, const char* source,
     }
 
     return false;
+}
+
+static bool build_symbol_identity_source(const char* kind, const char* module_path,
+                                         const char* contract, char* out, size_t out_size) {
+    if (!kind || !module_path || !contract || !out || out_size == 0) return false;
+
+    if (strncmp(contract, "var ", 4) == 0) {
+        const char* start = contract + 4;
+        const char* end = strchr(start, ':');
+        size_t len = end ? (size_t)(end - start) : strlen(start);
+        char name[MAX_NAME_LEN];
+        if (len == 0 || len >= sizeof(name)) return false;
+        memcpy(name, start, len);
+        name[len] = '\0';
+        return snprintf(out, out_size, "%s:var:%s::%s", kind, module_path, name) < (int)out_size;
+    }
+
+    if (strncmp(contract, "struct ", 7) == 0) {
+        const char* start = contract + 7;
+        if (strncmp(start, "pub ", 4) == 0) start += 4;
+        const char* end = strchr(start, '(');
+        size_t len = end ? (size_t)(end - start) : strlen(start);
+        char name[MAX_NAME_LEN];
+        if (len == 0 || len >= sizeof(name)) return false;
+        memcpy(name, start, len);
+        name[len] = '\0';
+        return snprintf(out, out_size, "%s:struct:%s::%s", kind, module_path, name) < (int)out_size;
+    }
+
+    CompactSymbolRow row;
+    if (!parse_compact_symbol_row(kind, contract, &row)) return false;
+    bool ok = row.parsed &&
+              snprintf(out, out_size, "%s:fn:%s::%s/%d", kind, module_path, row.name, row.arity) < (int)out_size;
+    free_compact_symbol_row(&row);
+    return ok;
 }
 
 static bool parse_semantic_item_text(const char* text, char* kind, size_t kind_size,
@@ -2010,6 +2361,43 @@ static bool parse_symbol_module_row(const char* line, char* module_ref, size_t m
     return module_ref[0] != '\0' && module_path[0] != '\0';
 }
 
+static bool parse_test_index_row(const char* line, char* path, size_t path_size,
+                                 StringList* covered_symbol_ids) {
+    if (!line || !path || path_size == 0 || !covered_symbol_ids) return false;
+    while (*line == ' ' || *line == '\t') line++;
+    const char* marker = strstr(line, " covers=");
+    if (!marker) return false;
+
+    size_t path_len = (size_t)(marker - line);
+    if (path_len == 0 || path_len >= path_size) return false;
+    memcpy(path, line, path_len);
+    path[path_len] = '\0';
+    return parse_csv_field(marker + 8, covered_symbol_ids);
+}
+
+static bool parse_state_exec_result_row(const char* line, char* path, size_t path_size,
+                                        char* status, size_t status_size) {
+    if (!line || !path || !status || path_size == 0 || status_size == 0) return false;
+    while (*line == ' ' || *line == '\t') line++;
+    const char* test_marker = strstr(line, "|test=");
+    const char* status_marker = strstr(line, "|status=");
+    if (!test_marker || !status_marker || status_marker <= test_marker + 6) return false;
+
+    const char* path_start = test_marker + 6;
+    size_t path_len = (size_t)(status_marker - path_start);
+    if (path_len == 0 || path_len >= path_size) return false;
+    memcpy(path, path_start, path_len);
+    path[path_len] = '\0';
+
+    const char* status_start = status_marker + 8;
+    const char* status_end = strchr(status_start, '|');
+    size_t status_len = status_end ? (size_t)(status_end - status_start) : strlen(status_start);
+    if (status_len == 0 || status_len >= status_size) return false;
+    memcpy(status, status_start, status_len);
+    status[status_len] = '\0';
+    return true;
+}
+
 static bool parse_stale_line_path(const char* line, char* path, size_t path_size) {
     if (!line || !path || path_size == 0) return false;
     const char* marker = strstr(line, " expected=");
@@ -2102,14 +2490,15 @@ static bool emit_stale_module_section(FILE* out, const StringList* module_refs,
     return true;
 }
 
-static bool emit_stale_symbol_section(const char* state_path, FILE* out, const StringList* module_refs) {
-    if (!state_path || !out || !module_refs) return false;
+static bool collect_stale_symbol_ids(const char* state_path, const StringList* module_refs,
+                                     StringList* symbol_ids) {
+    if (!state_path || !module_refs || !symbol_ids) return false;
+    memset(symbol_ids, 0, sizeof(*symbol_ids));
     if (module_refs->count == 0) return true;
 
     FILE* file = fopen(state_path, "r");
     if (!file) return false;
 
-    fprintf(out, "stale_symbols:\n");
     char line[8192];
     bool in_index = false;
     bool ok = true;
@@ -2136,17 +2525,1972 @@ static bool emit_stale_symbol_section(const char* state_path, FILE* out, const S
             break;
         }
         if (string_list_index_of(module_refs, module_ref) == -1) continue;
-        fprintf(out, "  %s\n", symbol_id);
+        if (!string_list_add_unique(symbol_ids, symbol_id)) {
+            ok = false;
+            break;
+        }
     }
 
     fclose(file);
-    return ok && in_index;
+    if (!ok || !in_index) {
+        free_string_list(symbol_ids);
+        return false;
+    }
+    return true;
+}
+
+static bool emit_string_list_section(FILE* out, const char* header, const StringList* items) {
+    if (!out || !header || !items) return false;
+    if (items->count == 0) return true;
+
+    fprintf(out, "%s\n", header);
+    for (int i = 0; i < items->count; i++) {
+        fprintf(out, "  %s\n", items->items[i]);
+    }
+    return true;
+}
+
+static bool emit_stale_symbol_section(const char* state_path, FILE* out, const StringList* module_refs) {
+    if (!state_path || !out || !module_refs) return false;
+    if (module_refs->count == 0) return true;
+
+    StringList symbol_ids;
+    if (!collect_stale_symbol_ids(state_path, module_refs, &symbol_ids)) return false;
+    fprintf(out, "stale_symbols:\n");
+    for (int i = 0; i < symbol_ids.count; i++) {
+        fprintf(out, "  %s\n", symbol_ids.items[i]);
+    }
+    free_string_list(&symbol_ids);
+    return true;
 }
 
 static bool module_ref_selected(const char* module_ref, const StringList* module_refs) {
     if (!module_ref) return false;
     if (!module_refs || module_refs->count == 0) return true;
     return string_list_index_of(module_refs, module_ref) != -1;
+}
+
+static int state_symbol_rows_index_of(const StateSymbolRowList* rows, const char* symbol_id) {
+    if (!rows || !symbol_id) return -1;
+    for (int i = 0; i < rows->count; i++) {
+        if (strcmp(rows->items[i].symbol_id, symbol_id) == 0) return i;
+    }
+    return -1;
+}
+
+static bool state_symbol_row_equals(const StateSymbolRow* lhs, const StateSymbolRow* rhs) {
+    if (!lhs || !rhs) return false;
+    return strcmp(lhs->symbol_id, rhs->symbol_id) == 0 &&
+           strcmp(lhs->module_ref, rhs->module_ref) == 0 &&
+           strcmp(lhs->kind, rhs->kind) == 0 &&
+           strcmp(lhs->contract, rhs->contract) == 0;
+}
+
+static bool state_symbol_row_diff_equals(const StateSymbolRow* lhs, const StateSymbolRow* rhs) {
+    if (!lhs || !rhs) return false;
+    return strcmp(lhs->kind, rhs->kind) == 0 &&
+           strcmp(lhs->contract, rhs->contract) == 0;
+}
+
+static bool load_state_symbol_rows_filtered(const char* state_path, const StringList* module_refs,
+                                            StateSymbolRowList* rows) {
+    if (!state_path || !rows) return false;
+    memset(rows, 0, sizeof(*rows));
+
+    FILE* file = fopen(state_path, "r");
+    if (!file) return false;
+
+    char line[8192];
+    bool in_index = false;
+    bool ok = true;
+    while (fgets(line, sizeof(line), file)) {
+        size_t n = strlen(line);
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+
+        if (!in_index) {
+            if (strcmp(line, "symbol_index:") == 0) in_index = true;
+            continue;
+        }
+        if (strcmp(line, "summary_items:") == 0) break;
+        if (line[0] == '\0') continue;
+
+        char symbol_id[32];
+        char module_ref[32];
+        char kind[16];
+        char contract[4608];
+        if (!parse_symbol_index_row(line, symbol_id, sizeof(symbol_id),
+                                    module_ref, sizeof(module_ref),
+                                    kind, sizeof(kind),
+                                    contract, sizeof(contract))) {
+            ok = false;
+            break;
+        }
+        if (!module_ref_selected(module_ref, module_refs)) continue;
+        if (!state_symbol_rows_add(rows, symbol_id, module_ref, kind, contract)) {
+            ok = false;
+            break;
+        }
+    }
+
+    fclose(file);
+    if (!ok || !in_index) {
+        free_state_symbol_rows(rows);
+        return false;
+    }
+    return true;
+}
+
+static bool load_state_semantic_items(const char* state_path, SemanticItemList* items) {
+    if (!state_path || !items) return false;
+    memset(items, 0, sizeof(*items));
+
+    FILE* file = fopen(state_path, "r");
+    if (!file) return false;
+
+    char line[8192];
+    bool in_items = false;
+    bool ok = true;
+    while (fgets(line, sizeof(line), file)) {
+        size_t n = strlen(line);
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+
+        if (!in_items) {
+            if (strcmp(line, "summary_items:") == 0) in_items = true;
+            continue;
+        }
+        if (strcmp(line, "tracked_tests:") == 0 || strcmp(line, "context:") == 0) break;
+        if (strncmp(line, "  ", 2) != 0 || line[2] == '\0') continue;
+        char kind[16];
+        char module_path[MAX_PATH_LEN];
+        char contract[4608];
+        char key[4700];
+        if (!parse_semantic_item_text(line + 2, kind, sizeof(kind),
+                                      module_path, sizeof(module_path),
+                                      contract, sizeof(contract))) {
+            ok = false;
+            break;
+        }
+        const char* item_type = strncmp(contract, "var ", 4) == 0 ? "var"
+                                : (strncmp(contract, "struct ", 7) == 0 ? "struct" : "fn");
+        if (snprintf(key, sizeof(key), "%s:%s:%s", kind, item_type, contract) >= (int)sizeof(key) ||
+            !semantic_items_add(items, key, line + 2)) {
+            ok = false;
+            break;
+        }
+    }
+
+    fclose(file);
+    if (!ok || !in_items) {
+        free_semantic_items(items);
+        return false;
+    }
+    return true;
+}
+
+static bool load_state_proof_summary(const char* state_path, StateProofSummary* summary) {
+    if (!state_path || !summary) return false;
+    memset(summary, 0, sizeof(*summary));
+
+    char proof_path[MAX_PATH_LEN];
+    if (!build_state_proof_path(state_path, proof_path, sizeof(proof_path))) return false;
+
+    FILE* file = fopen(proof_path, "r");
+    if (!file) return true;
+    summary->present = true;
+
+    char line[8192];
+    if (!fgets(line, sizeof(line), file)) {
+        fclose(file);
+        return false;
+    }
+    size_t n = strlen(line);
+    while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+    if (strcmp(line, "PSTATEEXECv1") != 0 && strcmp(line, "PSTATEEXECv2") != 0) {
+        fclose(file);
+        return false;
+    }
+
+    bool in_results = false;
+    bool ok = true;
+    while (fgets(line, sizeof(line), file)) {
+        n = strlen(line);
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+
+        if (strcmp(line, "results:") == 0) {
+            in_results = true;
+            continue;
+        }
+        if (in_results && strncmp(line, "  ", 2) == 0) {
+            char test_path[MAX_PATH_LEN];
+            char status[16];
+            char entry[MAX_PATH_LEN + 32];
+            if (!parse_state_exec_result_row(line, test_path, sizeof(test_path),
+                                             status, sizeof(status)) ||
+                snprintf(entry, sizeof(entry), "%s status=%s", test_path, status) >= (int)sizeof(entry) ||
+                !string_list_append(&summary->executed_tests, entry)) {
+                ok = false;
+                break;
+            }
+            continue;
+        }
+        in_results = false;
+
+        if (strncmp(line, "focus: ", 7) == 0) {
+            if (strcmp(line + 7, "-") != 0) copy_text(summary->focus, sizeof(summary->focus), line + 7);
+        } else if (strncmp(line, "impact: ", 8) == 0) {
+            summary->include_impact = strcmp(line + 8, "yes") == 0;
+        } else if (strncmp(line, "semantic_fingerprint: ", 22) == 0) {
+            copy_text(summary->semantic_fingerprint, sizeof(summary->semantic_fingerprint), line + 22);
+        } else if (strncmp(line, "tests_planned: ", 15) == 0) {
+            summary->tests_planned = atoi(line + 15);
+        } else if (strncmp(line, "tests_failed: ", 14) == 0) {
+            summary->tests_failed = atoi(line + 14);
+        }
+    }
+
+    fclose(file);
+    if (!ok) {
+        free_state_proof_summary(summary);
+        return false;
+    }
+    return true;
+}
+
+static bool parse_proof_executed_test_path(const char* entry, char* path, size_t path_size) {
+    if (!entry || !path || path_size == 0) return false;
+    const char* marker = strstr(entry, " status=");
+    size_t len = marker ? (size_t)(marker - entry) : strlen(entry);
+    if (len == 0 || len >= path_size) return false;
+    memcpy(path, entry, len);
+    path[len] = '\0';
+    return true;
+}
+
+static bool collect_state_verification_stale_tests(const char* state_path,
+                                                   const ProjectStateManifest* manifest,
+                                                   const StateProofSummary* summary,
+                                                   const StringList* stale_lines,
+                                                   const StringList* stale_symbol_ids,
+                                                   StringList* out_tests) {
+    if (!state_path || !manifest || !summary || !out_tests) return false;
+    memset(out_tests, 0, sizeof(*out_tests));
+
+    StringList executed_paths;
+    memset(&executed_paths, 0, sizeof(executed_paths));
+    for (int i = 0; i < summary->executed_tests.count; i++) {
+        char test_path[MAX_PATH_LEN];
+        if (!parse_proof_executed_test_path(summary->executed_tests.items[i],
+                                            test_path, sizeof(test_path)) ||
+            !string_list_add_unique(&executed_paths, test_path)) {
+            free_string_list(&executed_paths);
+            free_string_list(out_tests);
+            return false;
+        }
+    }
+
+    if (stale_lines) {
+        for (int i = 0; i < stale_lines->count; i++) {
+            char stale_path[MAX_PATH_LEN];
+            if (!parse_stale_line_path(stale_lines->items[i], stale_path, sizeof(stale_path))) {
+                free_string_list(&executed_paths);
+                free_string_list(out_tests);
+                return false;
+            }
+            if (string_list_index_of(&manifest->tracked_test_paths, stale_path) == -1 ||
+                string_list_index_of(&executed_paths, stale_path) == -1) {
+                continue;
+            }
+            if (!string_list_add_unique(out_tests, stale_path)) {
+                free_string_list(&executed_paths);
+                free_string_list(out_tests);
+                return false;
+            }
+        }
+    }
+
+    if (stale_symbol_ids && stale_symbol_ids->count > 0 && summary->executed_tests.count > 0) {
+        FILE* file = fopen(state_path, "r");
+        if (!file) {
+            free_string_list(&executed_paths);
+            free_string_list(out_tests);
+            return false;
+        }
+
+        char line[8192];
+        bool in_tests = false;
+        bool ok = true;
+        while (fgets(line, sizeof(line), file)) {
+            size_t n = strlen(line);
+            while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+
+            if (!in_tests) {
+                if (strcmp(line, "test_index:") == 0) in_tests = true;
+                continue;
+            }
+            if (strcmp(line, "context:") == 0) break;
+            if (line[0] == '\0') continue;
+
+            char path[MAX_PATH_LEN];
+            StringList covered_ids;
+            memset(&covered_ids, 0, sizeof(covered_ids));
+            if (!parse_test_index_row(line, path, sizeof(path), &covered_ids)) {
+                free_string_list(&covered_ids);
+                ok = false;
+                break;
+            }
+            if (string_list_index_of(&executed_paths, path) == -1) {
+                free_string_list(&covered_ids);
+                continue;
+            }
+
+            bool covered_stale = false;
+            for (int i = 0; i < covered_ids.count; i++) {
+                if (string_list_index_of(stale_symbol_ids, covered_ids.items[i]) != -1) {
+                    covered_stale = true;
+                    break;
+                }
+            }
+            free_string_list(&covered_ids);
+            if (!covered_stale) continue;
+            if (!string_list_add_unique(out_tests, path)) {
+                ok = false;
+                break;
+            }
+        }
+        fclose(file);
+        if (!ok || !in_tests) {
+            free_string_list(&executed_paths);
+            free_string_list(out_tests);
+            return false;
+        }
+    }
+
+    free_string_list(&executed_paths);
+    return true;
+}
+
+static bool emit_state_verification_stale(const char* state_path,
+                                          const ProjectStateManifest* manifest,
+                                          const StateProofSummary* summary,
+                                          const StringList* stale_lines,
+                                          const StringList* stale_module_refs,
+                                          FILE* out) {
+    if (!state_path || !manifest || !summary || !out) return false;
+    if (!summary->present || !summary->matches_state || summary->tests_planned == 0 ||
+        !stale_lines || stale_lines->count == 0) {
+        return true;
+    }
+
+    StringList stale_symbol_ids;
+    StringList stale_tests;
+    memset(&stale_symbol_ids, 0, sizeof(stale_symbol_ids));
+    memset(&stale_tests, 0, sizeof(stale_tests));
+
+    bool ok = true;
+    if (stale_module_refs && stale_module_refs->count > 0 &&
+        !collect_stale_symbol_ids(state_path, stale_module_refs, &stale_symbol_ids)) {
+        ok = false;
+    }
+    if (ok && !collect_state_verification_stale_tests(state_path, manifest, summary,
+                                                      stale_lines, &stale_symbol_ids,
+                                                      &stale_tests)) {
+        ok = false;
+    }
+    if (!ok) {
+        free_string_list(&stale_symbol_ids);
+        free_string_list(&stale_tests);
+        return false;
+    }
+    if (stale_symbol_ids.count == 0 && stale_tests.count == 0) {
+        free_string_list(&stale_symbol_ids);
+        free_string_list(&stale_tests);
+        return true;
+    }
+
+    fprintf(out, "verification_stale: yes\n");
+    if (!emit_string_list_section(out, "verification_stale_symbols:", &stale_symbol_ids) ||
+        !emit_string_list_section(out, "verification_stale_tests:", &stale_tests)) {
+        free_string_list(&stale_symbol_ids);
+        free_string_list(&stale_tests);
+        return false;
+    }
+
+    free_string_list(&stale_symbol_ids);
+    free_string_list(&stale_tests);
+    return true;
+}
+
+static bool emit_state_verification_summary(const char* state_path,
+                                            const ProjectStateManifest* manifest,
+                                            const StringList* stale_lines,
+                                            const StringList* stale_module_refs,
+                                            FILE* out) {
+    if (!state_path || !manifest || !out) return false;
+    StateProofSummary summary;
+    if (!load_state_proof_summary(state_path, &summary)) return false;
+    if (!summary.present) {
+        free_state_proof_summary(&summary);
+        return true;
+    }
+
+    summary.matches_state =
+        summary.semantic_fingerprint[0] != '\0' &&
+        strcmp(summary.semantic_fingerprint, manifest->semantic_fingerprint) == 0 &&
+        strcmp(summary.focus, manifest->focus) == 0 &&
+        summary.include_impact == manifest->include_impact;
+
+    fprintf(out, "verified: %s\n", summary.matches_state ? (summary.tests_failed == 0 ? "yes" : "fail") : "mismatch");
+    fprintf(out, "verified_tests: %d\n", summary.tests_planned);
+    fprintf(out, "verified_failed: %d\n", summary.tests_failed);
+    if (summary.matches_state && summary.executed_tests.count > 0) {
+        fprintf(out, "verification:\n");
+        for (int i = 0; i < summary.executed_tests.count; i++) {
+            fprintf(out, "  %d|%s\n", i + 1, summary.executed_tests.items[i]);
+        }
+    }
+    if (!emit_state_verification_stale(state_path, manifest, &summary,
+                                       stale_lines, stale_module_refs, out)) {
+        free_state_proof_summary(&summary);
+        return false;
+    }
+
+    free_state_proof_summary(&summary);
+    return true;
+}
+
+static bool load_state_module_rows_filtered(const char* state_path, const StringList* module_refs,
+                                            StringList* out_refs, StringList* out_paths) {
+    if (!state_path || !out_refs || !out_paths) return false;
+    memset(out_refs, 0, sizeof(*out_refs));
+    memset(out_paths, 0, sizeof(*out_paths));
+
+    FILE* file = fopen(state_path, "r");
+    if (!file) return false;
+
+    char line[4096];
+    bool in_modules = false;
+    bool ok = true;
+    while (fgets(line, sizeof(line), file)) {
+        size_t n = strlen(line);
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+
+        if (!in_modules) {
+            if (strcmp(line, "symbol_modules:") == 0) in_modules = true;
+            continue;
+        }
+        if (strcmp(line, "symbol_index:") == 0) break;
+        if (line[0] == '\0') continue;
+
+        char module_ref[32];
+        char module_path[MAX_PATH_LEN];
+        if (!parse_symbol_module_row(line, module_ref, sizeof(module_ref),
+                                     module_path, sizeof(module_path))) {
+            ok = false;
+            break;
+        }
+        if (!module_ref_selected(module_ref, module_refs)) continue;
+        if (!string_list_append(out_refs, module_ref) || !string_list_append(out_paths, module_path)) {
+            ok = false;
+            break;
+        }
+    }
+
+    fclose(file);
+    if (!ok || !in_modules) {
+        free_string_list(out_refs);
+        free_string_list(out_paths);
+        return false;
+    }
+    return true;
+}
+
+static bool state_symbol_row_name(const StateSymbolRow* row, char* out, size_t out_size) {
+    if (!row || !out || out_size == 0) return false;
+    out[0] = '\0';
+
+    if (strncmp(row->contract, "var ", 4) == 0) {
+        const char* start = row->contract + 4;
+        const char* end = strchr(start, ':');
+        size_t len = end ? (size_t)(end - start) : strlen(start);
+        if (len == 0 || len >= out_size) return false;
+        memcpy(out, start, len);
+        out[len] = '\0';
+        return true;
+    }
+
+    if (strncmp(row->contract, "struct ", 7) == 0) {
+        const char* start = row->contract + 7;
+        if (strncmp(start, "pub ", 4) == 0) start += 4;
+        const char* end = strchr(start, '(');
+        size_t len = end ? (size_t)(end - start) : strlen(start);
+        if (len == 0 || len >= out_size) return false;
+        memcpy(out, start, len);
+        out[len] = '\0';
+        return true;
+    }
+
+    CompactSymbolRow parsed;
+    if (!parse_compact_symbol_row(row->kind[0] == 'T' ? "target" : "caller", row->contract, &parsed)) {
+        return false;
+    }
+    copy_text(out, out_size, parsed.name);
+    free_compact_symbol_row(&parsed);
+    return out[0] != '\0';
+}
+
+static bool state_symbol_row_calls_selected(const StateSymbolRow* row, const StringList* active_names) {
+    if (!row || !active_names || active_names->count == 0) return false;
+
+    CompactSymbolRow parsed;
+    if (!parse_compact_symbol_row(row->kind[0] == 'T' ? "target" : "caller", row->contract, &parsed)) {
+        return false;
+    }
+
+    bool matched = false;
+    for (int i = 0; i < parsed.calls.count && !matched; i++) {
+        char call_name[MAX_NAME_LEN];
+        copy_text(call_name, sizeof(call_name), parsed.calls.items[i]);
+        char* slash = strchr(call_name, '/');
+        if (slash) *slash = '\0';
+        char* dot = strrchr(call_name, '.');
+        const char* base = dot ? dot + 1 : call_name;
+        for (int j = 0; j < active_names->count; j++) {
+            if (strcmp(base, active_names->items[j]) == 0) {
+                matched = true;
+                break;
+            }
+        }
+    }
+
+    free_compact_symbol_row(&parsed);
+    return matched;
+}
+
+static bool state_symbol_row_has_effect(const StateSymbolRow* row, const char* effect_name) {
+    if (!row || !effect_name || effect_name[0] == '\0') return false;
+
+    CompactSymbolRow parsed;
+    if (!parse_compact_symbol_row(row->kind[0] == 'T' ? "target" : "caller", row->contract, &parsed)) {
+        return false;
+    }
+
+    bool matched = false;
+    for (int i = 0; i < parsed.declared_effects.count && !matched; i++) {
+        matched = strcmp(parsed.declared_effects.items[i], effect_name) == 0;
+    }
+    for (int i = 0; i < parsed.inferred_effects.count && !matched; i++) {
+        matched = strcmp(parsed.inferred_effects.items[i], effect_name) == 0;
+    }
+
+    free_compact_symbol_row(&parsed);
+    return matched;
+}
+
+static bool state_symbol_row_calls_filter(const StateSymbolRow* row, const char* call_filter) {
+    if (!row || !call_filter || call_filter[0] == '\0') return false;
+
+    CompactSymbolRow parsed;
+    if (!parse_compact_symbol_row(row->kind[0] == 'T' ? "target" : "caller", row->contract, &parsed)) {
+        return false;
+    }
+
+    bool matched = false;
+    for (int i = 0; i < parsed.calls.count && !matched; i++) {
+        char call_name[MAX_NAME_LEN * 2];
+        copy_text(call_name, sizeof(call_name), parsed.calls.items[i]);
+        char* slash = strchr(call_name, '/');
+        if (slash) *slash = '\0';
+        if (strcmp(call_name, call_filter) == 0) {
+            matched = true;
+            break;
+        }
+        char* dot = strrchr(call_name, '.');
+        if (dot && strcmp(dot + 1, call_filter) == 0) {
+            matched = true;
+        }
+    }
+
+    free_compact_symbol_row(&parsed);
+    return matched;
+}
+
+static bool state_symbol_row_matches_query(const StateSymbolRow* row,
+                                           const char* name_filter,
+                                           const char* effect_filter,
+                                           const char* call_filter) {
+    if (!row) return false;
+
+    char row_name[MAX_NAME_LEN];
+    bool match = true;
+    if (name_filter && name_filter[0] != '\0') {
+        row_name[0] = '\0';
+        match = strcmp(row->symbol_id, name_filter) == 0;
+        if (!match && state_symbol_row_name(row, row_name, sizeof(row_name))) {
+            match = strcmp(row_name, name_filter) == 0;
+        }
+    }
+    if (match && effect_filter && effect_filter[0] != '\0') {
+        match = state_symbol_row_has_effect(row, effect_filter);
+    }
+    if (match && call_filter && call_filter[0] != '\0') {
+        match = state_symbol_row_calls_filter(row, call_filter);
+    }
+    return match;
+}
+
+static bool state_symbol_row_collect_call_basenames(const StateSymbolRow* row, StringList* out) {
+    if (!row || !out) return false;
+
+    CompactSymbolRow parsed;
+    if (!parse_compact_symbol_row(row->kind[0] == 'T' ? "target" : "caller", row->contract, &parsed)) {
+        return false;
+    }
+
+    for (int i = 0; i < parsed.calls.count; i++) {
+        char call_name[MAX_NAME_LEN * 2];
+        copy_text(call_name, sizeof(call_name), parsed.calls.items[i]);
+        char* slash = strchr(call_name, '/');
+        if (slash) *slash = '\0';
+        char* dot = strrchr(call_name, '.');
+        const char* base = dot ? dot + 1 : call_name;
+        if (!string_list_add_unique(out, base)) {
+            free_compact_symbol_row(&parsed);
+            return false;
+        }
+    }
+
+    free_compact_symbol_row(&parsed);
+    return true;
+}
+
+static bool select_query_symbol_rows(const StateSymbolRowList* all_rows,
+                                     const char* name_filter, const char* effect_filter,
+                                     const char* call_filter, bool include_impact,
+                                     bool include_dependencies, StateSymbolRowList* selected_rows,
+                                     int* seed_count_out) {
+    if (!all_rows || !selected_rows) return false;
+    memset(selected_rows, 0, sizeof(*selected_rows));
+    if (seed_count_out) *seed_count_out = 0;
+
+    unsigned char* selected = NULL;
+    if (all_rows->count > 0) {
+        selected = (unsigned char*)calloc((size_t)all_rows->count, sizeof(unsigned char));
+        if (!selected) return false;
+    }
+
+    for (int i = 0; i < all_rows->count; i++) {
+        if (!state_symbol_row_matches_query(&all_rows->items[i], name_filter, effect_filter, call_filter)) {
+            continue;
+        }
+
+        selected[i] = 1;
+        if (seed_count_out) (*seed_count_out)++;
+    }
+
+    if (include_impact || include_dependencies) {
+        bool changed = true;
+        while (changed) {
+            StringList selected_names;
+            StringList dependency_names;
+            memset(&selected_names, 0, sizeof(selected_names));
+            memset(&dependency_names, 0, sizeof(dependency_names));
+            changed = false;
+
+            for (int i = 0; i < all_rows->count; i++) {
+                char row_name[MAX_NAME_LEN];
+                if (!selected[i]) continue;
+                if (state_symbol_row_name(&all_rows->items[i], row_name, sizeof(row_name)) &&
+                    !string_list_add_unique(&selected_names, row_name)) {
+                    free(selected);
+                    free_string_list(&selected_names);
+                    free_string_list(&dependency_names);
+                    return false;
+                }
+                if (include_dependencies &&
+                    !state_symbol_row_collect_call_basenames(&all_rows->items[i], &dependency_names)) {
+                    free(selected);
+                    free_string_list(&selected_names);
+                    free_string_list(&dependency_names);
+                    return false;
+                }
+            }
+
+            for (int i = 0; i < all_rows->count; i++) {
+                char row_name[MAX_NAME_LEN];
+                if (selected[i]) continue;
+                if (include_impact &&
+                    state_symbol_row_calls_selected(&all_rows->items[i], &selected_names)) {
+                    selected[i] = 1;
+                    changed = true;
+                    continue;
+                }
+                if (include_dependencies &&
+                    state_symbol_row_name(&all_rows->items[i], row_name, sizeof(row_name)) &&
+                    string_list_index_of(&dependency_names, row_name) != -1) {
+                    selected[i] = 1;
+                    changed = true;
+                }
+            }
+
+            free_string_list(&selected_names);
+            free_string_list(&dependency_names);
+        }
+    }
+
+    for (int i = 0; i < all_rows->count; i++) {
+        if (!selected[i]) continue;
+        if (!state_symbol_rows_add(selected_rows, all_rows->items[i].symbol_id,
+                                   all_rows->items[i].module_ref, all_rows->items[i].kind,
+                                   all_rows->items[i].contract)) {
+            free(selected);
+            free_state_symbol_rows(selected_rows);
+            return false;
+        }
+    }
+
+    free(selected);
+    return true;
+}
+
+static bool build_query_graph_nodes(const StateSymbolRowList* rows, QueryGraphNode** out_nodes) {
+    if (!rows || !out_nodes) return false;
+    *out_nodes = NULL;
+    if (rows->count == 0) return true;
+
+    QueryGraphNode* nodes = (QueryGraphNode*)calloc((size_t)rows->count, sizeof(QueryGraphNode));
+    if (!nodes) return false;
+
+    for (int i = 0; i < rows->count; i++) {
+        CompactSymbolRow parsed;
+        if (!parse_compact_symbol_row(rows->items[i].kind[0] == 'T' ? "target" : "caller",
+                                      rows->items[i].contract, &parsed)) {
+            free_query_graph_nodes(nodes, rows->count);
+            return false;
+        }
+
+        if (parsed.parsed && parsed.name[0] != '\0') {
+            copy_text(nodes[i].name, sizeof(nodes[i].name), parsed.name);
+        } else if (!state_symbol_row_name(&rows->items[i], nodes[i].name, sizeof(nodes[i].name))) {
+            copy_text(nodes[i].name, sizeof(nodes[i].name), rows->items[i].symbol_id);
+        }
+        nodes[i].is_public = parsed.is_public;
+
+        for (int j = 0; j < parsed.declared_effects.count; j++) {
+            if (!string_list_add_unique(&nodes[i].self_effects, parsed.declared_effects.items[j])) {
+                free_compact_symbol_row(&parsed);
+                free_query_graph_nodes(nodes, rows->count);
+                return false;
+            }
+        }
+        for (int j = 0; j < parsed.inferred_effects.count; j++) {
+            if (!string_list_add_unique(&nodes[i].self_effects, parsed.inferred_effects.items[j])) {
+                free_compact_symbol_row(&parsed);
+                free_query_graph_nodes(nodes, rows->count);
+                return false;
+            }
+        }
+        for (int j = 0; j < parsed.calls.count; j++) {
+            char call_name[MAX_NAME_LEN * 2];
+            copy_text(call_name, sizeof(call_name), parsed.calls.items[j]);
+            char* slash = strchr(call_name, '/');
+            if (slash) *slash = '\0';
+            char* dot = strrchr(call_name, '.');
+            const char* base = dot ? dot + 1 : call_name;
+            if (!string_list_add_unique(&nodes[i].call_basenames, base)) {
+                free_compact_symbol_row(&parsed);
+                free_query_graph_nodes(nodes, rows->count);
+                return false;
+            }
+        }
+
+        free_compact_symbol_row(&parsed);
+    }
+
+    *out_nodes = nodes;
+    return true;
+}
+
+static bool query_graph_node_calls_name(const QueryGraphNode* node, const char* name) {
+    return node && name && name[0] != '\0' &&
+           string_list_index_of(&node->call_basenames, name) != -1;
+}
+
+static bool build_query_trace(const StateSymbolRowList* rows,
+                              const char* name_filter, const char* effect_filter,
+                              const char* call_filter, bool include_impact,
+                              bool include_dependencies, int** parents_out,
+                              char** reasons_out, int** queue_out) {
+    if (!rows || !parents_out || !reasons_out || !queue_out) return false;
+    *parents_out = NULL;
+    *reasons_out = NULL;
+    *queue_out = NULL;
+    if (rows->count < 0) return false;
+    if (rows->count == 0) return true;
+
+    QueryGraphNode* nodes = NULL;
+    int* parents = NULL;
+    int* queue = NULL;
+    char* reasons = NULL;
+    size_t row_count = (size_t)rows->count;
+
+    if (!build_query_graph_nodes(rows, &nodes)) return false;
+
+    parents = (int*)malloc(row_count * sizeof(int));
+    queue = (int*)malloc(row_count * sizeof(int));
+    reasons = (char*)malloc(row_count * sizeof(char));
+    if (!parents || !queue || !reasons) {
+        free(parents);
+        free(queue);
+        free(reasons);
+        free_query_graph_nodes(nodes, rows->count);
+        return false;
+    }
+
+    for (int i = 0; i < rows->count; i++) {
+        parents[i] = -2;
+        reasons[i] = '-';
+    }
+
+    int head = 0;
+    int tail = 0;
+    for (int i = 0; i < rows->count; i++) {
+        if (!state_symbol_row_matches_query(&rows->items[i], name_filter, effect_filter, call_filter)) {
+            continue;
+        }
+        parents[i] = -1;
+        reasons[i] = 's';
+        queue[tail++] = i;
+    }
+
+    while (head < tail) {
+        int current = queue[head++];
+        for (int i = 0; i < rows->count; i++) {
+            if (parents[i] != -2) continue;
+            if (include_dependencies &&
+                query_graph_node_calls_name(&nodes[current], nodes[i].name)) {
+                parents[i] = current;
+                reasons[i] = 'd';
+                queue[tail++] = i;
+                continue;
+            }
+            if (include_impact &&
+                query_graph_node_calls_name(&nodes[i], nodes[current].name)) {
+                parents[i] = current;
+                reasons[i] = 'i';
+                queue[tail++] = i;
+            }
+        }
+    }
+
+    free_query_graph_nodes(nodes, rows->count);
+    *parents_out = parents;
+    *reasons_out = reasons;
+    *queue_out = queue;
+    return true;
+}
+
+static bool emit_query_seed_explain(FILE* out, const StateSymbolRow* row,
+                                    const char* name_filter, const char* effect_filter,
+                                    const char* call_filter) {
+    if (!out || !row) return false;
+
+    bool first = true;
+    char row_name[MAX_NAME_LEN];
+    row_name[0] = '\0';
+    state_symbol_row_name(row, row_name, sizeof(row_name));
+
+    if (name_filter && name_filter[0] != '\0' &&
+        (strcmp(row->symbol_id, name_filter) == 0 ||
+         (row_name[0] != '\0' && strcmp(row_name, name_filter) == 0))) {
+        fprintf(out, "%sname=%s", first ? "" : ",", name_filter);
+        first = false;
+    }
+    if (effect_filter && effect_filter[0] != '\0' &&
+        state_symbol_row_has_effect(row, effect_filter)) {
+        fprintf(out, "%seffect=%s", first ? "" : ",", effect_filter);
+        first = false;
+    }
+    if (call_filter && call_filter[0] != '\0' &&
+        state_symbol_row_calls_filter(row, call_filter)) {
+        fprintf(out, "%scall=%s", first ? "" : ",", call_filter);
+        first = false;
+    }
+    if (first) fprintf(out, "direct");
+    return true;
+}
+
+static void emit_query_path_chain(FILE* out, const StateSymbolRowList* rows,
+                                  const int* parents, int* scratch, int index) {
+    int stack_len = 0;
+    int cursor = index;
+    while (cursor >= 0 && stack_len < rows->count) {
+        scratch[stack_len++] = cursor;
+        cursor = parents[cursor];
+    }
+    for (int j = stack_len - 1; j >= 0; j--) {
+        fprintf(out, "%s%s", j == stack_len - 1 ? "" : "->", rows->items[scratch[j]].symbol_id);
+    }
+}
+
+static bool emit_query_paths_and_explain(FILE* out, const StateSymbolRowList* rows,
+                                         const char* name_filter, const char* effect_filter,
+                                         const char* call_filter, bool include_impact,
+                                         bool include_dependencies) {
+    if (!out || !rows) return false;
+
+    int* parents = NULL;
+    int* queue = NULL;
+    char* reasons = NULL;
+    if (!build_query_trace(rows, name_filter, effect_filter, call_filter,
+                           include_impact, include_dependencies,
+                           &parents, &reasons, &queue)) {
+        return false;
+    }
+
+    fprintf(out, "paths:\n");
+    for (int i = 0; i < rows->count; i++) {
+        fprintf(out, "  %s=", rows->items[i].symbol_id);
+        if (!parents || parents[i] == -2 || parents[i] == -1) {
+            fprintf(out, "seed\n");
+            continue;
+        }
+        emit_query_path_chain(out, rows, parents, queue, i);
+        fprintf(out, "\n");
+    }
+
+    fprintf(out, "explain:\n");
+    for (int i = 0; i < rows->count; i++) {
+        fprintf(out, "  %s=", rows->items[i].symbol_id);
+        if (!parents || parents[i] == -2 || reasons[i] == 's') {
+            fprintf(out, "seed(");
+            emit_query_seed_explain(out, &rows->items[i], name_filter, effect_filter, call_filter);
+            fprintf(out, ")\n");
+            continue;
+        }
+
+        int depth = 0;
+        int root = i;
+        while (parents[root] >= 0) {
+            depth++;
+            root = parents[root];
+        }
+        fprintf(out, "%s(from=%s,depth=%d",
+                reasons[i] == 'd' ? "deps" : "impact",
+                rows->items[root].symbol_id, depth);
+        if (effect_filter && effect_filter[0] != '\0') {
+            fprintf(out, ",effect=%s", effect_filter);
+        }
+        fprintf(out, ")\n");
+    }
+
+    free(parents);
+    free(queue);
+    free(reasons);
+    return true;
+}
+
+static int compute_query_blast_radius(const QueryGraphNode* nodes, int node_count, int start,
+                                      unsigned char* visited, int* queue) {
+    if (!nodes || node_count <= 0 || start < 0 || start >= node_count || !visited || !queue) return 0;
+
+    memset(visited, 0, (size_t)node_count);
+    int head = 0;
+    int tail = 0;
+    int radius = 0;
+    visited[start] = 1;
+    queue[tail++] = start;
+
+    while (head < tail) {
+        int current = queue[head++];
+        for (int i = 0; i < node_count; i++) {
+            if (visited[i]) continue;
+            if (!query_graph_node_calls_name(&nodes[i], nodes[current].name)) continue;
+            visited[i] = 1;
+            queue[tail++] = i;
+            radius++;
+        }
+    }
+
+    return radius;
+}
+
+static int collect_query_dependency_effects(const QueryGraphNode* nodes, int node_count, int start,
+                                            unsigned char* visited, int* queue, StringList* effects_out) {
+    if (!nodes || node_count <= 0 || start < 0 || start >= node_count ||
+        !visited || !queue || !effects_out) {
+        return 0;
+    }
+
+    memset(visited, 0, (size_t)node_count);
+    int head = 0;
+    int tail = 0;
+    visited[start] = 1;
+    queue[tail++] = start;
+
+    while (head < tail) {
+        int current = queue[head++];
+        for (int i = 0; i < nodes[current].self_effects.count; i++) {
+            if (!string_list_add_unique(effects_out, nodes[current].self_effects.items[i])) {
+                return -1;
+            }
+        }
+        for (int i = 0; i < node_count; i++) {
+            if (visited[i]) continue;
+            if (!query_graph_node_calls_name(&nodes[current], nodes[i].name)) continue;
+            visited[i] = 1;
+            queue[tail++] = i;
+        }
+    }
+
+    return effects_out->count;
+}
+
+static void emit_string_list_csv(FILE* out, const StringList* list) {
+    if (!out || !list || list->count == 0) {
+        fprintf(out, "-");
+        return;
+    }
+    for (int i = 0; i < list->count; i++) {
+        fprintf(out, "%s%s", i == 0 ? "" : ",", list->items[i]);
+    }
+}
+
+static int compare_query_risk_order(int lhs_score, int rhs_score,
+                                    int lhs_blast, int rhs_blast,
+                                    int lhs_effects, int rhs_effects,
+                                    bool lhs_public, bool rhs_public,
+                                    const char* lhs_symbol, const char* rhs_symbol) {
+    if (lhs_score != rhs_score) return lhs_score > rhs_score ? -1 : 1;
+    if (lhs_blast != rhs_blast) return lhs_blast > rhs_blast ? -1 : 1;
+    if (lhs_effects != rhs_effects) return lhs_effects > rhs_effects ? -1 : 1;
+    if (lhs_public != rhs_public) return lhs_public ? -1 : 1;
+    return strcmp(lhs_symbol, rhs_symbol);
+}
+
+static bool build_query_risk_stats(const StateSymbolRowList* rows, QueryRiskStats* stats) {
+    if (!rows || !stats) return false;
+    memset(stats, 0, sizeof(*stats));
+    stats->count = rows->count;
+    if (rows->count <= 0) return true;
+
+    stats->nodes = NULL;
+    if (!build_query_graph_nodes(rows, &stats->nodes)) return false;
+
+    unsigned char* visited = (unsigned char*)malloc((size_t)rows->count);
+    int* queue = (int*)malloc((size_t)rows->count * sizeof(int));
+    stats->scores = (int*)malloc((size_t)rows->count * sizeof(int));
+    stats->blast = (int*)malloc((size_t)rows->count * sizeof(int));
+    stats->dep_effect_counts = (int*)malloc((size_t)rows->count * sizeof(int));
+    stats->dep_effects = (StringList*)calloc((size_t)rows->count, sizeof(StringList));
+    if (!visited || !queue || !stats->scores || !stats->blast ||
+        !stats->dep_effect_counts || !stats->dep_effects) {
+        free(visited);
+        free(queue);
+        free_query_risk_stats(stats);
+        return false;
+    }
+
+    bool ok = true;
+    for (int i = 0; i < rows->count; i++) {
+        stats->blast[i] = compute_query_blast_radius(stats->nodes, rows->count, i, visited, queue);
+        stats->dep_effect_counts[i] = collect_query_dependency_effects(stats->nodes, rows->count, i,
+                                                                       visited, queue,
+                                                                       &stats->dep_effects[i]);
+        if (stats->dep_effect_counts[i] < 0) {
+            ok = false;
+            break;
+        }
+        stats->scores[i] = stats->blast[i] * 10 + stats->dep_effect_counts[i] * 6 +
+                           (stats->nodes[i].is_public ? 2 : 0) +
+                           (rows->items[i].kind[0] == 'T' ? 1 : 0);
+    }
+
+    free(visited);
+    free(queue);
+    if (!ok) {
+        free_query_risk_stats(stats);
+        return false;
+    }
+    return true;
+}
+
+static bool sort_query_risk_order(const StateSymbolRowList* rows, const QueryRiskStats* stats,
+                                  int* order) {
+    if (!rows || !stats || !order) return false;
+    for (int i = 0; i < rows->count; i++) order[i] = i;
+    for (int i = 0; i < rows->count - 1; i++) {
+        for (int j = i + 1; j < rows->count; j++) {
+            int lhs = order[i];
+            int rhs = order[j];
+            if (compare_query_risk_order(stats->scores[lhs], stats->scores[rhs],
+                                         stats->blast[lhs], stats->blast[rhs],
+                                         stats->dep_effect_counts[lhs], stats->dep_effect_counts[rhs],
+                                         stats->nodes[lhs].is_public, stats->nodes[rhs].is_public,
+                                         rows->items[lhs].symbol_id, rows->items[rhs].symbol_id) > 0) {
+                int tmp = order[i];
+                order[i] = order[j];
+                order[j] = tmp;
+            }
+        }
+    }
+    return true;
+}
+
+static bool emit_query_risk_top(FILE* out, const StateSymbolRowList* rows) {
+    if (!out || !rows) return false;
+    fprintf(out, "risk_top:\n");
+    if (rows->count <= 0) return true;
+
+    QueryRiskStats stats;
+    if (!build_query_risk_stats(rows, &stats)) return false;
+
+    int* order = (int*)malloc((size_t)rows->count * sizeof(int));
+    if (!order) {
+        free_query_risk_stats(&stats);
+        return false;
+    }
+
+    bool ok = sort_query_risk_order(rows, &stats, order);
+    if (ok) {
+        int limit = rows->count < 5 ? rows->count : 5;
+        for (int rank = 0; rank < limit; rank++) {
+            int idx = order[rank];
+            fprintf(out, "  %d|%s|name=%s|score=%d|blast=%d|depfx=",
+                    rank + 1, rows->items[idx].symbol_id, stats.nodes[idx].name,
+                    stats.scores[idx], stats.blast[idx]);
+            emit_string_list_csv(out, &stats.dep_effects[idx]);
+            fprintf(out, "|pub=%d\n", stats.nodes[idx].is_public ? 1 : 0);
+        }
+    }
+
+    free(order);
+    free_query_risk_stats(&stats);
+    return ok;
+}
+
+static void emit_change_plan_checks(FILE* out, const char* status, int dep_effect_count, int blast) {
+    bool first = true;
+    if (!out) return;
+
+    if (status && strcmp(status, "changed") == 0) {
+        fprintf(out, "contract");
+        first = false;
+    } else if (status && strcmp(status, "added") == 0) {
+        fprintf(out, "new_surface");
+        first = false;
+    } else if (status && strcmp(status, "removed") == 0) {
+        fprintf(out, "deleted_surface");
+        first = false;
+    }
+    if (dep_effect_count > 0) {
+        fprintf(out, "%seffects", first ? "" : ",");
+        first = false;
+    }
+    if (blast > 0) {
+        fprintf(out, "%scallers", first ? "" : ",");
+        first = false;
+    }
+    if (first) fprintf(out, "review");
+}
+
+static bool emit_semantic_change_plan(FILE* out, const StateSymbolRowList* before_rows,
+                                      const StateSymbolRowList* after_rows) {
+    if (!out || !before_rows || !after_rows) return false;
+
+    QueryRiskStats before_stats;
+    QueryRiskStats after_stats;
+    memset(&before_stats, 0, sizeof(before_stats));
+    memset(&after_stats, 0, sizeof(after_stats));
+    if (!build_query_risk_stats(before_rows, &before_stats) ||
+        !build_query_risk_stats(after_rows, &after_stats)) {
+        free_query_risk_stats(&before_stats);
+        free_query_risk_stats(&after_stats);
+        return false;
+    }
+
+    StringList identities;
+    memset(&identities, 0, sizeof(identities));
+    bool ok = true;
+    for (int i = 0; ok && i < before_rows->count; i++) {
+        char diff_identity[256];
+        ok = state_symbol_row_diff_identity(&before_rows->items[i], diff_identity, sizeof(diff_identity)) &&
+             string_list_add_unique(&identities, diff_identity);
+    }
+    for (int i = 0; ok && i < after_rows->count; i++) {
+        char diff_identity[256];
+        ok = state_symbol_row_diff_identity(&after_rows->items[i], diff_identity, sizeof(diff_identity)) &&
+             string_list_add_unique(&identities, diff_identity);
+    }
+    if (!ok) {
+        free_string_list(&identities);
+        free_query_risk_stats(&before_stats);
+        free_query_risk_stats(&after_stats);
+        return false;
+    }
+
+    SemanticChangePlanItem* plan_items = NULL;
+    int plan_count = 0;
+    if (identities.count > 0) {
+        plan_items = (SemanticChangePlanItem*)calloc((size_t)identities.count, sizeof(SemanticChangePlanItem));
+        if (!plan_items) {
+            free_string_list(&identities);
+            free_query_risk_stats(&before_stats);
+            free_query_risk_stats(&after_stats);
+            return false;
+        }
+    }
+
+    for (int i = 0; i < identities.count; i++) {
+        int before_index = state_symbol_rows_index_of_diff_identity(before_rows, identities.items[i]);
+        int after_index = state_symbol_rows_index_of_diff_identity(after_rows, identities.items[i]);
+        if (before_index != -1 && after_index != -1 &&
+            state_symbol_row_diff_equals(&before_rows->items[before_index], &after_rows->items[after_index])) {
+            continue;
+        }
+
+        SemanticChangePlanItem* item = &plan_items[plan_count++];
+        copy_text(item->diff_identity, sizeof(item->diff_identity), identities.items[i]);
+        item->before_index = before_index;
+        item->after_index = after_index;
+        if (before_index == -1) {
+            copy_text(item->status, sizeof(item->status), "added");
+        } else if (after_index == -1) {
+            copy_text(item->status, sizeof(item->status), "removed");
+        } else {
+            copy_text(item->status, sizeof(item->status), "changed");
+        }
+    }
+
+    for (int i = 0; i < plan_count - 1; i++) {
+        for (int j = i + 1; j < plan_count; j++) {
+            const SemanticChangePlanItem* lhs_item = &plan_items[i];
+            const SemanticChangePlanItem* rhs_item = &plan_items[j];
+            bool lhs_after = lhs_item->after_index != -1;
+            bool rhs_after = rhs_item->after_index != -1;
+            int lhs_index = lhs_after ? lhs_item->after_index : lhs_item->before_index;
+            int rhs_index = rhs_after ? rhs_item->after_index : rhs_item->before_index;
+            const QueryRiskStats* lhs_stats = lhs_after ? &after_stats : &before_stats;
+            const QueryRiskStats* rhs_stats = rhs_after ? &after_stats : &before_stats;
+            const StateSymbolRowList* lhs_rows = lhs_after ? after_rows : before_rows;
+            const StateSymbolRowList* rhs_rows = rhs_after ? after_rows : before_rows;
+
+            if (compare_query_risk_order(lhs_stats->scores[lhs_index], rhs_stats->scores[rhs_index],
+                                         lhs_stats->blast[lhs_index], rhs_stats->blast[rhs_index],
+                                         lhs_stats->dep_effect_counts[lhs_index], rhs_stats->dep_effect_counts[rhs_index],
+                                         lhs_stats->nodes[lhs_index].is_public, rhs_stats->nodes[rhs_index].is_public,
+                                         lhs_rows->items[lhs_index].symbol_id, rhs_rows->items[rhs_index].symbol_id) > 0) {
+                SemanticChangePlanItem tmp = plan_items[i];
+                plan_items[i] = plan_items[j];
+                plan_items[j] = tmp;
+            }
+        }
+    }
+
+    fprintf(out, "change_plan:\n");
+    for (int i = 0; i < plan_count; i++) {
+        bool use_after = plan_items[i].after_index != -1;
+        int row_index = use_after ? plan_items[i].after_index : plan_items[i].before_index;
+        const QueryRiskStats* stats = use_after ? &after_stats : &before_stats;
+        const StateSymbolRowList* rows = use_after ? after_rows : before_rows;
+        const char* kind = rows->items[row_index].kind[0] == 'T' ? "target" : "caller";
+
+        fprintf(out, "  %d|status=%s|kind=%s|name=%s|score=%d|blast=%d|depfx=",
+                i + 1, plan_items[i].status, kind, stats->nodes[row_index].name,
+                stats->scores[row_index], stats->blast[row_index]);
+        emit_string_list_csv(out, &stats->dep_effects[row_index]);
+        fprintf(out, "|checks=");
+        emit_change_plan_checks(out, plan_items[i].status,
+                                stats->dep_effect_counts[row_index], stats->blast[row_index]);
+        fprintf(out, "\n");
+    }
+
+    free(plan_items);
+    free_string_list(&identities);
+    free_query_risk_stats(&before_stats);
+    free_query_risk_stats(&after_stats);
+    return true;
+}
+
+static bool collect_semantic_change_candidates(const SemanticItemList* before_items,
+                                               const SemanticItemList* after_items,
+                                               const StateSymbolRowList* before_rows,
+                                               const StateSymbolRowList* after_rows,
+                                               SemanticChangeCandidate** out_items,
+                                               int* out_count) {
+    if (!before_items || !after_items || !before_rows || !after_rows || !out_items || !out_count) {
+        return false;
+    }
+    *out_items = NULL;
+    *out_count = 0;
+
+    QueryRiskStats before_stats;
+    QueryRiskStats after_stats;
+    memset(&before_stats, 0, sizeof(before_stats));
+    memset(&after_stats, 0, sizeof(after_stats));
+    if (!build_query_risk_stats(before_rows, &before_stats) ||
+        !build_query_risk_stats(after_rows, &after_stats)) {
+        free_query_risk_stats(&before_stats);
+        free_query_risk_stats(&after_stats);
+        return false;
+    }
+
+    StringList identities;
+    memset(&identities, 0, sizeof(identities));
+    bool ok = true;
+    for (int i = 0; ok && i < before_rows->count; i++) {
+        char diff_identity[256];
+        ok = state_symbol_row_diff_identity(&before_rows->items[i], diff_identity, sizeof(diff_identity)) &&
+             string_list_add_unique(&identities, diff_identity);
+    }
+    for (int i = 0; ok && i < after_rows->count; i++) {
+        char diff_identity[256];
+        ok = state_symbol_row_diff_identity(&after_rows->items[i], diff_identity, sizeof(diff_identity)) &&
+             string_list_add_unique(&identities, diff_identity);
+    }
+    if (!ok) {
+        free_string_list(&identities);
+        free_query_risk_stats(&before_stats);
+        free_query_risk_stats(&after_stats);
+        return false;
+    }
+
+    SemanticChangeCandidate* items = NULL;
+    int count = 0;
+    int cap = 0;
+    for (int i = 0; i < identities.count; i++) {
+        int before_index = state_symbol_rows_index_of_diff_identity(before_rows, identities.items[i]);
+        int after_index = state_symbol_rows_index_of_diff_identity(after_rows, identities.items[i]);
+        if (before_index != -1 && after_index != -1 &&
+            state_symbol_row_diff_equals(&before_rows->items[before_index], &after_rows->items[after_index])) {
+            continue;
+        }
+
+        const StateSymbolRowList* rows = after_index != -1 ? after_rows : before_rows;
+        const QueryRiskStats* stats = after_index != -1 ? &after_stats : &before_stats;
+        const SemanticItemList* semantic_items = after_index != -1 ? after_items : before_items;
+        int row_index = after_index != -1 ? after_index : before_index;
+        const char* status = after_index == -1 ? "removed" : (before_index == -1 ? "added" : "changed");
+
+        char contract[4608];
+        char module_path[MAX_PATH_LEN];
+        bool found = false;
+        for (int j = 0; j < semantic_items->count; j++) {
+            char item_kind[16];
+            char item_module[MAX_PATH_LEN];
+            char item_contract[4608];
+            if (!parse_semantic_item_text(semantic_items->items[j].text, item_kind, sizeof(item_kind),
+                                          item_module, sizeof(item_module),
+                                          item_contract, sizeof(item_contract))) {
+                continue;
+            }
+            if (strcmp(item_contract, rows->items[row_index].contract) != 0) continue;
+            copy_text(module_path, sizeof(module_path), item_module);
+            copy_text(contract, sizeof(contract), item_contract);
+            found = true;
+            break;
+        }
+        if (!found) {
+            free(items);
+            free_string_list(&identities);
+            free_query_risk_stats(&before_stats);
+            free_query_risk_stats(&after_stats);
+            return false;
+        }
+
+        if (!ensure_capacity((void**)&items, &cap, count + 1, sizeof(SemanticChangeCandidate))) {
+            free(items);
+            free_string_list(&identities);
+            free_query_risk_stats(&before_stats);
+            free_query_risk_stats(&after_stats);
+            return false;
+        }
+
+        SemanticChangeCandidate* item = &items[count++];
+        memset(item, 0, sizeof(*item));
+        copy_text(item->diff_identity, sizeof(item->diff_identity), identities.items[i]);
+        copy_text(item->module_path, sizeof(item->module_path), module_path);
+        copy_text(item->status, sizeof(item->status), status);
+        copy_text(item->name, sizeof(item->name), stats->nodes[row_index].name);
+        if (!build_module_symbol_identity(module_path, contract,
+                                          item->module_symbol_identity,
+                                          sizeof(item->module_symbol_identity))) {
+            free(items);
+            free_string_list(&identities);
+            free_query_risk_stats(&before_stats);
+            free_query_risk_stats(&after_stats);
+            return false;
+        }
+        item->score = stats->scores[row_index];
+        item->blast = stats->blast[row_index];
+        item->dep_effect_count = stats->dep_effect_counts[row_index];
+    }
+
+    free_string_list(&identities);
+    free_query_risk_stats(&before_stats);
+    free_query_risk_stats(&after_stats);
+    *out_items = items;
+    *out_count = count;
+    return true;
+}
+
+static void emit_test_plan_checks(FILE* out, bool has_changed, bool has_added, bool has_removed,
+                                  bool has_effects, bool has_callers) {
+    bool first = true;
+    if (!out) return;
+    if (has_changed) {
+        fprintf(out, "contract");
+        first = false;
+    }
+    if (has_added) {
+        fprintf(out, "%snew_surface", first ? "" : ",");
+        first = false;
+    }
+    if (has_removed) {
+        fprintf(out, "%sdeleted_surface", first ? "" : ",");
+        first = false;
+    }
+    if (has_effects) {
+        fprintf(out, "%seffects", first ? "" : ",");
+        first = false;
+    }
+    if (has_callers) {
+        fprintf(out, "%scallers", first ? "" : ",");
+        first = false;
+    }
+    if (first) fprintf(out, "smoke");
+}
+
+static bool emit_semantic_test_plan(FILE* out, const SemanticItemList* before_items,
+                                    const SemanticItemList* after_items,
+                                    const StateSymbolRowList* before_rows,
+                                    const StateSymbolRowList* after_rows) {
+    if (!out || !before_items || !after_items || !before_rows || !after_rows) return false;
+
+    SemanticChangeCandidate* changes = NULL;
+    int change_count = 0;
+    if (!collect_semantic_change_candidates(before_items, after_items, before_rows, after_rows,
+                                            &changes, &change_count)) {
+        return false;
+    }
+
+    fprintf(out, "test_plan:\n");
+    if (change_count == 0) {
+        free(changes);
+        return true;
+    }
+
+    StringList test_files;
+    memset(&test_files, 0, sizeof(test_files));
+    if (!collect_candidate_test_files(index_project_root[0] != '\0' ? index_project_root : ".", &test_files)) {
+        free(changes);
+        free_string_list(&test_files);
+        return false;
+    }
+
+    typedef struct {
+        char path[MAX_PATH_LEN];
+        int hits;
+        int max_score;
+        bool has_changed;
+        bool has_added;
+        bool has_removed;
+        bool has_effects;
+        bool has_callers;
+        StringList symbols;
+    } TestPlanCandidate;
+
+    TestPlanCandidate* candidates = NULL;
+    int candidate_count = 0;
+    int candidate_cap = 0;
+    bool ok = true;
+
+    for (int i = 0; i < test_files.count && ok; i++) {
+        char test_entry[MAX_PATH_LEN];
+        ProjectIndex test_project;
+        StringList identities;
+        char* test_source = read_file(test_files.items[i]);
+        memset(&test_project, 0, sizeof(test_project));
+        memset(&identities, 0, sizeof(identities));
+        if (!test_source) continue;
+
+        bool maybe_relevant = false;
+        for (int j = 0; j < change_count && !maybe_relevant; j++) {
+            const char* slash = strrchr(changes[j].module_path, '/');
+            const char* basename = slash ? slash + 1 : changes[j].module_path;
+            if (basename[0] != '\0' && strstr(test_source, basename) != NULL) {
+                maybe_relevant = true;
+            }
+        }
+        if (!maybe_relevant) {
+            free(test_source);
+            continue;
+        }
+
+        int hits = 0;
+        int max_score = 0;
+        bool has_changed = false;
+        bool has_added = false;
+        bool has_removed = false;
+        bool has_effects = false;
+        bool has_callers = false;
+        StringList matched_symbols;
+        memset(&matched_symbols, 0, sizeof(matched_symbols));
+
+        bool manifest_link = strstr(test_source, "@covers") != NULL;
+        if (manifest_link) {
+            for (int j = 0; j < change_count; j++) {
+                const char* slash = strrchr(changes[j].module_path, '/');
+                const char* basename = slash ? slash + 1 : changes[j].module_path;
+                if ((basename[0] == '\0' || strstr(test_source, basename) == NULL) ||
+                    (changes[j].name[0] == '\0' || strstr(test_source, changes[j].name) == NULL)) {
+                    continue;
+                }
+                hits++;
+                if (changes[j].score > max_score) max_score = changes[j].score;
+                if (strcmp(changes[j].status, "changed") == 0) has_changed = true;
+                if (strcmp(changes[j].status, "added") == 0) has_added = true;
+                if (strcmp(changes[j].status, "removed") == 0) has_removed = true;
+                if (changes[j].dep_effect_count > 0) has_effects = true;
+                if (changes[j].blast > 0) has_callers = true;
+                if (!string_list_add_unique(&matched_symbols, changes[j].name)) {
+                    free_string_list(&matched_symbols);
+                    ok = false;
+                    break;
+                }
+            }
+        }
+
+        if (!manifest_link) {
+            free(test_source);
+            if (!build_project_index(test_files.items[i], &test_project, test_entry, sizeof(test_entry))) {
+                free_string_list(&identities);
+                free_string_list(&matched_symbols);
+                continue;
+            }
+            if (!collect_project_symbol_identities(&test_project, &identities)) {
+                free_project(&test_project);
+                free_string_list(&identities);
+                free_string_list(&matched_symbols);
+                continue;
+            }
+            for (int j = 0; j < change_count; j++) {
+                if (string_list_index_of(&identities, changes[j].module_symbol_identity) == -1) continue;
+                hits++;
+                if (changes[j].score > max_score) max_score = changes[j].score;
+                if (strcmp(changes[j].status, "changed") == 0) has_changed = true;
+                if (strcmp(changes[j].status, "added") == 0) has_added = true;
+                if (strcmp(changes[j].status, "removed") == 0) has_removed = true;
+                if (changes[j].dep_effect_count > 0) has_effects = true;
+                if (changes[j].blast > 0) has_callers = true;
+                if (!string_list_add_unique(&matched_symbols, changes[j].name)) {
+                    free_string_list(&matched_symbols);
+                    ok = false;
+                    break;
+                }
+            }
+        } else {
+            free(test_source);
+        }
+
+        free_project(&test_project);
+        free_string_list(&identities);
+        if (!ok) {
+            free_string_list(&matched_symbols);
+            break;
+        }
+        if (hits == 0) {
+            free_string_list(&matched_symbols);
+            continue;
+        }
+
+        if (!ensure_capacity((void**)&candidates, &candidate_cap, candidate_count + 1,
+                             sizeof(TestPlanCandidate))) {
+            free_string_list(&matched_symbols);
+            ok = false;
+            break;
+        }
+
+        TestPlanCandidate* candidate = &candidates[candidate_count++];
+        memset(candidate, 0, sizeof(*candidate));
+        copy_text(candidate->path, sizeof(candidate->path), test_files.items[i]);
+        candidate->hits = hits;
+        candidate->max_score = max_score;
+        candidate->has_changed = has_changed;
+        candidate->has_added = has_added;
+        candidate->has_removed = has_removed;
+        candidate->has_effects = has_effects;
+        candidate->has_callers = has_callers;
+        candidate->symbols = matched_symbols;
+    }
+
+    if (ok) {
+        for (int i = 0; i < candidate_count - 1; i++) {
+            for (int j = i + 1; j < candidate_count; j++) {
+                if (candidates[i].hits < candidates[j].hits ||
+                    (candidates[i].hits == candidates[j].hits && candidates[i].max_score < candidates[j].max_score) ||
+                    (candidates[i].hits == candidates[j].hits && candidates[i].max_score == candidates[j].max_score &&
+                     strcmp(candidates[i].path, candidates[j].path) > 0)) {
+                    TestPlanCandidate tmp = candidates[i];
+                    candidates[i] = candidates[j];
+                    candidates[j] = tmp;
+                }
+            }
+        }
+
+        for (int i = 0; i < candidate_count; i++) {
+            char display_path[MAX_PATH_LEN];
+            format_pack_path(candidates[i].path, display_path, sizeof(display_path));
+            fprintf(out, "  %d|test=%s|hits=%d|max_score=%d|symbols=",
+                    i + 1, display_path, candidates[i].hits, candidates[i].max_score);
+            emit_string_list_csv(out, &candidates[i].symbols);
+            fprintf(out, "|checks=");
+            emit_test_plan_checks(out, candidates[i].has_changed, candidates[i].has_added,
+                                  candidates[i].has_removed, candidates[i].has_effects,
+                                  candidates[i].has_callers);
+            fprintf(out, "\n");
+        }
+    }
+
+    for (int i = 0; i < candidate_count; i++) {
+        free_string_list(&candidates[i].symbols);
+    }
+    free(candidates);
+    free(changes);
+    free_string_list(&test_files);
+    return ok;
+}
+
+static bool state_plan_candidate_record_hit(StatePlanTestCandidate* candidate,
+                                            const SemanticChangeCandidate* change) {
+    if (!candidate || !change) return false;
+    candidate->hits++;
+    if (change->score > candidate->max_score) candidate->max_score = change->score;
+    if (strcmp(change->status, "changed") == 0) candidate->has_changed = true;
+    if (strcmp(change->status, "added") == 0) candidate->has_added = true;
+    if (strcmp(change->status, "removed") == 0) candidate->has_removed = true;
+    if (change->dep_effect_count > 0) candidate->has_effects = true;
+    if (change->blast > 0) candidate->has_callers = true;
+    return string_list_add_unique(&candidate->symbols, change->name);
+}
+
+static bool state_plan_candidate_status_selected(const char* status, bool include_changed,
+                                                 bool include_added, bool include_removed) {
+    if (!status) return false;
+    if (include_changed && strcmp(status, "changed") == 0) return true;
+    if (include_added && strcmp(status, "added") == 0) return true;
+    if (include_removed && strcmp(status, "removed") == 0) return true;
+    return false;
+}
+
+static StatePlanTestCandidate* find_state_plan_candidate(StatePlanTestCandidateList* list,
+                                                         const char* path) {
+    if (!list || !path) return NULL;
+    for (int i = 0; i < list->count; i++) {
+        if (strcmp(list->items[i].path, path) == 0) return &list->items[i];
+    }
+    return NULL;
+}
+
+static bool collect_state_test_plan_candidates(const char* state_path, const StateSymbolRowList* rows,
+                                               const SemanticChangeCandidate* changes, int change_count,
+                                               bool include_changed, bool include_added,
+                                               bool include_removed, StatePlanTestCandidateList* out) {
+    if (!state_path || !rows || !changes || !out) return false;
+
+    FILE* file = fopen(state_path, "r");
+    if (!file) return false;
+
+    char line[8192];
+    bool in_tests = false;
+    bool ok = true;
+    while (fgets(line, sizeof(line), file)) {
+        size_t n = strlen(line);
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+
+        if (!in_tests) {
+            if (strcmp(line, "test_index:") == 0) in_tests = true;
+            continue;
+        }
+        if (strcmp(line, "context:") == 0) break;
+        if (line[0] == '\0') continue;
+
+        char path[MAX_PATH_LEN];
+        StringList covered_ids;
+        memset(&covered_ids, 0, sizeof(covered_ids));
+        if (!parse_test_index_row(line, path, sizeof(path), &covered_ids)) {
+            free_string_list(&covered_ids);
+            ok = false;
+            break;
+        }
+
+        StatePlanTestCandidate* candidate = NULL;
+        for (int i = 0; i < change_count; i++) {
+            if (!state_plan_candidate_status_selected(changes[i].status, include_changed,
+                                                      include_added, include_removed)) {
+                continue;
+            }
+            int row_index = state_symbol_rows_index_of_diff_identity(rows, changes[i].diff_identity);
+            if (row_index == -1 ||
+                string_list_index_of(&covered_ids, rows->items[row_index].symbol_id) == -1) {
+                continue;
+            }
+            if (!candidate) {
+                candidate = find_state_plan_candidate(out, path);
+                if (!candidate) {
+                    if (!ensure_capacity((void**)&out->items, &out->cap, out->count + 1,
+                                         sizeof(StatePlanTestCandidate))) {
+                        ok = false;
+                        break;
+                    }
+                    candidate = &out->items[out->count++];
+                    memset(candidate, 0, sizeof(*candidate));
+                    copy_text(candidate->path, sizeof(candidate->path), path);
+                }
+            }
+            if (!state_plan_candidate_record_hit(candidate, &changes[i])) {
+                ok = false;
+                break;
+            }
+        }
+        free_string_list(&covered_ids);
+        if (!ok) break;
+    }
+    fclose(file);
+    if (!ok || !in_tests) {
+        return false;
+    }
+    return true;
+}
+
+static bool emit_state_test_plan(FILE* out, const char* before_state_path, const char* after_state_path,
+                                 const SemanticItemList* before_items, const SemanticItemList* after_items,
+                                 const StateSymbolRowList* before_rows, const StateSymbolRowList* after_rows) {
+    if (!out || !before_state_path || !after_state_path ||
+        !before_items || !after_items || !before_rows || !after_rows) {
+        return false;
+    }
+
+    fprintf(out, "test_plan:\n");
+    StatePlanTestCandidateList candidates;
+    memset(&candidates, 0, sizeof(candidates));
+    bool ok = build_state_test_plan_candidates(before_state_path, after_state_path,
+                                               before_items, after_items, before_rows, after_rows,
+                                               &candidates);
+    if (ok) {
+        for (int i = 0; i < candidates.count - 1; i++) {
+            for (int j = i + 1; j < candidates.count; j++) {
+                if (candidates.items[i].hits < candidates.items[j].hits ||
+                    (candidates.items[i].hits == candidates.items[j].hits &&
+                     candidates.items[i].max_score < candidates.items[j].max_score) ||
+                    (candidates.items[i].hits == candidates.items[j].hits &&
+                     candidates.items[i].max_score == candidates.items[j].max_score &&
+                     strcmp(candidates.items[i].path, candidates.items[j].path) > 0)) {
+                    StatePlanTestCandidate tmp = candidates.items[i];
+                    candidates.items[i] = candidates.items[j];
+                    candidates.items[j] = tmp;
+                }
+            }
+        }
+        for (int i = 0; i < candidates.count; i++) {
+            fprintf(out, "  %d|test=%s|hits=%d|max_score=%d|symbols=",
+                    i + 1, candidates.items[i].path, candidates.items[i].hits,
+                    candidates.items[i].max_score);
+            emit_string_list_csv(out, &candidates.items[i].symbols);
+            fprintf(out, "|checks=");
+            emit_test_plan_checks(out, candidates.items[i].has_changed, candidates.items[i].has_added,
+                                  candidates.items[i].has_removed, candidates.items[i].has_effects,
+                                  candidates.items[i].has_callers);
+            fprintf(out, "\n");
+        }
+    }
+
+    free_state_plan_test_candidates(&candidates);
+    return ok;
+}
+
+static bool build_state_test_plan_candidates(const char* before_state_path, const char* after_state_path,
+                                             const SemanticItemList* before_items, const SemanticItemList* after_items,
+                                             const StateSymbolRowList* before_rows, const StateSymbolRowList* after_rows,
+                                             StatePlanTestCandidateList* out) {
+    if (!before_state_path || !after_state_path || !before_items || !after_items ||
+        !before_rows || !after_rows || !out) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+
+    SemanticChangeCandidate* changes = NULL;
+    int change_count = 0;
+    if (!collect_semantic_change_candidates(before_items, after_items, before_rows, after_rows,
+                                            &changes, &change_count)) {
+        return false;
+    }
+    if (change_count == 0) {
+        free(changes);
+        return true;
+    }
+
+    bool ok = collect_state_test_plan_candidates(after_state_path, after_rows, changes, change_count,
+                                                 true, true, false, out);
+    if (ok) {
+        ok = collect_state_test_plan_candidates(before_state_path, before_rows, changes, change_count,
+                                                false, false, true, out);
+    }
+    free(changes);
+    if (!ok) {
+        free_state_plan_test_candidates(out);
+    }
+    return ok;
+}
+
+static bool read_failure_preview(const char* path, char* out, size_t out_size) {
+    if (!path || !out || out_size == 0) return false;
+    out[0] = '\0';
+    FILE* file = fopen(path, "r");
+    if (!file) return false;
+    if (!fgets(out, (int)out_size, file)) {
+        fclose(file);
+        return true;
+    }
+    fclose(file);
+    size_t n = strlen(out);
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r')) out[--n] = '\0';
+    return true;
+}
+
+static bool open_temp_capture_file(char* path, size_t path_size, int* out_fd) {
+    if (!path || path_size == 0 || !out_fd) return false;
+    *out_fd = -1;
+    for (int attempt = 0; attempt < 128; attempt++) {
+        if (snprintf(path, path_size, "/tmp/viper-state-run-%ld-%d",
+                     (long)getpid(), attempt) >= (int)path_size) {
+            return false;
+        }
+        int fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
+        if (fd >= 0) {
+            *out_fd = fd;
+            return true;
+        }
+    }
+    path[0] = '\0';
+    return false;
+}
+
+static bool run_viper_script_capture(const char* exe_path, const char* script_path,
+                                     int* exit_code, char* preview, size_t preview_size) {
+    if (!exe_path || !script_path || !exit_code) return false;
+    *exit_code = -1;
+    if (preview && preview_size > 0) preview[0] = '\0';
+
+    char temp_path[MAX_PATH_LEN];
+    int fd = -1;
+    if (!open_temp_capture_file(temp_path, sizeof(temp_path), &fd)) return false;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(fd);
+        unlink(temp_path);
+        return false;
+    }
+    if (pid == 0) {
+        dup2(fd, STDOUT_FILENO);
+        dup2(fd, STDERR_FILENO);
+        close(fd);
+        execl(exe_path, exe_path, script_path, (char*)NULL);
+        _exit(127);
+    }
+
+    close(fd);
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        unlink(temp_path);
+        return false;
+    }
+
+    if (WIFEXITED(status)) {
+        *exit_code = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        *exit_code = 128 + WTERMSIG(status);
+    }
+
+    if (*exit_code != 0 && preview && preview_size > 0) {
+        read_failure_preview(temp_path, preview, preview_size);
+    }
+    unlink(temp_path);
+    return true;
+}
+
+static bool select_resume_symbol_rows(const StateSymbolRowList* all_rows, const char* focus_symbol,
+                                      bool include_impact, StateSymbolRowList* selected_rows) {
+    if (!all_rows || !focus_symbol || !selected_rows) return false;
+    memset(selected_rows, 0, sizeof(*selected_rows));
+
+    unsigned char* selected = NULL;
+    StringList active_names;
+    memset(&active_names, 0, sizeof(active_names));
+    if (all_rows->count > 0) {
+        selected = (unsigned char*)calloc((size_t)all_rows->count, sizeof(unsigned char));
+        if (!selected) return false;
+    }
+
+    int selected_count = 0;
+    for (int i = 0; i < all_rows->count; i++) {
+        char row_name[MAX_NAME_LEN];
+        bool matches = strcmp(all_rows->items[i].symbol_id, focus_symbol) == 0;
+        if (!matches && state_symbol_row_name(&all_rows->items[i], row_name, sizeof(row_name))) {
+            matches = strcmp(row_name, focus_symbol) == 0;
+        }
+        if (!matches) continue;
+        selected[i] = 1;
+        selected_count++;
+        if (row_name[0] != '\0' && !string_list_add_unique(&active_names, row_name)) {
+            free(selected);
+            free_string_list(&active_names);
+            return false;
+        }
+    }
+
+    if (selected_count == 0) {
+        free(selected);
+        free_string_list(&active_names);
+        return false;
+    }
+
+    if (include_impact) {
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (int i = 0; i < all_rows->count; i++) {
+                if (selected[i]) continue;
+                if (!state_symbol_row_calls_selected(&all_rows->items[i], &active_names)) continue;
+                char row_name[MAX_NAME_LEN];
+                if (!state_symbol_row_name(&all_rows->items[i], row_name, sizeof(row_name))) continue;
+                selected[i] = 1;
+                selected_count++;
+                if (!string_list_add_unique(&active_names, row_name)) {
+                    free(selected);
+                    free_string_list(&active_names);
+                    return false;
+                }
+                changed = true;
+            }
+        }
+    }
+
+    for (int i = 0; i < all_rows->count; i++) {
+        if (!selected[i]) continue;
+        if (!state_symbol_rows_add(selected_rows, all_rows->items[i].symbol_id,
+                                   all_rows->items[i].module_ref, all_rows->items[i].kind,
+                                   all_rows->items[i].contract)) {
+            free(selected);
+            free_string_list(&active_names);
+            free_state_symbol_rows(selected_rows);
+            return false;
+        }
+    }
+
+    free(selected);
+    free_string_list(&active_names);
+    return true;
 }
 
 static bool collect_resume_symbol_tables_filtered(const char* state_path, const StringList* module_refs,
@@ -2352,21 +4696,546 @@ static bool emit_resume_symbol_ledger(const char* state_path, FILE* out) {
     return ok && in_index;
 }
 
-static bool emit_patch_symbol_ledger(const char* state_path, const StringList* module_refs,
-                                     const StringList* module_paths, FILE* out, int* patched_symbols) {
-    if (!state_path || !module_refs || !module_paths || !out) return false;
-    if (patched_symbols) *patched_symbols = 0;
-    if (module_refs->count == 0) return true;
+static bool emit_resume_symbol_ledger_from_rows(const char* state_path, const StateSymbolRowList* rows,
+                                                FILE* out) {
+    if (!state_path || !rows || !out) return false;
+    if (rows->count == 0) {
+        fprintf(out, "mods:\n");
+        fprintf(out, "rets:\n");
+        fprintf(out, "effs:\n");
+        fprintf(out, "calls:\n");
+        fprintf(out, "syms:\n");
+        return true;
+    }
 
+    StringList selected_module_refs;
+    StringList module_refs;
+    StringList module_paths;
     StringList returns;
     StringList effects;
     StringList calls;
+    memset(&selected_module_refs, 0, sizeof(selected_module_refs));
+    memset(&module_refs, 0, sizeof(module_refs));
+    memset(&module_paths, 0, sizeof(module_paths));
     memset(&returns, 0, sizeof(returns));
     memset(&effects, 0, sizeof(effects));
     memset(&calls, 0, sizeof(calls));
 
+    for (int i = 0; i < rows->count; i++) {
+        if (!string_list_add_unique(&selected_module_refs, rows->items[i].module_ref)) {
+            free_string_list(&selected_module_refs);
+            free_string_list(&module_refs);
+            free_string_list(&module_paths);
+            free_string_list(&returns);
+            free_string_list(&effects);
+            free_string_list(&calls);
+            return false;
+        }
+    }
+    if (!load_state_module_rows_filtered(state_path, &selected_module_refs, &module_refs, &module_paths) ||
+        !collect_symbol_tables_from_rows(rows, &returns, &effects, &calls, NULL)) {
+        free_string_list(&selected_module_refs);
+        free_string_list(&module_refs);
+        free_string_list(&module_paths);
+        free_string_list(&returns);
+        free_string_list(&effects);
+        free_string_list(&calls);
+        return false;
+    }
+
+    fprintf(out, "mods:\n");
+    for (int i = 0; i < module_refs.count; i++) {
+        fprintf(out, "  %s %s\n", module_refs.items[i], module_paths.items[i]);
+    }
+    if (!emit_compact_symbol_refs(out, "rets", 'r', &returns) ||
+        !emit_compact_symbol_refs(out, "effs", 'e', &effects) ||
+        !emit_compact_symbol_refs(out, "calls", 'c', &calls)) {
+        free_string_list(&selected_module_refs);
+        free_string_list(&module_refs);
+        free_string_list(&module_paths);
+        free_string_list(&returns);
+        free_string_list(&effects);
+        free_string_list(&calls);
+        return false;
+    }
+
+    fprintf(out, "syms:\n");
+    for (int i = 0; i < rows->count; i++) {
+        if (!emit_compact_symbol_row_from_state(out, &rows->items[i], &returns, &effects, &calls)) {
+            free_string_list(&selected_module_refs);
+            free_string_list(&module_refs);
+            free_string_list(&module_paths);
+            free_string_list(&returns);
+            free_string_list(&effects);
+            free_string_list(&calls);
+            return false;
+        }
+    }
+
+    free_string_list(&selected_module_refs);
+    free_string_list(&module_refs);
+    free_string_list(&module_paths);
+    free_string_list(&returns);
+    free_string_list(&effects);
+    free_string_list(&calls);
+    return true;
+}
+
+static bool collect_state_linked_test_candidates(const char* state_path, const StateSymbolRowList* selected_rows,
+                                                 StatePlanTestCandidateList* out) {
+    if (!state_path || !selected_rows || !out) return false;
+    memset(out, 0, sizeof(*out));
+    if (selected_rows->count == 0) return true;
+
+    FILE* file = fopen(state_path, "r");
+    if (!file) return false;
+
+    char line[8192];
+    bool in_tests = false;
+    bool ok = true;
+    while (fgets(line, sizeof(line), file)) {
+        size_t n = strlen(line);
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+
+        if (!in_tests) {
+            if (strcmp(line, "test_index:") == 0) in_tests = true;
+            continue;
+        }
+        if (strcmp(line, "context:") == 0) break;
+        if (line[0] == '\0') continue;
+
+        char path[MAX_PATH_LEN];
+        StringList covered_ids;
+        StringList matched_names;
+        memset(&covered_ids, 0, sizeof(covered_ids));
+        memset(&matched_names, 0, sizeof(matched_names));
+        if (!parse_test_index_row(line, path, sizeof(path), &covered_ids)) {
+            free_string_list(&covered_ids);
+            ok = false;
+            break;
+        }
+
+        int hits = 0;
+        for (int i = 0; i < covered_ids.count; i++) {
+            int row_index = state_symbol_rows_index_of(selected_rows, covered_ids.items[i]);
+            char row_name[MAX_NAME_LEN];
+            if (row_index == -1 ||
+                !state_symbol_row_name(&selected_rows->items[row_index], row_name, sizeof(row_name))) {
+                continue;
+            }
+            hits++;
+            if (!string_list_add_unique(&matched_names, row_name)) {
+                ok = false;
+                break;
+            }
+        }
+        free_string_list(&covered_ids);
+        if (!ok) {
+            free_string_list(&matched_names);
+            break;
+        }
+        if (hits == 0) {
+            free_string_list(&matched_names);
+            continue;
+        }
+
+        if (!ensure_capacity((void**)&out->items, &out->cap, out->count + 1,
+                             sizeof(StatePlanTestCandidate))) {
+            free_string_list(&matched_names);
+            ok = false;
+            break;
+        }
+
+        StatePlanTestCandidate* candidate = &out->items[out->count++];
+        memset(candidate, 0, sizeof(*candidate));
+        copy_text(candidate->path, sizeof(candidate->path), path);
+        candidate->hits = hits;
+        candidate->symbols = matched_names;
+    }
+    fclose(file);
+
+    if (ok) {
+        for (int i = 0; i < out->count - 1; i++) {
+            for (int j = i + 1; j < out->count; j++) {
+                if (out->items[i].hits < out->items[j].hits ||
+                    (out->items[i].hits == out->items[j].hits &&
+                     strcmp(out->items[i].path, out->items[j].path) > 0)) {
+                    StatePlanTestCandidate tmp = out->items[i];
+                    out->items[i] = out->items[j];
+                    out->items[j] = tmp;
+                }
+            }
+        }
+    }
+
+    if (!ok || !in_tests) {
+        free_state_plan_test_candidates(out);
+        return false;
+    }
+    return true;
+}
+
+static bool emit_state_linked_tests(const char* state_path, const StateSymbolRowList* selected_rows,
+                                    FILE* out) {
+    if (!state_path || !selected_rows || !out || selected_rows->count == 0) return true;
+
+    StatePlanTestCandidateList candidates;
+    if (!collect_state_linked_test_candidates(state_path, selected_rows, &candidates)) return false;
+
+    if (candidates.count > 0) {
+        fprintf(out, "tests:\n");
+        for (int i = 0; i < candidates.count; i++) {
+            fprintf(out, "  %d|test=%s|hits=%d|symbols=",
+                    i + 1, candidates.items[i].path, candidates.items[i].hits);
+            emit_string_list_csv(out, &candidates.items[i].symbols);
+            fprintf(out, "\n");
+        }
+    }
+
+    free_state_plan_test_candidates(&candidates);
+    return true;
+}
+
+static bool emit_state_module_section_from_rows(const char* state_path, const StateSymbolRowList* rows,
+                                                FILE* out) {
+    if (!state_path || !rows || !out) return false;
+    fprintf(out, "mods:\n");
+    if (rows->count == 0) return true;
+
+    StringList selected_module_refs;
+    StringList module_refs;
+    StringList module_paths;
+    memset(&selected_module_refs, 0, sizeof(selected_module_refs));
+    memset(&module_refs, 0, sizeof(module_refs));
+    memset(&module_paths, 0, sizeof(module_paths));
+
+    bool ok = true;
+    for (int i = 0; i < rows->count && ok; i++) {
+        ok = string_list_add_unique(&selected_module_refs, rows->items[i].module_ref);
+    }
+    if (ok) {
+        ok = load_state_module_rows_filtered(state_path, &selected_module_refs, &module_refs, &module_paths);
+    }
+    if (ok) {
+        for (int i = 0; i < module_refs.count; i++) {
+            fprintf(out, "  %s %s\n", module_refs.items[i], module_paths.items[i]);
+        }
+    }
+
+    free_string_list(&selected_module_refs);
+    free_string_list(&module_refs);
+    free_string_list(&module_paths);
+    return ok;
+}
+
+static bool emit_state_brief_rows(FILE* out, const StateSymbolRowList* rows) {
+    if (!out || !rows) return false;
+    fprintf(out, "brief_syms:\n");
+    for (int i = 0; i < rows->count; i++) {
+        CompactSymbolRow row;
+        if (!parse_compact_symbol_row(rows->items[i].kind[0] == 'T' ? "target" : "caller",
+                                      rows->items[i].contract, &row)) {
+            return false;
+        }
+
+        if (!row.parsed) {
+            char name[MAX_NAME_LEN];
+            if (!state_symbol_row_name(&rows->items[i], name, sizeof(name))) {
+                copy_text(name, sizeof(name), rows->items[i].contract);
+            }
+            fprintf(out, "  %d|%s|%s|%s|%s|-|-|-|0|raw=%s\n",
+                    i + 1, rows->items[i].symbol_id, rows->items[i].kind,
+                    rows->items[i].module_ref, name, row.raw_contract);
+            free_compact_symbol_row(&row);
+            continue;
+        }
+
+        StringList effects;
+        memset(&effects, 0, sizeof(effects));
+        bool ok = true;
+        for (int j = 0; j < row.declared_effects.count && ok; j++) {
+            ok = string_list_add_unique(&effects, row.declared_effects.items[j]);
+        }
+        for (int j = 0; j < row.inferred_effects.count && ok; j++) {
+            ok = string_list_add_unique(&effects, row.inferred_effects.items[j]);
+        }
+        if (!ok) {
+            free_string_list(&effects);
+            free_compact_symbol_row(&row);
+            return false;
+        }
+
+        fprintf(out, "  %d|%s|%s|%s|%s|%s|%c|",
+                i + 1, rows->items[i].symbol_id, rows->items[i].kind, rows->items[i].module_ref,
+                row.signature[0] != '\0' ? row.signature : row.name,
+                row.return_type[0] != '\0' ? row.return_type : "-",
+                row.is_public ? '+' : '-');
+        if (effects.count > 0) {
+            emit_string_list_csv(out, &effects);
+        } else {
+            fprintf(out, "-");
+        }
+        fprintf(out, "|%d\n", row.calls.count);
+
+        free_string_list(&effects);
+        free_compact_symbol_row(&row);
+    }
+    return true;
+}
+
+static long measure_state_payload_bytes(const char* state_path, const StateSymbolRowList* rows,
+                                        bool brief_output, bool include_tests) {
+    if (!state_path) return -1;
+    static unsigned long ledger_tmp_counter = 0;
+    char tmp_path[MAX_PATH_LEN];
+    snprintf(tmp_path, sizeof(tmp_path), "/tmp/viper-ledger-%ld-%lu.tmp",
+             (long)getpid(), ++ledger_tmp_counter);
+    FILE* tmp = fopen(tmp_path, "w+");
+    if (!tmp) return -1;
+    unlink(tmp_path);
+
+    bool ok = true;
+    if (!brief_output) {
+        ok = rows ? emit_resume_symbol_ledger_from_rows(state_path, rows, tmp)
+                  : emit_resume_symbol_ledger(state_path, tmp);
+    } else {
+        if (!rows) {
+            fclose(tmp);
+            return -1;
+        }
+        ok = emit_state_module_section_from_rows(state_path, rows, tmp) &&
+             emit_state_brief_rows(tmp, rows);
+    }
+    if (ok && include_tests && rows) {
+        ok = emit_state_linked_tests(state_path, rows, tmp);
+    }
+    if (!ok) {
+        fclose(tmp);
+        return -1;
+    }
+    if (fflush(tmp) != 0) {
+        fclose(tmp);
+        return -1;
+    }
+    long bytes = ftell(tmp);
+    fclose(tmp);
+    return bytes;
+}
+
+static bool compute_state_payload_metrics(const char* state_path, const StateSymbolRowList* rows,
+                                          bool include_tests, StatePayloadMetrics* metrics) {
+    if (!state_path || !rows || !metrics) return false;
+
+    memset(metrics, 0, sizeof(*metrics));
+
+    unsigned long long start_us = monotonic_time_us();
+    metrics->brief_bytes = measure_state_payload_bytes(state_path, rows, true, include_tests);
+    metrics->brief_emit_us = monotonic_time_us() - start_us;
+
+    start_us = monotonic_time_us();
+    metrics->full_bytes = measure_state_payload_bytes(state_path, rows, false, include_tests);
+    metrics->full_emit_us = monotonic_time_us() - start_us;
+
+    if (metrics->brief_bytes < 0 || metrics->full_bytes < 0) return false;
+
+    metrics->saved_bytes = metrics->full_bytes - metrics->brief_bytes;
+    metrics->saved_pct = metrics->full_bytes > 0
+        ? (metrics->saved_bytes * 100) / metrics->full_bytes
+        : 0;
+    metrics->brief_tokens_est = estimate_payload_tokens(metrics->brief_bytes);
+    metrics->full_tokens_est = estimate_payload_tokens(metrics->full_bytes);
+    metrics->saved_tokens_est = metrics->full_tokens_est - metrics->brief_tokens_est;
+
+    if (metrics->saved_bytes < 0) metrics->saved_bytes = 0;
+    if (metrics->saved_pct < 0) metrics->saved_pct = 0;
+    if (metrics->saved_tokens_est < 0) metrics->saved_tokens_est = 0;
+    return true;
+}
+
+static void emit_ledger_metrics(FILE* out, const char* state_path,
+                                const StateSymbolRowList* rows, bool include_tests) {
+    if (!out || !state_path || !rows) return;
+
+    StatePayloadMetrics metrics;
+    if (!compute_state_payload_metrics(state_path, rows, include_tests, &metrics)) return;
+
+    fprintf(out, "ledger_bytes: %ld\n", metrics.brief_bytes);
+    fprintf(out, "ledger_full_bytes: %ld\n", metrics.full_bytes);
+    fprintf(out, "ledger_saved_bytes: %ld\n", metrics.saved_bytes);
+    fprintf(out, "ledger_saved_pct: %ld\n", metrics.saved_pct);
+}
+
+static int count_unique_state_modules(const StateSymbolRowList* rows) {
+    if (!rows) return 0;
+
+    StringList refs;
+    memset(&refs, 0, sizeof(refs));
+    bool ok = true;
+    for (int i = 0; i < rows->count && ok; i++) {
+        ok = string_list_add_unique(&refs, rows->items[i].module_ref);
+    }
+
+    int count = ok ? refs.count : 0;
+    free_string_list(&refs);
+    return count;
+}
+
+static bool collect_symbol_tables_from_rows(const StateSymbolRowList* rows,
+                                            StringList* returns, StringList* effects,
+                                            StringList* calls, int* symbol_count) {
+    if (!rows || !returns || !effects || !calls) return false;
+    int collected = 0;
+    for (int i = 0; i < rows->count; i++) {
+        CompactSymbolRow row;
+        if (!parse_compact_symbol_row(rows->items[i].kind[0] == 'T' ? "target" : "caller",
+                                      rows->items[i].contract, &row)) {
+            return false;
+        }
+        if (row.parsed) {
+            collected++;
+            if (row.return_type[0] != '\0' && !string_list_add_unique(returns, row.return_type)) {
+                free_compact_symbol_row(&row);
+                return false;
+            }
+            for (int j = 0; j < row.declared_effects.count; j++) {
+                if (!string_list_add_unique(effects, row.declared_effects.items[j])) {
+                    free_compact_symbol_row(&row);
+                    return false;
+                }
+            }
+            for (int j = 0; j < row.inferred_effects.count; j++) {
+                if (!string_list_add_unique(effects, row.inferred_effects.items[j])) {
+                    free_compact_symbol_row(&row);
+                    return false;
+                }
+            }
+            for (int j = 0; j < row.calls.count; j++) {
+                if (!string_list_add_unique(calls, row.calls.items[j])) {
+                    free_compact_symbol_row(&row);
+                    return false;
+                }
+            }
+        }
+        free_compact_symbol_row(&row);
+    }
+    if (symbol_count) *symbol_count = collected;
+    return true;
+}
+
+static bool emit_compact_symbol_row_from_state(FILE* out, const StateSymbolRow* state_row,
+                                               const StringList* returns, const StringList* effects,
+                                               const StringList* calls) {
+    if (!out || !state_row || !returns || !effects || !calls) return false;
+
+    CompactSymbolRow row;
+    if (!parse_compact_symbol_row(state_row->kind[0] == 'T' ? "target" : "caller",
+                                  state_row->contract, &row)) {
+        return false;
+    }
+
+    if (!row.parsed) {
+        fprintf(out, "  %s|%s|%s|raw|%s\n",
+                state_row->symbol_id, state_row->kind, state_row->module_ref, row.raw_contract);
+        free_compact_symbol_row(&row);
+        return true;
+    }
+
+    fprintf(out, "  %s|%s|%s|%c|%s|", state_row->symbol_id, state_row->kind, state_row->module_ref,
+            row.is_public ? '+' : '-',
+            row.signature[0] != '\0' ? row.signature : row.name);
+    if (row.return_type[0] == '\0') {
+        fprintf(out, "-|");
+    } else {
+        int return_index = string_list_index_of(returns, row.return_type);
+        if (return_index == -1) {
+            free_compact_symbol_row(&row);
+            return false;
+        }
+        fprintf(out, "r%d|", return_index + 1);
+    }
+    if (!emit_compact_symbol_id_list(out, 'e', &row.declared_effects, effects) ||
+        fprintf(out, "|") < 0 ||
+        !emit_compact_symbol_id_list(out, 'e', &row.inferred_effects, effects) ||
+        fprintf(out, "|") < 0 ||
+        !emit_compact_symbol_id_list(out, 'c', &row.calls, calls)) {
+        free_compact_symbol_row(&row);
+        return false;
+    }
+    fprintf(out, "\n");
+    free_compact_symbol_row(&row);
+    return true;
+}
+
+static bool emit_patch_symbol_ledger(const char* old_state_path, const char* new_state_path,
+                                     const StringList* module_refs, const StringList* module_paths,
+                                     FILE* out, int* patched_symbols) {
+    if (!old_state_path || !new_state_path || !module_refs || !module_paths || !out) return false;
+    if (patched_symbols) *patched_symbols = 0;
+    if (module_refs->count == 0) return true;
+
+    StateSymbolRowList before_rows;
+    StateSymbolRowList after_rows;
+    StateSymbolRowList changed_rows;
+    StringList removed_symbol_ids;
+    StringList returns;
+    StringList effects;
+    StringList calls;
+    memset(&before_rows, 0, sizeof(before_rows));
+    memset(&after_rows, 0, sizeof(after_rows));
+    memset(&changed_rows, 0, sizeof(changed_rows));
+    memset(&removed_symbol_ids, 0, sizeof(removed_symbol_ids));
+    memset(&returns, 0, sizeof(returns));
+    memset(&effects, 0, sizeof(effects));
+    memset(&calls, 0, sizeof(calls));
+
+    if (!load_state_symbol_rows_filtered(old_state_path, module_refs, &before_rows) ||
+        !load_state_symbol_rows_filtered(new_state_path, module_refs, &after_rows)) {
+        free_state_symbol_rows(&before_rows);
+        free_state_symbol_rows(&after_rows);
+        free_string_list(&returns);
+        free_string_list(&effects);
+        free_string_list(&calls);
+        return false;
+    }
+
+    for (int i = 0; i < after_rows.count; i++) {
+        int old_index = state_symbol_rows_index_of(&before_rows, after_rows.items[i].symbol_id);
+        if (old_index != -1 && state_symbol_row_equals(&before_rows.items[old_index], &after_rows.items[i])) {
+            continue;
+        }
+        if (!state_symbol_rows_add(&changed_rows, after_rows.items[i].symbol_id,
+                                   after_rows.items[i].module_ref, after_rows.items[i].kind,
+                                   after_rows.items[i].contract)) {
+            free_state_symbol_rows(&before_rows);
+            free_state_symbol_rows(&after_rows);
+            free_state_symbol_rows(&changed_rows);
+            free_string_list(&removed_symbol_ids);
+            free_string_list(&returns);
+            free_string_list(&effects);
+            free_string_list(&calls);
+            return false;
+        }
+    }
+    for (int i = 0; i < before_rows.count; i++) {
+        if (state_symbol_rows_index_of(&after_rows, before_rows.items[i].symbol_id) != -1) continue;
+        if (!string_list_append(&removed_symbol_ids, before_rows.items[i].symbol_id)) {
+            free_state_symbol_rows(&before_rows);
+            free_state_symbol_rows(&after_rows);
+            free_state_symbol_rows(&changed_rows);
+            free_string_list(&removed_symbol_ids);
+            free_string_list(&returns);
+            free_string_list(&effects);
+            free_string_list(&calls);
+            return false;
+        }
+    }
+
     int symbol_count = 0;
-    if (!collect_resume_symbol_tables_filtered(state_path, module_refs, &returns, &effects, &calls, &symbol_count)) {
+    if (!collect_symbol_tables_from_rows(&changed_rows, &returns, &effects, &calls, &symbol_count)) {
+        free_state_symbol_rows(&before_rows);
+        free_state_symbol_rows(&after_rows);
+        free_state_symbol_rows(&changed_rows);
+        free_string_list(&removed_symbol_ids);
         free_string_list(&returns);
         free_string_list(&effects);
         free_string_list(&calls);
@@ -2377,96 +5246,51 @@ static bool emit_patch_symbol_ledger(const char* state_path, const StringList* m
     for (int i = 0; i < module_refs->count; i++) {
         fprintf(out, "  %s %s\n", module_refs->items[i], module_paths->items[i]);
     }
-    if (!emit_compact_symbol_refs(out, "patch_rets", 'r', &returns) ||
-        !emit_compact_symbol_refs(out, "patch_effs", 'e', &effects) ||
-        !emit_compact_symbol_refs(out, "patch_calls", 'c', &calls)) {
-        free_string_list(&returns);
-        free_string_list(&effects);
-        free_string_list(&calls);
-        return false;
+    if (removed_symbol_ids.count > 0) {
+        fprintf(out, "patch_removed_syms:\n");
+        for (int i = 0; i < removed_symbol_ids.count; i++) {
+            fprintf(out, "  %s\n", removed_symbol_ids.items[i]);
+        }
     }
-
-    FILE* file = fopen(state_path, "r");
-    if (!file) {
-        free_string_list(&returns);
-        free_string_list(&effects);
-        free_string_list(&calls);
-        return false;
-    }
-
-    fprintf(out, "patch_syms:\n");
-    char line[8192];
-    bool in_index = false;
-    bool ok = true;
-    while (fgets(line, sizeof(line), file)) {
-        size_t n = strlen(line);
-        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
-
-        if (!in_index) {
-            if (strcmp(line, "symbol_index:") == 0) in_index = true;
-            continue;
+    if (changed_rows.count > 0) {
+        if (!emit_compact_symbol_refs(out, "patch_rets", 'r', &returns) ||
+            !emit_compact_symbol_refs(out, "patch_effs", 'e', &effects) ||
+            !emit_compact_symbol_refs(out, "patch_calls", 'c', &calls)) {
+            free_state_symbol_rows(&before_rows);
+            free_state_symbol_rows(&after_rows);
+            free_state_symbol_rows(&changed_rows);
+            free_string_list(&removed_symbol_ids);
+            free_string_list(&returns);
+            free_string_list(&effects);
+            free_string_list(&calls);
+            return false;
         }
-        if (strcmp(line, "summary_items:") == 0) break;
-        if (line[0] == '\0') continue;
-
-        char symbol_id[32];
-        char module_ref[32];
-        char kind[16];
-        char contract[4608];
-        if (!parse_symbol_index_row(line, symbol_id, sizeof(symbol_id),
-                                    module_ref, sizeof(module_ref),
-                                    kind, sizeof(kind),
-                                    contract, sizeof(contract))) {
-            ok = false;
-            break;
-        }
-        if (!module_ref_selected(module_ref, module_refs)) continue;
-
-        CompactSymbolRow row;
-        if (!parse_compact_symbol_row(kind[0] == 'T' ? "target" : "caller", contract, &row)) {
-            ok = false;
-            break;
-        }
-
-        if (!row.parsed) {
-            fprintf(out, "  %s|%s|%s|raw|%s\n", symbol_id, kind, module_ref, row.raw_contract);
-            free_compact_symbol_row(&row);
-            continue;
-        }
-
-        fprintf(out, "  %s|%s|%s|%c|%s|", symbol_id, kind, module_ref,
-                row.is_public ? '+' : '-',
-                row.signature[0] != '\0' ? row.signature : row.name);
-        if (row.return_type[0] == '\0') {
-            fprintf(out, "-|");
-        } else {
-            int return_index = string_list_index_of(&returns, row.return_type);
-            if (return_index == -1) {
-                ok = false;
-                free_compact_symbol_row(&row);
-                break;
+        fprintf(out, "patch_syms:\n");
+        for (int i = 0; i < changed_rows.count; i++) {
+            if (!emit_compact_symbol_row_from_state(out, &changed_rows.items[i],
+                                                    &returns, &effects, &calls)) {
+                free_state_symbol_rows(&before_rows);
+                free_state_symbol_rows(&after_rows);
+                free_state_symbol_rows(&changed_rows);
+                free_string_list(&removed_symbol_ids);
+                free_string_list(&returns);
+                free_string_list(&effects);
+                free_string_list(&calls);
+                return false;
             }
-            fprintf(out, "r%d|", return_index + 1);
         }
-        if (!emit_compact_symbol_id_list(out, 'e', &row.declared_effects, &effects) ||
-            fprintf(out, "|") < 0 ||
-            !emit_compact_symbol_id_list(out, 'e', &row.inferred_effects, &effects) ||
-            fprintf(out, "|") < 0 ||
-            !emit_compact_symbol_id_list(out, 'c', &row.calls, &calls)) {
-            ok = false;
-            free_compact_symbol_row(&row);
-            break;
-        }
-        fprintf(out, "\n");
-        free_compact_symbol_row(&row);
     }
 
-    fclose(file);
+    int total_patch_ops = symbol_count + removed_symbol_ids.count;
+    free_state_symbol_rows(&before_rows);
+    free_state_symbol_rows(&after_rows);
+    free_state_symbol_rows(&changed_rows);
+    free_string_list(&removed_symbol_ids);
     free_string_list(&returns);
     free_string_list(&effects);
     free_string_list(&calls);
-    if (patched_symbols) *patched_symbols = symbol_count;
-    return ok && in_index;
+    if (patched_symbols) *patched_symbols = total_patch_ops;
+    return true;
 }
 
 static bool emit_symbol_index_sections(FILE* out, const SemanticItemList* items) {
@@ -2534,8 +5358,16 @@ static bool emit_symbol_index_sections(FILE* out, const SemanticItemList* items)
             free_string_list(&symbol_refs);
             return false;
         }
+        char symbol_identity[4608];
+        if (!build_symbol_identity_source(kind, module_path, contract,
+                                          symbol_identity, sizeof(symbol_identity))) {
+            free_string_list(&modules);
+            free_string_list(&module_refs);
+            free_string_list(&symbol_refs);
+            return false;
+        }
         char symbol_ref[32];
-        if (!build_stable_ref("s", items->items[i].key, &symbol_refs, symbol_ref, sizeof(symbol_ref)) ||
+        if (!build_stable_ref("s", symbol_identity, &symbol_refs, symbol_ref, sizeof(symbol_ref)) ||
             !string_list_append(&symbol_refs, symbol_ref)) {
             free_string_list(&modules);
             free_string_list(&module_refs);
@@ -2553,6 +5385,429 @@ static bool emit_symbol_index_sections(FILE* out, const SemanticItemList* items)
     return true;
 }
 
+static bool collect_symbol_rows_from_semantic_items(const SemanticItemList* items,
+                                                    StateSymbolRowList* rows) {
+    if (!items || !rows) return false;
+    memset(rows, 0, sizeof(*rows));
+
+    StringList modules;
+    StringList module_refs;
+    StringList symbol_refs;
+    memset(&modules, 0, sizeof(modules));
+    memset(&module_refs, 0, sizeof(module_refs));
+    memset(&symbol_refs, 0, sizeof(symbol_refs));
+
+    for (int i = 0; i < items->count; i++) {
+        char kind[16];
+        char module_path[MAX_PATH_LEN];
+        char contract[4608];
+        if (!parse_semantic_item_text(items->items[i].text, kind, sizeof(kind),
+                                      module_path, sizeof(module_path),
+                                      contract, sizeof(contract)) ||
+            !string_list_add_unique(&modules, module_path)) {
+            free_string_list(&modules);
+            free_string_list(&module_refs);
+            free_string_list(&symbol_refs);
+            free_state_symbol_rows(rows);
+            return false;
+        }
+    }
+
+    for (int i = 0; i < modules.count; i++) {
+        char module_ref[32];
+        if (!build_stable_ref("m", modules.items[i], &module_refs, module_ref, sizeof(module_ref)) ||
+            !string_list_append(&module_refs, module_ref)) {
+            free_string_list(&modules);
+            free_string_list(&module_refs);
+            free_string_list(&symbol_refs);
+            free_state_symbol_rows(rows);
+            return false;
+        }
+    }
+
+    for (int i = 0; i < items->count; i++) {
+        char kind[16];
+        char module_path[MAX_PATH_LEN];
+        char contract[4608];
+        if (!parse_semantic_item_text(items->items[i].text, kind, sizeof(kind),
+                                      module_path, sizeof(module_path),
+                                      contract, sizeof(contract))) {
+            free_string_list(&modules);
+            free_string_list(&module_refs);
+            free_string_list(&symbol_refs);
+            free_state_symbol_rows(rows);
+            return false;
+        }
+        int module_index = string_list_index_of(&modules, module_path);
+        if (module_index == -1) {
+            free_string_list(&modules);
+            free_string_list(&module_refs);
+            free_string_list(&symbol_refs);
+            free_state_symbol_rows(rows);
+            return false;
+        }
+
+        char symbol_identity[4608];
+        char symbol_ref[32];
+        if (!build_symbol_identity_source(kind, module_path, contract,
+                                          symbol_identity, sizeof(symbol_identity)) ||
+            !build_stable_ref("s", symbol_identity, &symbol_refs, symbol_ref, sizeof(symbol_ref)) ||
+            !string_list_append(&symbol_refs, symbol_ref) ||
+            !state_symbol_rows_add(rows, symbol_ref, module_refs.items[module_index],
+                                   strcmp(kind, "target") == 0 ? "T" : "C", contract)) {
+            free_string_list(&modules);
+            free_string_list(&module_refs);
+            free_string_list(&symbol_refs);
+            free_state_symbol_rows(rows);
+            return false;
+        }
+    }
+
+    free_string_list(&modules);
+    free_string_list(&module_refs);
+    free_string_list(&symbol_refs);
+    return true;
+}
+
+static bool collect_module_rows_from_semantic_items(const SemanticItemList* items,
+                                                    StringList* module_refs, StringList* module_paths) {
+    if (!items || !module_refs || !module_paths) return false;
+    memset(module_refs, 0, sizeof(*module_refs));
+    memset(module_paths, 0, sizeof(*module_paths));
+
+    for (int i = 0; i < items->count; i++) {
+        char kind[16];
+        char module_path[MAX_PATH_LEN];
+        char contract[4608];
+        if (!parse_semantic_item_text(items->items[i].text, kind, sizeof(kind),
+                                      module_path, sizeof(module_path),
+                                      contract, sizeof(contract)) ||
+            !string_list_add_unique(module_paths, module_path)) {
+            free_string_list(module_refs);
+            free_string_list(module_paths);
+            return false;
+        }
+    }
+
+    for (int i = 0; i < module_paths->count; i++) {
+        char module_ref[32];
+        if (!build_stable_ref("m", module_paths->items[i], module_refs, module_ref, sizeof(module_ref)) ||
+            !string_list_append(module_refs, module_ref)) {
+            free_string_list(module_refs);
+            free_string_list(module_paths);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool module_token_matches(const char* module_path, const char* token) {
+    if (!module_path || !token || token[0] == '\0') return false;
+    if (strcmp(module_path, token) == 0) return true;
+    const char* slash = strrchr(module_path, '/');
+    const char* basename = slash ? slash + 1 : module_path;
+    return strcmp(basename, token) == 0;
+}
+
+static bool state_test_links_add(StateTestLinkList* links, const char* path, const char* hash_hex,
+                                 const StringList* covered_symbol_ids) {
+    if (!links || !path || !hash_hex || !covered_symbol_ids) return false;
+    if (!ensure_capacity((void**)&links->items, &links->cap, links->count + 1, sizeof(StateTestLink))) {
+        return false;
+    }
+
+    StateTestLink* item = &links->items[links->count++];
+    memset(item, 0, sizeof(*item));
+    copy_text(item->path, sizeof(item->path), path);
+    copy_text(item->hash_hex, sizeof(item->hash_hex), hash_hex);
+    for (int i = 0; i < covered_symbol_ids->count; i++) {
+        if (!string_list_add_unique(&item->covered_symbol_ids, covered_symbol_ids->items[i])) {
+            free_state_test_links(links);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool collect_state_test_links(const char* project_root, const SemanticItemList* items,
+                                     StateTestLinkList* out) {
+    if (!project_root || !items || !out) return false;
+    memset(out, 0, sizeof(*out));
+
+    StringList test_files;
+    StringList module_refs;
+    StringList module_paths;
+    StateSymbolRowList rows;
+    memset(&test_files, 0, sizeof(test_files));
+    memset(&module_refs, 0, sizeof(module_refs));
+    memset(&module_paths, 0, sizeof(module_paths));
+    memset(&rows, 0, sizeof(rows));
+    bool ok = collect_candidate_test_files(project_root, &test_files) &&
+              collect_module_rows_from_semantic_items(items, &module_refs, &module_paths) &&
+              collect_symbol_rows_from_semantic_items(items, &rows);
+    if (!ok) {
+        free_string_list(&test_files);
+        free_string_list(&module_refs);
+        free_string_list(&module_paths);
+        free_state_symbol_rows(&rows);
+        return false;
+    }
+
+    for (int i = 0; i < test_files.count; i++) {
+        char* source = read_file(test_files.items[i]);
+        StringList covered_symbol_ids;
+        memset(&covered_symbol_ids, 0, sizeof(covered_symbol_ids));
+        if (!source) continue;
+        if (strstr(source, "@covers") == NULL) {
+            free(source);
+            continue;
+        }
+
+        char* cursor = source;
+        while (*cursor != '\0') {
+            char* line_end = strchr(cursor, '\n');
+            size_t len = line_end ? (size_t)(line_end - cursor) : strlen(cursor);
+            if (len > 0) {
+                char line_buf[2048];
+                if (len >= sizeof(line_buf)) len = sizeof(line_buf) - 1;
+                memcpy(line_buf, cursor, len);
+                line_buf[len] = '\0';
+                char* marker = strstr(line_buf, "@covers");
+                if (marker) {
+                    char* token = strtok(marker + 7, " \t");
+                    if (token) {
+                        char module_token[MAX_PATH_LEN];
+                        copy_text(module_token, sizeof(module_token), token);
+                        while ((token = strtok(NULL, " \t")) != NULL) {
+                            for (int row_index = 0; row_index < rows.count; row_index++) {
+                                int module_index = string_list_index_of(&module_refs, rows.items[row_index].module_ref);
+                                char row_name[MAX_NAME_LEN];
+                                if (module_index == -1 ||
+                                    !module_token_matches(module_paths.items[module_index], module_token) ||
+                                    !state_symbol_row_name(&rows.items[row_index], row_name, sizeof(row_name)) ||
+                                    strcmp(row_name, token) != 0) {
+                                    continue;
+                                }
+                                if (!string_list_add_unique(&covered_symbol_ids, rows.items[row_index].symbol_id)) {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if (!ok) break;
+                        }
+                    }
+                }
+            }
+            if (!ok || !line_end) break;
+            cursor = line_end + 1;
+        }
+
+        if (ok && covered_symbol_ids.count > 0) {
+            char hash_hex[65];
+            char display_path[MAX_PATH_LEN];
+            if (!compute_module_hash_hex(test_files.items[i], hash_hex) ||
+                !format_pack_path(test_files.items[i], display_path, sizeof(display_path)) ||
+                !state_test_links_add(out, display_path, hash_hex, &covered_symbol_ids)) {
+                ok = false;
+            }
+        }
+        free_string_list(&covered_symbol_ids);
+        free(source);
+        if (!ok) break;
+    }
+
+    free_string_list(&test_files);
+    free_string_list(&module_refs);
+    free_string_list(&module_paths);
+    free_state_symbol_rows(&rows);
+    if (!ok) {
+        free_state_test_links(out);
+        return false;
+    }
+    return true;
+}
+
+static bool emit_state_test_sections(FILE* out, const StateTestLinkList* links) {
+    if (!out || !links) return false;
+    fprintf(out, "tracked_tests:\n");
+    for (int i = 0; i < links->count; i++) {
+        fprintf(out, "  %s sha256=%s\n", links->items[i].path, links->items[i].hash_hex);
+    }
+    fprintf(out, "test_index:\n");
+    for (int i = 0; i < links->count; i++) {
+        fprintf(out, "  %s covers=", links->items[i].path);
+        emit_string_list_csv(out, &links->items[i].covered_symbol_ids);
+        fprintf(out, "\n");
+    }
+    return true;
+}
+
+static bool build_diff_symbol_identity(const char* kind, const char* contract,
+                                       char* out, size_t out_size) {
+    if (!kind || !contract || !out || out_size == 0) return false;
+
+    if (strncmp(contract, "var ", 4) == 0) {
+        const char* start = contract + 4;
+        const char* end = strchr(start, ':');
+        size_t len = end ? (size_t)(end - start) : strlen(start);
+        char name[MAX_NAME_LEN];
+        if (len == 0 || len >= sizeof(name)) return false;
+        memcpy(name, start, len);
+        name[len] = '\0';
+        return snprintf(out, out_size, "%s:var:%s", kind, name) < (int)out_size;
+    }
+
+    if (strncmp(contract, "struct ", 7) == 0) {
+        const char* start = contract + 7;
+        if (strncmp(start, "pub ", 4) == 0) start += 4;
+        const char* end = strchr(start, '(');
+        size_t len = end ? (size_t)(end - start) : strlen(start);
+        char name[MAX_NAME_LEN];
+        if (len == 0 || len >= sizeof(name)) return false;
+        memcpy(name, start, len);
+        name[len] = '\0';
+        return snprintf(out, out_size, "%s:struct:%s", kind, name) < (int)out_size;
+    }
+
+    CompactSymbolRow row;
+    if (!parse_compact_symbol_row(kind, contract, &row)) return false;
+    bool ok = row.parsed &&
+              snprintf(out, out_size, "%s:fn:%s/%d", kind, row.name, row.arity) < (int)out_size;
+    free_compact_symbol_row(&row);
+    return ok;
+}
+
+static bool state_symbol_row_diff_identity(const StateSymbolRow* row, char* out, size_t out_size) {
+    if (!row || !out || out_size == 0) return false;
+    return build_diff_symbol_identity(row->kind[0] == 'T' ? "target" : "caller",
+                                      row->contract, out, out_size);
+}
+
+static int state_symbol_rows_index_of_diff_identity(const StateSymbolRowList* rows,
+                                                    const char* diff_identity) {
+    if (!rows || !diff_identity) return -1;
+    for (int i = 0; i < rows->count; i++) {
+        char current[256];
+        if (!state_symbol_row_diff_identity(&rows->items[i], current, sizeof(current))) continue;
+        if (strcmp(current, diff_identity) == 0) return i;
+    }
+    return -1;
+}
+
+static bool build_module_symbol_identity(const char* module_path, const char* contract,
+                                         char* out, size_t out_size) {
+    if (!module_path || !contract || !out || out_size == 0) return false;
+
+    if (strncmp(contract, "var ", 4) == 0) {
+        const char* start = contract + 4;
+        const char* end = strchr(start, ':');
+        size_t len = end ? (size_t)(end - start) : strlen(start);
+        char name[MAX_NAME_LEN];
+        if (len == 0 || len >= sizeof(name)) return false;
+        memcpy(name, start, len);
+        name[len] = '\0';
+        return snprintf(out, out_size, "%s::var:%s", module_path, name) < (int)out_size;
+    }
+
+    if (strncmp(contract, "struct ", 7) == 0) {
+        const char* start = contract + 7;
+        if (strncmp(start, "pub ", 4) == 0) start += 4;
+        const char* end = strchr(start, '(');
+        size_t len = end ? (size_t)(end - start) : strlen(start);
+        char name[MAX_NAME_LEN];
+        if (len == 0 || len >= sizeof(name)) return false;
+        memcpy(name, start, len);
+        name[len] = '\0';
+        return snprintf(out, out_size, "%s::struct:%s", module_path, name) < (int)out_size;
+    }
+
+    CompactSymbolRow row;
+    if (!parse_compact_symbol_row("target", contract, &row)) return false;
+    bool ok = row.parsed &&
+              snprintf(out, out_size, "%s::fn:%s/%d", module_path, row.name, row.arity) < (int)out_size;
+    free_compact_symbol_row(&row);
+    return ok;
+}
+
+static bool collect_project_symbol_identities(const ProjectIndex* project, StringList* out) {
+    if (!project || !out) return false;
+    for (int i = 0; i < project->module_count; i++) {
+        char canonical_path[MAX_PATH_LEN];
+        char module_path[MAX_PATH_LEN];
+        if (!canonicalize_existing_path(project->modules[i].path, canonical_path, sizeof(canonical_path)) ||
+            !format_pack_path(canonical_path, module_path, sizeof(module_path))) {
+            return false;
+        }
+
+        for (int j = 0; j < project->modules[i].variable_count; j++) {
+            char contract[512];
+            char identity[1536];
+            if (!format_var_contract(&project->modules[i].variables[j], contract, sizeof(contract)) ||
+                !build_module_symbol_identity(module_path, contract, identity, sizeof(identity)) ||
+                !string_list_append_unique(out, identity)) {
+                return false;
+            }
+        }
+        for (int j = 0; j < project->modules[i].struct_count; j++) {
+            char contract[1024];
+            char identity[2048];
+            if (!format_struct_contract(&project->modules[i].structs[j], contract, sizeof(contract)) ||
+                !build_module_symbol_identity(module_path, contract, identity, sizeof(identity)) ||
+                !string_list_append_unique(out, identity)) {
+                return false;
+            }
+        }
+        for (int j = 0; j < project->modules[i].function_count; j++) {
+            char contract[4096];
+            char identity[4608];
+            if (!format_fn_contract(&project->modules[i].functions[j], contract, sizeof(contract)) ||
+                !build_module_symbol_identity(module_path, contract, identity, sizeof(identity)) ||
+                !string_list_append_unique(out, identity)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool collect_vp_files_in_dir(const char* dir_path, StringList* out) {
+    if (!dir_path || !out) return false;
+
+    DIR* dir = opendir(dir_path);
+    if (!dir) return true;
+
+    struct dirent* entry;
+    bool ok = true;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        if (!has_suffix(entry->d_name, ".vp")) continue;
+
+        char full_path[MAX_PATH_LEN];
+        struct stat st;
+        if (!join_path(dir_path, entry->d_name, full_path, sizeof(full_path)) ||
+            stat(full_path, &st) != 0 || !S_ISREG(st.st_mode) ||
+            !string_list_append_unique(out, full_path)) {
+            ok = false;
+            break;
+        }
+    }
+
+    closedir(dir);
+    return ok;
+}
+
+static bool collect_candidate_test_files(const char* project_root, StringList* out) {
+    if (!project_root || !out) return false;
+
+    char scripts_dir[MAX_PATH_LEN];
+    char tests_dir[MAX_PATH_LEN];
+    if (!join_path(project_root, "tests", tests_dir, sizeof(tests_dir))) return false;
+    if (!join_path(tests_dir, "scripts", scripts_dir, sizeof(scripts_dir))) return false;
+    if (!collect_vp_files_in_dir(scripts_dir, out)) return false;
+    return true;
+}
+
 static bool compute_module_hash_hex(const char* module_path, char out_hex[65]) {
     if (!module_path || !out_hex) return false;
     char* source = read_file(module_path);
@@ -2562,6 +5817,60 @@ static bool compute_module_hash_hex(const char* module_path, char out_hex[65]) {
     bytes_to_hex(digest, sizeof(digest), out_hex, 65);
     free(source);
     return out_hex[0] != '\0';
+}
+
+static bool canonicalize_existing_path(const char* path, char* out, size_t out_size) {
+    if (!path || !out || out_size == 0) return false;
+    char temp[MAX_PATH_LEN];
+    char* segments[128];
+    int segment_count = 0;
+    bool absolute = path[0] == '/';
+
+    copy_text(temp, sizeof(temp), path);
+    char* cursor = temp;
+    if (absolute && *cursor == '/') cursor++;
+
+    while (*cursor) {
+        char* next = strchr(cursor, '/');
+        if (next) *next = '\0';
+
+        if (cursor[0] != '\0' && strcmp(cursor, ".") != 0) {
+            if (strcmp(cursor, "..") == 0) {
+                if (segment_count > 0) segment_count--;
+            } else if (segment_count < (int)(sizeof(segments) / sizeof(segments[0]))) {
+                segments[segment_count++] = cursor;
+            } else {
+                return false;
+            }
+        }
+
+        if (!next) break;
+        cursor = next + 1;
+    }
+
+    size_t offset = 0;
+    if (absolute) {
+        if (offset + 1 >= out_size) return false;
+        out[offset++] = '/';
+    }
+    for (int i = 0; i < segment_count; i++) {
+        size_t len = strlen(segments[i]);
+        if (offset > 0 && out[offset - 1] != '/') {
+            if (offset + 1 >= out_size) return false;
+            out[offset++] = '/';
+        }
+        if (offset + len >= out_size) return false;
+        memcpy(out + offset, segments[i], len);
+        offset += len;
+    }
+    if (offset == 0) {
+        if (out_size < 2) return false;
+        out[0] = absolute ? '/' : '.';
+        out[1] = '\0';
+        return true;
+    }
+    out[offset] = '\0';
+    return true;
 }
 
 static bool state_module_selected(const ProjectIndex* project, int module_index,
@@ -3085,22 +6394,30 @@ static FILE* open_index_output(const char* out_path) {
     return out;
 }
 
-bool resume_project_state(const char* state_path, const char* out_path) {
+bool resume_project_state(const char* state_path, const char* out_path,
+                          const char* focus_symbol, bool include_impact,
+                          bool brief_output) {
     ProjectStateManifest manifest;
     if (!load_project_state_manifest(state_path, &manifest)) return false;
 
     StringList stale_lines;
     StringList stale_module_refs;
     StringList stale_module_paths;
+    StateSymbolRowList all_rows;
+    StateSymbolRowList selected_rows;
     memset(&stale_lines, 0, sizeof(stale_lines));
     memset(&stale_module_refs, 0, sizeof(stale_module_refs));
     memset(&stale_module_paths, 0, sizeof(stale_module_paths));
+    memset(&all_rows, 0, sizeof(all_rows));
+    memset(&selected_rows, 0, sizeof(selected_rows));
     int stale_count = 0;
     bool ok = check_project_state_manifest(state_path, &manifest, &stale_lines, &stale_count);
     if (!ok) {
         free_string_list(&stale_lines);
         free_string_list(&stale_module_refs);
         free_string_list(&stale_module_paths);
+        free_state_symbol_rows(&all_rows);
+        free_state_symbol_rows(&selected_rows);
         free_project_state_manifest(&manifest);
         fprintf(stderr, "Indexer Error: Could not resume from state file \"%s\".\n", state_path);
         return false;
@@ -3110,9 +6427,39 @@ bool resume_project_state(const char* state_path, const char* out_path) {
         free_string_list(&stale_lines);
         free_string_list(&stale_module_refs);
         free_string_list(&stale_module_paths);
+        free_state_symbol_rows(&all_rows);
+        free_state_symbol_rows(&selected_rows);
         free_project_state_manifest(&manifest);
         fprintf(stderr, "Indexer Error: Could not map stale modules in state file \"%s\".\n", state_path);
         return false;
+    }
+
+    if ((focus_symbol && focus_symbol[0] != '\0') || brief_output) {
+        if (!load_state_symbol_rows_filtered(state_path, NULL, &all_rows)) {
+            free_string_list(&stale_lines);
+            free_string_list(&stale_module_refs);
+            free_string_list(&stale_module_paths);
+            free_state_symbol_rows(&all_rows);
+            free_state_symbol_rows(&selected_rows);
+            free_project_state_manifest(&manifest);
+            fprintf(stderr, "Indexer Error: Could not load symbol ledger for \"%s\".\n", state_path);
+            return false;
+        }
+    }
+    if (focus_symbol && focus_symbol[0] != '\0') {
+        if (!select_resume_symbol_rows(&all_rows, focus_symbol, include_impact, &selected_rows)) {
+            free_string_list(&stale_lines);
+            free_string_list(&stale_module_refs);
+            free_string_list(&stale_module_paths);
+            free_state_symbol_rows(&all_rows);
+            free_state_symbol_rows(&selected_rows);
+            free_project_state_manifest(&manifest);
+            fprintf(stderr, "Indexer Error: Could not focus resume state on \"%s\".\n", focus_symbol);
+            return false;
+        }
+    } else if (brief_output) {
+        selected_rows = all_rows;
+        memset(&all_rows, 0, sizeof(all_rows));
     }
 
     FILE* out = open_index_output(out_path);
@@ -3120,6 +6467,7 @@ bool resume_project_state(const char* state_path, const char* out_path) {
         free_string_list(&stale_lines);
         free_string_list(&stale_module_refs);
         free_string_list(&stale_module_paths);
+        free_state_symbol_rows(&selected_rows);
         free_project_state_manifest(&manifest);
         return false;
     }
@@ -3132,6 +6480,7 @@ bool resume_project_state(const char* state_path, const char* out_path) {
         free_string_list(&stale_lines);
         free_string_list(&stale_module_refs);
         free_string_list(&stale_module_paths);
+        free_state_symbol_rows(&selected_rows);
         free_project_state_manifest(&manifest);
         return false;
     }
@@ -3139,39 +6488,107 @@ bool resume_project_state(const char* state_path, const char* out_path) {
     char entry_display[MAX_PATH_LEN];
     format_pack_path(entry_path, entry_display, sizeof(entry_display));
 
-    fprintf(out, "PRESUMEv4\n");
+    fprintf(out, "%s\n", (focus_symbol && focus_symbol[0] != '\0') ? "PRESUMEv6" : "PRESUMEv4");
     fprintf(out, "state: %s\n", state_path);
     fprintf(out, "entry: %s\n", entry_display);
     fprintf(out, "focus: %s\n", manifest.focus[0] != '\0' ? manifest.focus : "-");
     fprintf(out, "impact: %s\n", manifest.include_impact ? "yes" : "no");
+    fprintf(out, "brief: %s\n", brief_output ? "yes" : "no");
+    if (focus_symbol && focus_symbol[0] != '\0') {
+        fprintf(out, "resume_focus: %s\n", focus_symbol);
+        fprintf(out, "resume_impact: %s\n", include_impact ? "yes" : "no");
+    }
     fprintf(out, "valid: %s\n", stale_count == 0 ? "yes" : "no");
     fprintf(out, "changed_files: %d\n", stale_count);
     fprintf(out, "semantic_items: %d\n", manifest.semantic_item_count);
     fprintf(out, "semantic_fingerprint: %s\n",
             manifest.semantic_fingerprint[0] != '\0' ? manifest.semantic_fingerprint : "-");
+    if (brief_output) {
+        emit_ledger_metrics(out, state_path, &selected_rows,
+                            focus_symbol && focus_symbol[0] != '\0');
+    }
+    if (!emit_state_verification_summary(state_path, &manifest,
+                                         &stale_lines, &stale_module_refs, out)) {
+        if (out != stdout) fclose(out);
+        free_string_list(&stale_lines);
+        free_string_list(&stale_module_refs);
+        free_string_list(&stale_module_paths);
+        free_state_symbol_rows(&all_rows);
+        free_state_symbol_rows(&selected_rows);
+        free_project_state_manifest(&manifest);
+        fprintf(stderr, "Indexer Error: Could not emit state verification summary for \"%s\".\n", state_path);
+        return false;
+    }
     if (stale_count > 0) {
+        bool stale_ok = true;
         fprintf(out, "stale_files:\n");
         for (int i = 0; i < stale_lines.count; i++) {
             fprintf(out, "  %s\n", stale_lines.items[i]);
         }
-        if (!emit_stale_module_section(out, &stale_module_refs, &stale_module_paths) ||
-            !emit_stale_symbol_section(state_path, out, &stale_module_refs)) {
+        stale_ok = emit_stale_module_section(out, &stale_module_refs, &stale_module_paths);
+        if (stale_ok) {
+            if (!focus_symbol || focus_symbol[0] == '\0') {
+                stale_ok = emit_stale_symbol_section(state_path, out, &stale_module_refs);
+            } else {
+                fprintf(out, "stale_symbols:\n");
+                for (int i = 0; i < selected_rows.count; i++) {
+                    if (string_list_index_of(&stale_module_refs, selected_rows.items[i].module_ref) == -1) {
+                        continue;
+                    }
+                    fprintf(out, "  %s\n", selected_rows.items[i].symbol_id);
+                }
+            }
+        }
+        if (!stale_ok) {
             if (out != stdout) fclose(out);
             free_string_list(&stale_lines);
             free_string_list(&stale_module_refs);
             free_string_list(&stale_module_paths);
+            free_state_symbol_rows(&all_rows);
+            free_state_symbol_rows(&selected_rows);
             free_project_state_manifest(&manifest);
             fprintf(stderr, "Indexer Error: Could not emit stale symbol map for \"%s\".\n", state_path);
             return false;
         }
     }
-    if (!emit_resume_symbol_ledger(state_path, out)) {
+    if (!brief_output) {
+        if ((focus_symbol && focus_symbol[0] != '\0')
+                ? !emit_resume_symbol_ledger_from_rows(state_path, &selected_rows, out)
+                : !emit_resume_symbol_ledger(state_path, out)) {
+            if (out != stdout) fclose(out);
+            free_string_list(&stale_lines);
+            free_string_list(&stale_module_refs);
+            free_string_list(&stale_module_paths);
+            free_state_symbol_rows(&all_rows);
+            free_state_symbol_rows(&selected_rows);
+            free_project_state_manifest(&manifest);
+            fprintf(stderr, "Indexer Error: Missing embedded symbol ledger in state file \"%s\".\n", state_path);
+            return false;
+        }
+    } else {
+        if (!emit_state_module_section_from_rows(state_path, &selected_rows, out) ||
+            !emit_state_brief_rows(out, &selected_rows)) {
+            if (out != stdout) fclose(out);
+            free_string_list(&stale_lines);
+            free_string_list(&stale_module_refs);
+            free_string_list(&stale_module_paths);
+            free_state_symbol_rows(&all_rows);
+            free_state_symbol_rows(&selected_rows);
+            free_project_state_manifest(&manifest);
+            fprintf(stderr, "Indexer Error: Could not emit brief state resume for \"%s\".\n", state_path);
+            return false;
+        }
+    }
+    if (focus_symbol && focus_symbol[0] != '\0' &&
+        !emit_state_linked_tests(state_path, &selected_rows, out)) {
         if (out != stdout) fclose(out);
         free_string_list(&stale_lines);
         free_string_list(&stale_module_refs);
         free_string_list(&stale_module_paths);
+        free_state_symbol_rows(&all_rows);
+        free_state_symbol_rows(&selected_rows);
         free_project_state_manifest(&manifest);
-        fprintf(stderr, "Indexer Error: Missing embedded symbol ledger in state file \"%s\".\n", state_path);
+        fprintf(stderr, "Indexer Error: Could not emit linked tests for \"%s\".\n", state_path);
         return false;
     }
 
@@ -3179,6 +6596,355 @@ bool resume_project_state(const char* state_path, const char* out_path) {
     free_string_list(&stale_lines);
     free_string_list(&stale_module_refs);
     free_string_list(&stale_module_paths);
+    free_state_symbol_rows(&all_rows);
+    free_state_symbol_rows(&selected_rows);
+    free_project_state_manifest(&manifest);
+    return true;
+}
+
+bool query_project_state(const char* state_path, const char* out_path,
+                         const char* name_filter, const char* effect_filter,
+                         const char* call_filter, bool include_impact,
+                         bool include_dependencies, bool brief_output) {
+    if ((!name_filter || name_filter[0] == '\0') &&
+        (!effect_filter || effect_filter[0] == '\0') &&
+        (!call_filter || call_filter[0] == '\0')) {
+        fprintf(stderr, "Indexer Error: state query requires at least one filter.\n");
+        return false;
+    }
+
+    ProjectStateManifest manifest;
+    if (!load_project_state_manifest(state_path, &manifest)) return false;
+
+    StringList stale_lines;
+    StringList stale_module_refs;
+    StringList stale_module_paths;
+    StateSymbolRowList all_rows;
+    StateSymbolRowList selected_rows;
+    memset(&stale_lines, 0, sizeof(stale_lines));
+    memset(&stale_module_refs, 0, sizeof(stale_module_refs));
+    memset(&stale_module_paths, 0, sizeof(stale_module_paths));
+    memset(&all_rows, 0, sizeof(all_rows));
+    memset(&selected_rows, 0, sizeof(selected_rows));
+    int seed_matches = 0;
+
+    int stale_count = 0;
+    bool ok = check_project_state_manifest(state_path, &manifest, &stale_lines, &stale_count);
+    if (!ok) {
+        free_string_list(&stale_lines);
+        free_string_list(&stale_module_refs);
+        free_string_list(&stale_module_paths);
+        free_state_symbol_rows(&all_rows);
+        free_state_symbol_rows(&selected_rows);
+        free_project_state_manifest(&manifest);
+        fprintf(stderr, "Indexer Error: Could not query state file \"%s\".\n", state_path);
+        return false;
+    }
+    if (stale_count > 0 &&
+        !collect_stale_module_refs(state_path, &stale_lines, &stale_module_refs, &stale_module_paths)) {
+        free_string_list(&stale_lines);
+        free_string_list(&stale_module_refs);
+        free_string_list(&stale_module_paths);
+        free_state_symbol_rows(&all_rows);
+        free_state_symbol_rows(&selected_rows);
+        free_project_state_manifest(&manifest);
+        fprintf(stderr, "Indexer Error: Could not map stale modules in state file \"%s\".\n", state_path);
+        return false;
+    }
+    if (!load_state_symbol_rows_filtered(state_path, NULL, &all_rows) ||
+        !select_query_symbol_rows(&all_rows, name_filter, effect_filter, call_filter,
+                                  include_impact, include_dependencies,
+                                  &selected_rows, &seed_matches)) {
+        free_string_list(&stale_lines);
+        free_string_list(&stale_module_refs);
+        free_string_list(&stale_module_paths);
+        free_state_symbol_rows(&all_rows);
+        free_state_symbol_rows(&selected_rows);
+        free_project_state_manifest(&manifest);
+        fprintf(stderr, "Indexer Error: Could not query symbol ledger in \"%s\".\n", state_path);
+        return false;
+    }
+
+    FILE* out = open_index_output(out_path);
+    if (!out) {
+        free_string_list(&stale_lines);
+        free_string_list(&stale_module_refs);
+        free_string_list(&stale_module_paths);
+        free_state_symbol_rows(&all_rows);
+        free_state_symbol_rows(&selected_rows);
+        free_project_state_manifest(&manifest);
+        return false;
+    }
+
+    char root_path[MAX_PATH_LEN];
+    char entry_path[MAX_PATH_LEN];
+    if (!resolve_manifest_root(state_path, &manifest, root_path, sizeof(root_path)) ||
+        !resolve_state_path(root_path, manifest.entry, entry_path, sizeof(entry_path))) {
+        if (out != stdout) fclose(out);
+        free_string_list(&stale_lines);
+        free_string_list(&stale_module_refs);
+        free_string_list(&stale_module_paths);
+        free_state_symbol_rows(&all_rows);
+        free_state_symbol_rows(&selected_rows);
+        free_project_state_manifest(&manifest);
+        return false;
+    }
+
+    char entry_display[MAX_PATH_LEN];
+    format_pack_path(entry_path, entry_display, sizeof(entry_display));
+
+    fprintf(out, "PQUERYv3\n");
+    fprintf(out, "state: %s\n", state_path);
+    fprintf(out, "entry: %s\n", entry_display);
+    fprintf(out, "focus: %s\n", manifest.focus[0] != '\0' ? manifest.focus : "-");
+    fprintf(out, "impact: %s\n", manifest.include_impact ? "yes" : "no");
+    fprintf(out, "brief: %s\n", brief_output ? "yes" : "no");
+    fprintf(out, "query_name: %s\n", (name_filter && name_filter[0] != '\0') ? name_filter : "-");
+    fprintf(out, "query_effect: %s\n", (effect_filter && effect_filter[0] != '\0') ? effect_filter : "-");
+    fprintf(out, "query_call: %s\n", (call_filter && call_filter[0] != '\0') ? call_filter : "-");
+    fprintf(out, "query_impact: %s\n", include_impact ? "yes" : "no");
+    fprintf(out, "query_deps: %s\n", include_dependencies ? "yes" : "no");
+    fprintf(out, "valid: %s\n", stale_count == 0 ? "yes" : "no");
+    fprintf(out, "changed_files: %d\n", stale_count);
+    fprintf(out, "seed_matches: %d\n", seed_matches);
+    fprintf(out, "matches: %d\n", selected_rows.count);
+    if (brief_output) {
+        emit_ledger_metrics(out, state_path, &selected_rows, true);
+    }
+    if (!emit_state_verification_summary(state_path, &manifest,
+                                         &stale_lines, &stale_module_refs, out)) {
+        if (out != stdout) fclose(out);
+        free_string_list(&stale_lines);
+        free_string_list(&stale_module_refs);
+        free_string_list(&stale_module_paths);
+        free_state_symbol_rows(&all_rows);
+        free_state_symbol_rows(&selected_rows);
+        free_project_state_manifest(&manifest);
+        fprintf(stderr, "Indexer Error: Could not emit state verification summary for \"%s\".\n", state_path);
+        return false;
+    }
+    if (stale_count > 0) {
+        fprintf(out, "stale_files:\n");
+        for (int i = 0; i < stale_lines.count; i++) {
+            fprintf(out, "  %s\n", stale_lines.items[i]);
+        }
+        if (!emit_stale_module_section(out, &stale_module_refs, &stale_module_paths)) {
+            if (out != stdout) fclose(out);
+            free_string_list(&stale_lines);
+            free_string_list(&stale_module_refs);
+            free_string_list(&stale_module_paths);
+            free_state_symbol_rows(&all_rows);
+            free_state_symbol_rows(&selected_rows);
+            free_project_state_manifest(&manifest);
+            fprintf(stderr, "Indexer Error: Could not emit stale module map for \"%s\".\n", state_path);
+            return false;
+        }
+        fprintf(out, "stale_symbols:\n");
+        for (int i = 0; i < selected_rows.count; i++) {
+            if (string_list_index_of(&stale_module_refs, selected_rows.items[i].module_ref) == -1) continue;
+            fprintf(out, "  %s\n", selected_rows.items[i].symbol_id);
+        }
+    }
+    if ((include_impact || include_dependencies) &&
+        !emit_query_paths_and_explain(out, &selected_rows, name_filter, effect_filter, call_filter,
+                                      include_impact, include_dependencies)) {
+        if (out != stdout) fclose(out);
+        free_string_list(&stale_lines);
+        free_string_list(&stale_module_refs);
+        free_string_list(&stale_module_paths);
+        free_state_symbol_rows(&all_rows);
+        free_state_symbol_rows(&selected_rows);
+        free_project_state_manifest(&manifest);
+        fprintf(stderr, "Indexer Error: Could not emit query paths for \"%s\".\n", state_path);
+        return false;
+    }
+    if ((include_impact || include_dependencies) &&
+        !emit_query_risk_top(out, &selected_rows)) {
+        if (out != stdout) fclose(out);
+        free_string_list(&stale_lines);
+        free_string_list(&stale_module_refs);
+        free_string_list(&stale_module_paths);
+        free_state_symbol_rows(&all_rows);
+        free_state_symbol_rows(&selected_rows);
+        free_project_state_manifest(&manifest);
+        fprintf(stderr, "Indexer Error: Could not emit risk ranking for \"%s\".\n", state_path);
+        return false;
+    }
+    if (!brief_output) {
+        if (!emit_resume_symbol_ledger_from_rows(state_path, &selected_rows, out)) {
+            if (out != stdout) fclose(out);
+            free_string_list(&stale_lines);
+            free_string_list(&stale_module_refs);
+            free_string_list(&stale_module_paths);
+            free_state_symbol_rows(&all_rows);
+            free_state_symbol_rows(&selected_rows);
+            free_project_state_manifest(&manifest);
+            fprintf(stderr, "Indexer Error: Could not emit state query for \"%s\".\n", state_path);
+            return false;
+        }
+    } else {
+        if (!emit_state_module_section_from_rows(state_path, &selected_rows, out) ||
+            !emit_state_brief_rows(out, &selected_rows)) {
+            if (out != stdout) fclose(out);
+            free_string_list(&stale_lines);
+            free_string_list(&stale_module_refs);
+            free_string_list(&stale_module_paths);
+            free_state_symbol_rows(&all_rows);
+            free_state_symbol_rows(&selected_rows);
+            free_project_state_manifest(&manifest);
+            fprintf(stderr, "Indexer Error: Could not emit brief state query for \"%s\".\n", state_path);
+            return false;
+        }
+    }
+    if (!emit_state_linked_tests(state_path, &selected_rows, out)) {
+        if (out != stdout) fclose(out);
+        free_string_list(&stale_lines);
+        free_string_list(&stale_module_refs);
+        free_string_list(&stale_module_paths);
+        free_state_symbol_rows(&all_rows);
+        free_state_symbol_rows(&selected_rows);
+        free_project_state_manifest(&manifest);
+        fprintf(stderr, "Indexer Error: Could not emit linked tests for \"%s\".\n", state_path);
+        return false;
+    }
+
+    if (out != stdout) fclose(out);
+    free_string_list(&stale_lines);
+    free_string_list(&stale_module_refs);
+    free_string_list(&stale_module_paths);
+    free_state_symbol_rows(&all_rows);
+    free_state_symbol_rows(&selected_rows);
+    free_project_state_manifest(&manifest);
+    return true;
+}
+
+bool bench_project_state(const char* state_path, const char* out_path,
+                         const char* focus_symbol, const char* name_filter,
+                         const char* effect_filter, const char* call_filter,
+                         bool include_impact, bool include_dependencies) {
+    bool query_mode = (name_filter && name_filter[0] != '\0') ||
+                      (effect_filter && effect_filter[0] != '\0') ||
+                      (call_filter && call_filter[0] != '\0');
+    if (!query_mode && include_dependencies) {
+        fprintf(stderr, "Indexer Error: state benchmark dependencies require a query filter.\n");
+        return false;
+    }
+
+    ProjectStateManifest manifest;
+    if (!load_project_state_manifest(state_path, &manifest)) return false;
+
+    StringList stale_lines;
+    StateSymbolRowList all_rows;
+    StateSymbolRowList selected_rows;
+    memset(&stale_lines, 0, sizeof(stale_lines));
+    memset(&all_rows, 0, sizeof(all_rows));
+    memset(&selected_rows, 0, sizeof(selected_rows));
+
+    int stale_count = 0;
+    int seed_matches = 0;
+    bool ok = check_project_state_manifest(state_path, &manifest, &stale_lines, &stale_count);
+    if (!ok || !load_state_symbol_rows_filtered(state_path, NULL, &all_rows)) {
+        free_string_list(&stale_lines);
+        free_state_symbol_rows(&all_rows);
+        free_state_symbol_rows(&selected_rows);
+        free_project_state_manifest(&manifest);
+        fprintf(stderr, "Indexer Error: Could not load state benchmark inputs for \"%s\".\n", state_path);
+        return false;
+    }
+
+    if (query_mode) {
+        ok = select_query_symbol_rows(&all_rows, name_filter, effect_filter, call_filter,
+                                      include_impact, include_dependencies,
+                                      &selected_rows, &seed_matches);
+    } else if (focus_symbol && focus_symbol[0] != '\0') {
+        ok = select_resume_symbol_rows(&all_rows, focus_symbol, include_impact, &selected_rows);
+    } else {
+        selected_rows = all_rows;
+        memset(&all_rows, 0, sizeof(all_rows));
+    }
+
+    if (!ok) {
+        free_string_list(&stale_lines);
+        free_state_symbol_rows(&all_rows);
+        free_state_symbol_rows(&selected_rows);
+        free_project_state_manifest(&manifest);
+        fprintf(stderr, "Indexer Error: Could not select state benchmark slice for \"%s\".\n", state_path);
+        return false;
+    }
+
+    StatePayloadMetrics metrics;
+    bool include_tests = query_mode || (focus_symbol && focus_symbol[0] != '\0');
+    if (!compute_state_payload_metrics(state_path, &selected_rows, include_tests, &metrics)) {
+        free_string_list(&stale_lines);
+        free_state_symbol_rows(&all_rows);
+        free_state_symbol_rows(&selected_rows);
+        free_project_state_manifest(&manifest);
+        fprintf(stderr, "Indexer Error: Could not compute state benchmark metrics for \"%s\".\n", state_path);
+        return false;
+    }
+
+    FILE* out = open_index_output(out_path);
+    if (!out) {
+        free_string_list(&stale_lines);
+        free_state_symbol_rows(&all_rows);
+        free_state_symbol_rows(&selected_rows);
+        free_project_state_manifest(&manifest);
+        return false;
+    }
+
+    char root_path[MAX_PATH_LEN];
+    char entry_path[MAX_PATH_LEN];
+    if (!resolve_manifest_root(state_path, &manifest, root_path, sizeof(root_path)) ||
+        !resolve_state_path(root_path, manifest.entry, entry_path, sizeof(entry_path))) {
+        if (out != stdout) fclose(out);
+        free_string_list(&stale_lines);
+        free_state_symbol_rows(&all_rows);
+        free_state_symbol_rows(&selected_rows);
+        free_project_state_manifest(&manifest);
+        return false;
+    }
+
+    char entry_display[MAX_PATH_LEN];
+    format_pack_path(entry_path, entry_display, sizeof(entry_display));
+
+    fprintf(out, "PBENCHv1\n");
+    fprintf(out, "state: %s\n", state_path);
+    fprintf(out, "entry: %s\n", entry_display);
+    fprintf(out, "mode: %s\n", query_mode ? "query" : "resume");
+    fprintf(out, "scope: ledger\n");
+    fprintf(out, "focus: %s\n", manifest.focus[0] != '\0' ? manifest.focus : "-");
+    fprintf(out, "impact: %s\n", manifest.include_impact ? "yes" : "no");
+    if (query_mode) {
+        fprintf(out, "query_name: %s\n", (name_filter && name_filter[0] != '\0') ? name_filter : "-");
+        fprintf(out, "query_effect: %s\n", (effect_filter && effect_filter[0] != '\0') ? effect_filter : "-");
+        fprintf(out, "query_call: %s\n", (call_filter && call_filter[0] != '\0') ? call_filter : "-");
+        fprintf(out, "query_impact: %s\n", include_impact ? "yes" : "no");
+        fprintf(out, "query_deps: %s\n", include_dependencies ? "yes" : "no");
+        fprintf(out, "seed_matches: %d\n", seed_matches);
+    } else {
+        fprintf(out, "resume_focus: %s\n",
+                (focus_symbol && focus_symbol[0] != '\0') ? focus_symbol : "-");
+        fprintf(out, "resume_impact: %s\n", include_impact ? "yes" : "no");
+    }
+    fprintf(out, "valid: %s\n", stale_count == 0 ? "yes" : "no");
+    fprintf(out, "changed_files: %d\n", stale_count);
+    fprintf(out, "selection_symbols: %d\n", selected_rows.count);
+    fprintf(out, "selection_modules: %d\n", count_unique_state_modules(&selected_rows));
+    fprintf(out, "include_tests: %s\n", include_tests ? "yes" : "no");
+    fprintf(out, "brief_bytes: %ld\n", metrics.brief_bytes);
+    fprintf(out, "full_bytes: %ld\n", metrics.full_bytes);
+    fprintf(out, "saved_bytes: %ld\n", metrics.saved_bytes);
+    fprintf(out, "saved_pct: %ld\n", metrics.saved_pct);
+    fprintf(out, "brief_tokens_est: %ld\n", metrics.brief_tokens_est);
+    fprintf(out, "full_tokens_est: %ld\n", metrics.full_tokens_est);
+    fprintf(out, "saved_tokens_est: %ld\n", metrics.saved_tokens_est);
+    fprintf(out, "brief_emit_us: %llu\n", metrics.brief_emit_us);
+    fprintf(out, "full_emit_us: %llu\n", metrics.full_emit_us);
+
+    if (out != stdout) fclose(out);
+    free_string_list(&stale_lines);
+    free_state_symbol_rows(&all_rows);
+    free_state_symbol_rows(&selected_rows);
     free_project_state_manifest(&manifest);
     return true;
 }
@@ -3245,6 +7011,16 @@ bool verify_project_state(const char* state_path, const char* out_path) {
     fprintf(out, "tracked_modules: %d\n", manifest.tracked_paths.count);
     fprintf(out, "valid: %s\n", stale_count == 0 ? "yes" : "no");
     fprintf(out, "changed_files: %d\n", stale_count);
+    if (!emit_state_verification_summary(state_path, &manifest,
+                                         &stale_lines, &stale_module_refs, out)) {
+        if (out != stdout) fclose(out);
+        free_string_list(&stale_lines);
+        free_string_list(&stale_module_refs);
+        free_string_list(&stale_module_paths);
+        free_project_state_manifest(&manifest);
+        fprintf(stderr, "Indexer Error: Could not emit state verification summary for \"%s\".\n", state_path);
+        return false;
+    }
     if (stale_count > 0) {
         fprintf(out, "stale_files:\n");
         for (int i = 0; i < stale_lines.count; i++) {
@@ -3274,11 +7050,13 @@ bool refresh_project_state(const char* state_path, const char* out_path) {
     ProjectStateManifest manifest;
     if (!load_project_state_manifest(state_path, &manifest)) return false;
 
+    StateProofSummary existing_proof;
     StringList stale_lines;
     StringList stale_module_refs;
     StringList stale_module_paths;
     StringList refreshed_module_refs;
     StringList refreshed_module_paths;
+    memset(&existing_proof, 0, sizeof(existing_proof));
     memset(&stale_lines, 0, sizeof(stale_lines));
     memset(&stale_module_refs, 0, sizeof(stale_module_refs));
     memset(&stale_module_paths, 0, sizeof(stale_module_paths));
@@ -3306,11 +7084,22 @@ bool refresh_project_state(const char* state_path, const char* out_path) {
         fprintf(stderr, "Indexer Error: Could not map stale modules in state file \"%s\".\n", state_path);
         return false;
     }
+    if (!load_state_proof_summary(state_path, &existing_proof)) {
+        free_string_list(&stale_lines);
+        free_string_list(&stale_module_refs);
+        free_string_list(&stale_module_paths);
+        free_string_list(&refreshed_module_refs);
+        free_string_list(&refreshed_module_paths);
+        free_project_state_manifest(&manifest);
+        fprintf(stderr, "Indexer Error: Could not load state proof for \"%s\".\n", state_path);
+        return false;
+    }
 
     char root_path[MAX_PATH_LEN];
     char entry_path[MAX_PATH_LEN];
     if (!resolve_manifest_root(state_path, &manifest, root_path, sizeof(root_path)) ||
         !resolve_state_path(root_path, manifest.entry, entry_path, sizeof(entry_path))) {
+        free_state_proof_summary(&existing_proof);
         free_string_list(&stale_lines);
         free_string_list(&stale_module_refs);
         free_string_list(&stale_module_paths);
@@ -3321,7 +7110,11 @@ bool refresh_project_state(const char* state_path, const char* out_path) {
     }
 
     char temp_state_path[MAX_PATH_LEN];
+    char temp_proof_path[MAX_PATH_LEN];
+    char final_proof_path[MAX_PATH_LEN];
     temp_state_path[0] = '\0';
+    temp_proof_path[0] = '\0';
+    final_proof_path[0] = '\0';
     ProjectStateManifest refreshed_manifest;
     ProjectIndex refreshed_project;
     StringList tracked_module_paths;
@@ -3329,10 +7122,15 @@ bool refresh_project_state(const char* state_path, const char* out_path) {
     memset(&refreshed_project, 0, sizeof(refreshed_project));
     memset(&tracked_module_paths, 0, sizeof(tracked_module_paths));
     bool semantic_changed = false;
+    bool proof_should_refresh = false;
+    bool proof_refreshed = false;
+    int proof_tests_planned = existing_proof.present ? existing_proof.tests_planned : 0;
+    int proof_tests_failed = existing_proof.present ? existing_proof.tests_failed : 0;
 
     if (stale_count > 0) {
         if (snprintf(temp_state_path, sizeof(temp_state_path), "%s.tmp-%ld",
                      state_path, (long)getpid()) >= (int)sizeof(temp_state_path)) {
+            free_state_proof_summary(&existing_proof);
             free_string_list(&stale_lines);
             free_string_list(&stale_module_refs);
             free_string_list(&stale_module_paths);
@@ -3350,6 +7148,7 @@ bool refresh_project_state(const char* state_path, const char* out_path) {
                                              manifest.focus[0] != '\0' ? manifest.focus : NULL,
                                              manifest.include_impact)) {
             unlink(temp_state_path);
+            free_state_proof_summary(&existing_proof);
             free_string_list(&stale_lines);
             free_string_list(&stale_module_refs);
             free_string_list(&stale_module_paths);
@@ -3362,6 +7161,7 @@ bool refresh_project_state(const char* state_path, const char* out_path) {
         }
         if (!load_project_state_manifest(temp_state_path, &refreshed_manifest)) {
             unlink(temp_state_path);
+            free_state_proof_summary(&existing_proof);
             free_string_list(&stale_lines);
             free_string_list(&stale_module_refs);
             free_string_list(&stale_module_paths);
@@ -3380,6 +7180,7 @@ bool refresh_project_state(const char* state_path, const char* out_path) {
             !collect_state_module_refs_for_paths(temp_state_path, &stale_module_paths,
                                                  &refreshed_module_refs, &refreshed_module_paths)) {
             unlink(temp_state_path);
+            free_state_proof_summary(&existing_proof);
             free_string_list(&stale_lines);
             free_string_list(&stale_module_refs);
             free_string_list(&stale_module_paths);
@@ -3392,24 +7193,55 @@ bool refresh_project_state(const char* state_path, const char* out_path) {
             fprintf(stderr, "Indexer Error: Could not map refreshed modules in state file \"%s\".\n", state_path);
             return false;
         }
-        if (rename(temp_state_path, state_path) != 0) {
-            unlink(temp_state_path);
-            free_string_list(&stale_lines);
-            free_string_list(&stale_module_refs);
-            free_string_list(&stale_module_paths);
-            free_string_list(&refreshed_module_refs);
-            free_string_list(&refreshed_module_paths);
-            free_string_list(&tracked_module_paths);
-            free_project(&refreshed_project);
-            free_project_state_manifest(&refreshed_manifest);
-            free_project_state_manifest(&manifest);
-            fprintf(stderr, "Indexer Error: Could not replace state file \"%s\".\n", state_path);
-            return false;
+
+        proof_should_refresh =
+            existing_proof.present &&
+            (semantic_changed || stale_lines_include_tracked_test_change(&manifest, &stale_lines));
+        if (proof_should_refresh) {
+            if (!build_state_proof_path(state_path, final_proof_path, sizeof(final_proof_path)) ||
+                snprintf(temp_proof_path, sizeof(temp_proof_path), "%s.tmp-%ld",
+                         final_proof_path, (long)getpid()) >= (int)sizeof(temp_proof_path)) {
+                unlink(temp_state_path);
+                free_state_proof_summary(&existing_proof);
+                free_string_list(&stale_lines);
+                free_string_list(&stale_module_refs);
+                free_string_list(&stale_module_paths);
+                free_string_list(&refreshed_module_refs);
+                free_string_list(&refreshed_module_paths);
+                free_string_list(&tracked_module_paths);
+                free_project(&refreshed_project);
+                free_project_state_manifest(&refreshed_manifest);
+                free_project_state_manifest(&manifest);
+                fprintf(stderr, "Indexer Error: Could not allocate state proof path for \"%s\".\n", state_path);
+                return false;
+            }
+            unlink(temp_proof_path);
+            if (!write_state_linked_proof(state_path, temp_state_path, temp_proof_path,
+                                          &proof_tests_planned, &proof_tests_failed)) {
+                unlink(temp_state_path);
+                unlink(temp_proof_path);
+                free_state_proof_summary(&existing_proof);
+                free_string_list(&stale_lines);
+                free_string_list(&stale_module_refs);
+                free_string_list(&stale_module_paths);
+                free_string_list(&refreshed_module_refs);
+                free_string_list(&refreshed_module_paths);
+                free_string_list(&tracked_module_paths);
+                free_project(&refreshed_project);
+                free_project_state_manifest(&refreshed_manifest);
+                free_project_state_manifest(&manifest);
+                fprintf(stderr, "Indexer Error: Could not refresh state proof for \"%s\".\n", state_path);
+                return false;
+            }
+            proof_refreshed = true;
         }
     }
 
     FILE* out = open_index_output(out_path);
     if (!out) {
+        unlink(temp_proof_path);
+        unlink(temp_state_path);
+        free_state_proof_summary(&existing_proof);
         free_string_list(&stale_lines);
         free_string_list(&stale_module_refs);
         free_string_list(&stale_module_paths);
@@ -3430,13 +7262,42 @@ bool refresh_project_state(const char* state_path, const char* out_path) {
     fprintf(out, "changed_files: %d\n", stale_count);
     fprintf(out, "status: %s\n",
             stale_count == 0 ? "unchanged" : (semantic_changed ? "refreshed" : "rehashed"));
+    if (!emit_state_verification_summary(state_path, &manifest,
+                                         &stale_lines, &stale_module_refs, out)) {
+        if (out != stdout) fclose(out);
+        unlink(temp_proof_path);
+        unlink(temp_state_path);
+        free_state_proof_summary(&existing_proof);
+        free_string_list(&stale_lines);
+        free_string_list(&stale_module_refs);
+        free_string_list(&stale_module_paths);
+        free_string_list(&refreshed_module_refs);
+        free_string_list(&refreshed_module_paths);
+        free_string_list(&tracked_module_paths);
+        free_project(&refreshed_project);
+        free_project_state_manifest(&refreshed_manifest);
+        free_project_state_manifest(&manifest);
+        fprintf(stderr, "Indexer Error: Could not emit state verification summary for \"%s\".\n", state_path);
+        return false;
+    }
+    fprintf(out, "proof: %s\n",
+            !existing_proof.present ? "none" :
+            (proof_refreshed ? (proof_tests_failed == 0 ? "refreshed" : "refreshed-fail") : "retained"));
+    if (existing_proof.present || proof_refreshed) {
+        fprintf(out, "proof_tests: %d\n", proof_tests_planned);
+        fprintf(out, "proof_failed: %d\n", proof_tests_failed);
+    }
     if (stale_count > 0) {
         int patched_symbols = 0;
         fprintf(out, "patched_modules: %d\n", semantic_changed ? refreshed_module_refs.count : 0);
         if (semantic_changed) {
-            if (!emit_patch_symbol_ledger(state_path, &refreshed_module_refs, &refreshed_module_paths, out,
+            if (!emit_patch_symbol_ledger(state_path, temp_state_path,
+                                          &refreshed_module_refs, &refreshed_module_paths, out,
                                           &patched_symbols)) {
                 if (out != stdout) fclose(out);
+                unlink(temp_proof_path);
+                unlink(temp_state_path);
+                free_state_proof_summary(&existing_proof);
                 free_string_list(&stale_lines);
                 free_string_list(&stale_module_refs);
                 free_string_list(&stale_module_paths);
@@ -3452,6 +7313,40 @@ bool refresh_project_state(const char* state_path, const char* out_path) {
     }
 
     if (out != stdout) fclose(out);
+    if (stale_count > 0) {
+        if (rename(temp_state_path, state_path) != 0) {
+            unlink(temp_state_path);
+            unlink(temp_proof_path);
+            free_state_proof_summary(&existing_proof);
+            free_string_list(&stale_lines);
+            free_string_list(&stale_module_refs);
+            free_string_list(&stale_module_paths);
+            free_string_list(&refreshed_module_refs);
+            free_string_list(&refreshed_module_paths);
+            free_string_list(&tracked_module_paths);
+            free_project(&refreshed_project);
+            free_project_state_manifest(&refreshed_manifest);
+            free_project_state_manifest(&manifest);
+            fprintf(stderr, "Indexer Error: Could not replace state file \"%s\".\n", state_path);
+            return false;
+        }
+        if (proof_refreshed && rename(temp_proof_path, final_proof_path) != 0) {
+            unlink(temp_proof_path);
+            free_state_proof_summary(&existing_proof);
+            free_string_list(&stale_lines);
+            free_string_list(&stale_module_refs);
+            free_string_list(&stale_module_paths);
+            free_string_list(&refreshed_module_refs);
+            free_string_list(&refreshed_module_paths);
+            free_string_list(&tracked_module_paths);
+            free_project(&refreshed_project);
+            free_project_state_manifest(&refreshed_manifest);
+            free_project_state_manifest(&manifest);
+            fprintf(stderr, "Indexer Error: Could not replace state proof file \"%s\".\n", final_proof_path);
+            return false;
+        }
+    }
+    free_state_proof_summary(&existing_proof);
     free_string_list(&stale_lines);
     free_string_list(&stale_module_refs);
     free_string_list(&stale_module_paths);
@@ -3476,9 +7371,11 @@ static bool emit_project_state_from_project(const ProjectIndex* project, const c
     FocusSlice impact_slice;
     FocusSlice* impact_slice_ptr = NULL;
     SemanticItemList semantic_items;
+    StateTestLinkList test_links;
     memset(&focus_slice, 0, sizeof(focus_slice));
     memset(&impact_slice, 0, sizeof(impact_slice));
     memset(&semantic_items, 0, sizeof(semantic_items));
+    memset(&test_links, 0, sizeof(test_links));
 
     bool focused = focus_symbol && focus_symbol[0] != '\0';
     if (focused) {
@@ -3505,6 +7402,14 @@ static bool emit_project_state_from_project(const ProjectIndex* project, const c
         free_focus_slice(&focus_slice);
         return false;
     }
+    if (!collect_state_test_links(index_project_root[0] != '\0' ? index_project_root : ".",
+                                  &semantic_items, &test_links)) {
+        if (out != stdout) fclose(out);
+        free_semantic_items(&semantic_items);
+        free_focus_slice(&impact_slice);
+        free_focus_slice(&focus_slice);
+        return false;
+    }
 
     int tracked_modules = 0;
     for (int i = 0; i < project->module_count; i++) {
@@ -3519,6 +7424,7 @@ static bool emit_project_state_from_project(const ProjectIndex* project, const c
     if (!compute_semantic_fingerprint(&semantic_items, semantic_fingerprint)) {
         if (out != stdout) fclose(out);
         free_semantic_items(&semantic_items);
+        free_state_test_links(&test_links);
         free_focus_slice(&impact_slice);
         free_focus_slice(&focus_slice);
         return false;
@@ -3542,6 +7448,8 @@ static bool emit_project_state_from_project(const ProjectIndex* project, const c
         if (!format_pack_path(project->modules[i].path, module_path, sizeof(module_path)) ||
             !compute_module_hash_hex(project->modules[i].path, hash_hex)) {
             if (out != stdout) fclose(out);
+            free_semantic_items(&semantic_items);
+            free_state_test_links(&test_links);
             free_focus_slice(&impact_slice);
             free_focus_slice(&focus_slice);
             return false;
@@ -3551,6 +7459,7 @@ static bool emit_project_state_from_project(const ProjectIndex* project, const c
     if (!emit_symbol_index_sections(out, &semantic_items)) {
         if (out != stdout) fclose(out);
         free_semantic_items(&semantic_items);
+        free_state_test_links(&test_links);
         free_focus_slice(&impact_slice);
         free_focus_slice(&focus_slice);
         return false;
@@ -3559,12 +7468,21 @@ static bool emit_project_state_from_project(const ProjectIndex* project, const c
     for (int i = 0; i < semantic_items.count; i++) {
         fprintf(out, "  %s\n", semantic_items.items[i].text);
     }
+    if (!emit_state_test_sections(out, &test_links)) {
+        if (out != stdout) fclose(out);
+        free_semantic_items(&semantic_items);
+        free_state_test_links(&test_links);
+        free_focus_slice(&impact_slice);
+        free_focus_slice(&focus_slice);
+        return false;
+    }
     fprintf(out, "context:\n");
     emit_context_pack_text(out, project, entry_path, focus_slice_ptr, impact_slice_ptr,
                            focus_symbol, include_impact);
 
     if (out != stdout) fclose(out);
     free_semantic_items(&semantic_items);
+    free_state_test_links(&test_links);
     free_focus_slice(&impact_slice);
     free_focus_slice(&focus_slice);
     return true;
@@ -3579,6 +7497,305 @@ bool emit_project_state(const char* entry_file, const char* out_path,
     bool ok = emit_project_state_from_project(&project, entry_path, out_path, focus_symbol, include_impact);
     free_project(&project);
     return ok;
+}
+
+bool emit_state_plan(const char* before_state, const char* after_state, const char* out_path) {
+    if (!before_state || !after_state) {
+        fprintf(stderr, "Indexer Error: state plan requires before and after state files.\n");
+        return false;
+    }
+
+    ProjectStateManifest before_manifest;
+    ProjectStateManifest after_manifest;
+    SemanticItemList before_items;
+    SemanticItemList after_items;
+    StateSymbolRowList before_rows;
+    StateSymbolRowList after_rows;
+    memset(&before_manifest, 0, sizeof(before_manifest));
+    memset(&after_manifest, 0, sizeof(after_manifest));
+    memset(&before_items, 0, sizeof(before_items));
+    memset(&after_items, 0, sizeof(after_items));
+    memset(&before_rows, 0, sizeof(before_rows));
+    memset(&after_rows, 0, sizeof(after_rows));
+
+    bool ok = load_project_state_manifest(before_state, &before_manifest) &&
+              load_project_state_manifest(after_state, &after_manifest) &&
+              load_state_semantic_items(before_state, &before_items) &&
+              load_state_semantic_items(after_state, &after_items) &&
+              load_state_symbol_rows_filtered(before_state, NULL, &before_rows) &&
+              load_state_symbol_rows_filtered(after_state, NULL, &after_rows);
+    if (!ok) {
+        free_project_state_manifest(&before_manifest);
+        free_project_state_manifest(&after_manifest);
+        free_semantic_items(&before_items);
+        free_semantic_items(&after_items);
+        free_state_symbol_rows(&before_rows);
+        free_state_symbol_rows(&after_rows);
+        fprintf(stderr, "Indexer Error: Could not load state plan inputs.\n");
+        return false;
+    }
+
+    if (strcmp(before_manifest.focus, after_manifest.focus) != 0 ||
+        before_manifest.include_impact != after_manifest.include_impact) {
+        free_project_state_manifest(&before_manifest);
+        free_project_state_manifest(&after_manifest);
+        free_semantic_items(&before_items);
+        free_semantic_items(&after_items);
+        free_state_symbol_rows(&before_rows);
+        free_state_symbol_rows(&after_rows);
+        fprintf(stderr, "Indexer Error: state plan requires matching focus and impact settings.\n");
+        return false;
+    }
+
+    FILE* out = open_index_output(out_path);
+    if (!out) {
+        free_project_state_manifest(&before_manifest);
+        free_project_state_manifest(&after_manifest);
+        free_semantic_items(&before_items);
+        free_semantic_items(&after_items);
+        free_state_symbol_rows(&before_rows);
+        free_state_symbol_rows(&after_rows);
+        return false;
+    }
+
+    int removed_count = 0;
+    int added_count = 0;
+    int unchanged_count = 0;
+    for (int i = 0; i < before_items.count; i++) {
+        if (semantic_items_contains(&after_items, before_items.items[i].key)) unchanged_count++;
+        else removed_count++;
+    }
+    for (int i = 0; i < after_items.count; i++) {
+        if (!semantic_items_contains(&before_items, after_items.items[i].key)) added_count++;
+    }
+
+    fprintf(out, "PSTATEPLANv1\n");
+    fprintf(out, "before_state: %s\n", before_state);
+    fprintf(out, "after_state: %s\n", after_state);
+    fprintf(out, "before_entry: %s\n", before_manifest.entry);
+    fprintf(out, "after_entry: %s\n", after_manifest.entry);
+    fprintf(out, "focus: %s\n", before_manifest.focus[0] != '\0' ? before_manifest.focus : "-");
+    fprintf(out, "impact: %s\n", before_manifest.include_impact ? "yes" : "no");
+    fprintf(out, "summary: before=%d after=%d added=%d removed=%d unchanged=%d\n",
+            before_items.count, after_items.count, added_count, removed_count, unchanged_count);
+
+    ok = emit_semantic_change_plan(out, &before_rows, &after_rows) &&
+         emit_state_test_plan(out, before_state, after_state,
+                              &before_items, &after_items, &before_rows, &after_rows);
+
+    if (out != stdout) fclose(out);
+    free_project_state_manifest(&before_manifest);
+    free_project_state_manifest(&after_manifest);
+    free_semantic_items(&before_items);
+    free_semantic_items(&after_items);
+    free_state_symbol_rows(&before_rows);
+    free_state_symbol_rows(&after_rows);
+    return ok;
+}
+
+static bool stale_lines_include_tracked_test_change(const ProjectStateManifest* manifest,
+                                                    const StringList* stale_lines) {
+    if (!manifest || !stale_lines) return false;
+    for (int i = 0; i < stale_lines->count; i++) {
+        char stale_path[MAX_PATH_LEN];
+        if (!parse_stale_line_path(stale_lines->items[i], stale_path, sizeof(stale_path))) continue;
+        if (string_list_index_of(&manifest->tracked_test_paths, stale_path) != -1) return true;
+    }
+    return false;
+}
+
+static bool emit_state_exec_report(FILE* out, const char* before_state, const char* after_state,
+                                   const ProjectStateManifest* after_manifest, const char* after_root,
+                                   const StatePlanTestCandidateList* candidates, int* failed_out) {
+    if (!out || !before_state || !after_state || !after_manifest || !after_root || !candidates) return false;
+
+    fprintf(out, "PSTATEEXECv2\n");
+    fprintf(out, "before_state: %s\n", before_state);
+    fprintf(out, "after_state: %s\n", after_state);
+    fprintf(out, "focus: %s\n", after_manifest->focus[0] != '\0' ? after_manifest->focus : "-");
+    fprintf(out, "impact: %s\n", after_manifest->include_impact ? "yes" : "no");
+    fprintf(out, "semantic_fingerprint: %s\n",
+            after_manifest->semantic_fingerprint[0] != '\0' ? after_manifest->semantic_fingerprint : "-");
+    fprintf(out, "tests_planned: %d\n", candidates->count);
+    fprintf(out, "results:\n");
+
+    int failed = 0;
+    for (int i = 0; i < candidates->count; i++) {
+        char test_path[MAX_PATH_LEN];
+        bool resolved = resolve_state_path(after_root, candidates->items[i].path, test_path, sizeof(test_path));
+
+        int exit_code = 127;
+        char preview[256];
+        preview[0] = '\0';
+        bool ran = resolved && run_viper_script_capture("/proc/self/exe", test_path, &exit_code,
+                                                        preview, sizeof(preview));
+        bool passed = ran && exit_code == 0;
+        if (!passed) failed++;
+
+        fprintf(out, "  %d|test=%s|status=%s|exit=%d|hits=%d|max_score=%d|symbols=",
+                i + 1, candidates->items[i].path, passed ? "pass" : "fail",
+                ran ? exit_code : 127, candidates->items[i].hits, candidates->items[i].max_score);
+        emit_string_list_csv(out, &candidates->items[i].symbols);
+        fprintf(out, "|checks=");
+        emit_test_plan_checks(out, candidates->items[i].has_changed, candidates->items[i].has_added,
+                              candidates->items[i].has_removed, candidates->items[i].has_effects,
+                              candidates->items[i].has_callers);
+        if (!passed && preview[0] != '\0') {
+            fprintf(out, "|detail=%s", preview);
+        }
+        fprintf(out, "\n");
+    }
+    fprintf(out, "tests_failed: %d\n", failed);
+    if (failed_out) *failed_out = failed;
+    return true;
+}
+
+static bool write_state_linked_proof(const char* before_state, const char* after_state,
+                                     const char* out_path, int* tests_planned_out,
+                                     int* tests_failed_out) {
+    if (!before_state || !after_state || !out_path) return false;
+
+    ProjectStateManifest after_manifest;
+    StateSymbolRowList after_rows;
+    StatePlanTestCandidateList candidates;
+    memset(&after_manifest, 0, sizeof(after_manifest));
+    memset(&after_rows, 0, sizeof(after_rows));
+    memset(&candidates, 0, sizeof(candidates));
+
+    bool ok = load_project_state_manifest(after_state, &after_manifest) &&
+              load_state_symbol_rows_filtered(after_state, NULL, &after_rows) &&
+              collect_state_linked_test_candidates(after_state, &after_rows, &candidates);
+    if (!ok) {
+        free_project_state_manifest(&after_manifest);
+        free_state_symbol_rows(&after_rows);
+        free_state_plan_test_candidates(&candidates);
+        return false;
+    }
+
+    char after_root[MAX_PATH_LEN];
+    if (!resolve_manifest_root(after_state, &after_manifest, after_root, sizeof(after_root))) {
+        free_project_state_manifest(&after_manifest);
+        free_state_symbol_rows(&after_rows);
+        free_state_plan_test_candidates(&candidates);
+        return false;
+    }
+
+    FILE* out = open_index_output(out_path);
+    if (!out) {
+        free_project_state_manifest(&after_manifest);
+        free_state_symbol_rows(&after_rows);
+        free_state_plan_test_candidates(&candidates);
+        return false;
+    }
+
+    int failed = 0;
+    ok = emit_state_exec_report(out, before_state, after_state, &after_manifest, after_root,
+                                &candidates, &failed);
+    if (out != stdout) fclose(out);
+    if (tests_planned_out) *tests_planned_out = candidates.count;
+    if (tests_failed_out) *tests_failed_out = failed;
+
+    free_project_state_manifest(&after_manifest);
+    free_state_symbol_rows(&after_rows);
+    free_state_plan_test_candidates(&candidates);
+    return ok;
+}
+
+bool run_state_plan(const char* before_state, const char* after_state, const char* out_path) {
+    if (!before_state || !after_state) {
+        fprintf(stderr, "Indexer Error: state test run requires before and after state files.\n");
+        return false;
+    }
+
+    ProjectStateManifest before_manifest;
+    ProjectStateManifest after_manifest;
+    SemanticItemList before_items;
+    SemanticItemList after_items;
+    StateSymbolRowList before_rows;
+    StateSymbolRowList after_rows;
+    StatePlanTestCandidateList candidates;
+    memset(&before_manifest, 0, sizeof(before_manifest));
+    memset(&after_manifest, 0, sizeof(after_manifest));
+    memset(&before_items, 0, sizeof(before_items));
+    memset(&after_items, 0, sizeof(after_items));
+    memset(&before_rows, 0, sizeof(before_rows));
+    memset(&after_rows, 0, sizeof(after_rows));
+    memset(&candidates, 0, sizeof(candidates));
+
+    bool ok = load_project_state_manifest(before_state, &before_manifest) &&
+              load_project_state_manifest(after_state, &after_manifest) &&
+              load_state_semantic_items(before_state, &before_items) &&
+              load_state_semantic_items(after_state, &after_items) &&
+              load_state_symbol_rows_filtered(before_state, NULL, &before_rows) &&
+              load_state_symbol_rows_filtered(after_state, NULL, &after_rows) &&
+              build_state_test_plan_candidates(before_state, after_state,
+                                               &before_items, &after_items, &before_rows, &after_rows,
+                                               &candidates);
+    if (!ok) {
+        free_project_state_manifest(&before_manifest);
+        free_project_state_manifest(&after_manifest);
+        free_semantic_items(&before_items);
+        free_semantic_items(&after_items);
+        free_state_symbol_rows(&before_rows);
+        free_state_symbol_rows(&after_rows);
+        free_state_plan_test_candidates(&candidates);
+        fprintf(stderr, "Indexer Error: Could not build state test run inputs.\n");
+        return false;
+    }
+
+    if (strcmp(before_manifest.focus, after_manifest.focus) != 0 ||
+        before_manifest.include_impact != after_manifest.include_impact) {
+        free_project_state_manifest(&before_manifest);
+        free_project_state_manifest(&after_manifest);
+        free_semantic_items(&before_items);
+        free_semantic_items(&after_items);
+        free_state_symbol_rows(&before_rows);
+        free_state_symbol_rows(&after_rows);
+        free_state_plan_test_candidates(&candidates);
+        fprintf(stderr, "Indexer Error: state test run requires matching focus and impact settings.\n");
+        return false;
+    }
+
+    char after_root[MAX_PATH_LEN];
+    char before_root[MAX_PATH_LEN];
+    if (!resolve_manifest_root(after_state, &after_manifest, after_root, sizeof(after_root)) ||
+        !resolve_manifest_root(before_state, &before_manifest, before_root, sizeof(before_root))) {
+        free_project_state_manifest(&before_manifest);
+        free_project_state_manifest(&after_manifest);
+        free_semantic_items(&before_items);
+        free_semantic_items(&after_items);
+        free_state_symbol_rows(&before_rows);
+        free_state_symbol_rows(&after_rows);
+        free_state_plan_test_candidates(&candidates);
+        fprintf(stderr, "Indexer Error: Could not prepare state test runner.\n");
+        return false;
+    }
+
+    FILE* out = open_index_output(out_path);
+    if (!out) {
+        free_project_state_manifest(&before_manifest);
+        free_project_state_manifest(&after_manifest);
+        free_semantic_items(&before_items);
+        free_semantic_items(&after_items);
+        free_state_symbol_rows(&before_rows);
+        free_state_symbol_rows(&after_rows);
+        free_state_plan_test_candidates(&candidates);
+        return false;
+    }
+
+    int failed = 0;
+    ok = emit_state_exec_report(out, before_state, after_state, &after_manifest, after_root,
+                                &candidates, &failed);
+
+    if (out != stdout) fclose(out);
+    free_project_state_manifest(&before_manifest);
+    free_project_state_manifest(&after_manifest);
+    free_semantic_items(&before_items);
+    free_semantic_items(&after_items);
+    free_state_symbol_rows(&before_rows);
+    free_state_symbol_rows(&after_rows);
+    free_state_plan_test_candidates(&candidates);
+    return failed == 0;
 }
 
 bool emit_semantic_diff(const char* before_entry, const char* after_entry, const char* out_path,
@@ -3643,8 +7860,12 @@ bool emit_semantic_diff(const char* before_entry, const char* after_entry, const
 
     SemanticItemList before_items;
     SemanticItemList after_items;
+    StateSymbolRowList before_rows;
+    StateSymbolRowList after_rows;
     memset(&before_items, 0, sizeof(before_items));
     memset(&after_items, 0, sizeof(after_items));
+    memset(&before_rows, 0, sizeof(before_rows));
+    memset(&after_rows, 0, sizeof(after_rows));
 
     bool ok = collect_focus_semantic_items(&before_project, &before_focus, &before_items) &&
               collect_focus_semantic_items(&after_project, &after_focus, &after_items);
@@ -3656,6 +7877,23 @@ bool emit_semantic_diff(const char* before_entry, const char* after_entry, const
         fprintf(stderr, "Indexer Error: Could not build semantic diff items.\n");
         free_semantic_items(&before_items);
         free_semantic_items(&after_items);
+        free_state_symbol_rows(&before_rows);
+        free_state_symbol_rows(&after_rows);
+        free_focus_slice(&before_impact);
+        free_focus_slice(&after_impact);
+        free_focus_slice(&before_focus);
+        free_focus_slice(&after_focus);
+        free_project(&before_project);
+        free_project(&after_project);
+        return false;
+    }
+    if (!collect_symbol_rows_from_semantic_items(&before_items, &before_rows) ||
+        !collect_symbol_rows_from_semantic_items(&after_items, &after_rows)) {
+        fprintf(stderr, "Indexer Error: Could not build semantic diff rows.\n");
+        free_semantic_items(&before_items);
+        free_semantic_items(&after_items);
+        free_state_symbol_rows(&before_rows);
+        free_state_symbol_rows(&after_rows);
         free_focus_slice(&before_impact);
         free_focus_slice(&after_impact);
         free_focus_slice(&before_focus);
@@ -3669,6 +7907,8 @@ bool emit_semantic_diff(const char* before_entry, const char* after_entry, const
     if (!out) {
         free_semantic_items(&before_items);
         free_semantic_items(&after_items);
+        free_state_symbol_rows(&before_rows);
+        free_state_symbol_rows(&after_rows);
         free_focus_slice(&before_impact);
         free_focus_slice(&after_impact);
         free_focus_slice(&before_focus);
@@ -3694,7 +7934,7 @@ bool emit_semantic_diff(const char* before_entry, const char* after_entry, const
     format_pack_path(before_path, before_display, sizeof(before_display));
     format_pack_path(after_path, after_display, sizeof(after_display));
 
-    fprintf(out, "SDIFFv1\n");
+    fprintf(out, "SDIFFv2\n");
     fprintf(out, "before: %s\n", before_display);
     fprintf(out, "after: %s\n", after_display);
     fprintf(out, "focus: %s\n", focus_symbol);
@@ -3707,6 +7947,36 @@ bool emit_semantic_diff(const char* before_entry, const char* after_entry, const
     if (removed_count == 0 && added_count == 0) {
         fprintf(out, "status: unchanged\n");
     } else {
+        if (!emit_semantic_change_plan(out, &before_rows, &after_rows)) {
+            if (out != stdout) fclose(out);
+            free_semantic_items(&before_items);
+            free_semantic_items(&after_items);
+            free_state_symbol_rows(&before_rows);
+            free_state_symbol_rows(&after_rows);
+            free_focus_slice(&before_impact);
+            free_focus_slice(&after_impact);
+            free_focus_slice(&before_focus);
+            free_focus_slice(&after_focus);
+            free_project(&before_project);
+            free_project(&after_project);
+            fprintf(stderr, "Indexer Error: Could not emit semantic change plan.\n");
+            return false;
+        }
+        if (!emit_semantic_test_plan(out, &before_items, &after_items, &before_rows, &after_rows)) {
+            if (out != stdout) fclose(out);
+            free_semantic_items(&before_items);
+            free_semantic_items(&after_items);
+            free_state_symbol_rows(&before_rows);
+            free_state_symbol_rows(&after_rows);
+            free_focus_slice(&before_impact);
+            free_focus_slice(&after_impact);
+            free_focus_slice(&before_focus);
+            free_focus_slice(&after_focus);
+            free_project(&before_project);
+            free_project(&after_project);
+            fprintf(stderr, "Indexer Error: Could not emit semantic test plan.\n");
+            return false;
+        }
         if (removed_count > 0) {
             fprintf(out, "removed:\n");
             for (int i = 0; i < before_items.count; i++) {
@@ -3726,6 +7996,8 @@ bool emit_semantic_diff(const char* before_entry, const char* after_entry, const
     if (out != stdout) fclose(out);
     free_semantic_items(&before_items);
     free_semantic_items(&after_items);
+    free_state_symbol_rows(&before_rows);
+    free_state_symbol_rows(&after_rows);
     free_focus_slice(&before_impact);
     free_focus_slice(&after_impact);
     free_focus_slice(&before_focus);
