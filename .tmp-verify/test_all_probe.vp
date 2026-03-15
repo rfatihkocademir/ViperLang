@@ -1,0 +1,55 @@
+use "@std/os" as os
+use "@std/io" as io
+
+st Point { x; y }
+st Rect { top_left; bottom_right }
+
+fn test_loops_arrays() {
+    var items = [10, 20, 30]
+    var i = 0
+    var sum = 0
+    var limit = arr_len(items)
+    while i < limit {
+        sum = sum + items[i]
+        i = i + 1
+    }
+    ret sum
+}
+
+fn test_strings() {
+    var a = "Hello"
+    var b = "World"
+    ret a + ", " + b + "!"
+}
+
+@effect(ffi)
+fn test_ffi_strlen() {
+    var libc = load_dl("libc.so.6")
+    var strlen = libc.get_fn("strlen", "s->i")
+    ret strlen("ViperLang")
+}
+
+@effect(os, fs)
+fn test_io() {
+    var file_path = ".tmp_test_file.txt"
+    var f1 = io.open(file_path, "w")
+    pr("f1:", f1)
+    io.write_text(f1, "test_content")
+    var f2 = io.open(file_path, "r")
+    pr("f2:", f2)
+    var content = io.read_text(f2)
+    pr("content-in-fn:", content)
+    pr("eq-in-fn:", content == "test_content")
+    ret content
+}
+
+var p1 = Point(0, 0)
+var p2 = Point(10, 10)
+var r = Rect(p1, p2)
+r.top_left.x = 5
+var sum = test_loops_arrays()
+var str_res = test_strings()
+var len = test_ffi_strlen()
+var io_res = test_io()
+pr("io_res-top:", io_res)
+pr("eq-top:", io_res == "test_content")

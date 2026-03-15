@@ -1,0 +1,15 @@
+st Point { x; y }
+
+var point = Point()
+point.x = 3
+point.y = 4
+
+if point.x != 3 {
+    panic("point-x")
+}
+
+if point.y != 4 {
+    panic("point-y")
+}
+
+pr("struct-inline-fields-ok")

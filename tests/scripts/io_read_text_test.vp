@@ -1,0 +1,29 @@
+use "@std/io" as io
+
+var missing = io.open("missing-file-for-io-read-text.txt", "r")
+if missing != 0 {
+    panic("missing-open-should-return-zero")
+}
+
+var path = "io_read_text_test.txt"
+var writer = io.open(path, "w")
+if writer == 0 {
+    panic("writer-open-failed")
+}
+io.write_text(writer, "hello from io.read_text")
+
+var reader = io.open(path, "r")
+if reader == 0 {
+    panic("reader-open-failed")
+}
+
+var content = io.read_text(reader)
+io.close(reader)
+io.close(writer)
+io.remove_file(path)
+
+if content != "hello from io.read_text" {
+    panic("read-text-mismatch")
+}
+
+pr("io-read-text-ok")

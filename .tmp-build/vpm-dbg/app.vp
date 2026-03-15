@@ -1,0 +1,3 @@
+use "@web" as web
+pr("pkg ok")
+pr(web.webPing())

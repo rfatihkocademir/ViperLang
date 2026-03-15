@@ -169,6 +169,7 @@ static TokenType identifier_type() {
                     case 'a': return check_keyword(2, 3, "lse", TOKEN_FALSE);
                     case 'l': return check_keyword(2, 3, "oat", TOKEN_TYPE_F);
                     case 'n': return check_keyword(2, 0, "", TOKEN_FN);
+                    case 'o': return check_keyword(2, 1, "r", TOKEN_F);
                 }
             }
             break;

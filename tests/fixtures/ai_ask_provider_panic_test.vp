@@ -1,0 +1,13 @@
+fn leaf() {
+    ai_ask("hello")
+}
+
+fn middle() {
+    leaf()
+}
+
+fn top() {
+    middle()
+}
+
+top()

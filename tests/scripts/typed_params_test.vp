@@ -1,0 +1,12 @@
+fn add(a: int, b: int) -> int {
+    ret a + b
+}
+
+fn describe(code: int, label: str) -> str {
+    ret label + ":" + code
+}
+
+var fn_ref = add
+pr("sum:", add(2, 5))
+pr("sum_ref:", fn_ref(4, 6))
+pr(describe(7, "typed"))

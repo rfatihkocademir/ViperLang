@@ -1,0 +1,15 @@
+use "@std/io" as io
+
+fn main() {
+    var file_path = ".tmp_test_file.txt"
+    var f1 = io.open(file_path, "w")
+    pr("f1:", f1)
+    io.write_text(f1, "test_content")
+    var f2 = io.open(file_path, "r")
+    pr("f2:", f2)
+    var content = io.read_text(f2)
+    pr("content:", content)
+    pr("eq:", content == "test_content")
+}
+
+main()

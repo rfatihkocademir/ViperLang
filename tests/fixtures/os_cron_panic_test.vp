@@ -1,0 +1,17 @@
+fn job() {
+    ret 1
+}
+
+fn leaf() {
+    os_cron("bad spec", job, 1)
+}
+
+fn middle() {
+    leaf()
+}
+
+fn top() {
+    middle()
+}
+
+top()

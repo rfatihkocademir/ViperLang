@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include "parser.h"
 #include "compiler.h"
@@ -49,6 +50,7 @@ typedef struct {
 #define MAX_PATH_LEN 1024
 #define MAX_ABI_NAME_LEN 128
 #define MAX_ABI_EFFECTS_LEN 256
+#define MAX_ABI_PARAMS_LEN 512
 #define MAX_NAMESPACE_ALIAS_LEN 128
 #define ABI_KIND_FUNCTION 1
 #define ABI_KIND_STRUCT 2
@@ -71,6 +73,25 @@ static bool emit_halt_enabled = true;
 
 static bool join_path2(const char* a, const char* b, char* out, size_t out_size);
 static bool file_exists(const char* path);
+
+static void compiler_error(const char* code, const char* fmt, ...) {
+    va_list args;
+    fprintf(stderr, "Compiler Error [%s]: ", code);
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fprintf(stderr, "\n");
+}
+
+static void compiler_error_exit(const char* code, const char* fmt, ...) {
+    va_list args;
+    fprintf(stderr, "Compiler Error [%s]: ", code);
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fprintf(stderr, "\n");
+    exit(1);
+}
 
 static const char* capability_hint_for_symbol(const char* name, int len) {
     (void)name;
@@ -127,9 +148,8 @@ static const char* capability_hint_for_symbol(const char* name, int len) {
 static void compiler_error_disabled_native(const char* name, int len, int native_idx) {
     const char* cap = native_capability(native_idx);
     if (!cap) cap = "unknown";
-    printf("Compiler Error: Native '%.*s' is disabled (capability=%s, profile=%s)\n",
-           len, name, cap, VIPER_PROFILE_NAME);
-    exit(1);
+    compiler_error_exit("VCP001", "Native '%.*s' is disabled (capability=%s, profile=%s)",
+                        len, name, cap, VIPER_PROFILE_NAME);
 }
 
 static void copy_path(char* dst, size_t dst_size, const char* src) {
@@ -138,8 +158,7 @@ static void copy_path(char* dst, size_t dst_size, const char* src) {
 }
 
 static void compiler_fatal_oom(void) {
-    printf("Compiler Error: Out of memory.\n");
-    exit(1);
+    compiler_error_exit("VCP002", "Out of memory.");
 }
 
 static bool ensure_capacity(void** ptr, int* cap, int needed, size_t elem_size) {
@@ -430,8 +449,7 @@ static void detect_project_root(void) {
 
 static void resolve_package_path(const char* raw_path, char* out, size_t out_size) {
     if (strstr(raw_path, "..") != NULL) {
-        printf("Compiler Error: Package import cannot contain '..': %s\n", raw_path);
-        exit(1);
+        compiler_error_exit("VCP003", "Package import cannot contain '..': %s", raw_path);
     }
 
     // Special case for standard library.
@@ -464,10 +482,10 @@ static void resolve_package_path(const char* raw_path, char* out, size_t out_siz
             return;
         }
 
-        printf("Compiler Error: Standard library module not found: %s\n", raw_path);
-        if (env_std) printf("  Checked VIPER_STD_PATH: %s\n", env_std);
-        printf("  Checked Dev Path: %s/lib/std/%s\n", project_root_path, filename);
-        printf("  Checked Sys Path: /usr/local/lib/viper/std/%s\n", filename);
+        compiler_error("VCP004", "Standard library module not found: %s", raw_path);
+        if (env_std) fprintf(stderr, "  Checked VIPER_STD_PATH: %s\n", env_std);
+        fprintf(stderr, "  Checked Dev Path: %s/lib/std/%s\n", project_root_path, filename);
+        fprintf(stderr, "  Checked Sys Path: /usr/local/lib/viper/std/%s\n", filename);
         exit(1);
     }
 
@@ -480,8 +498,7 @@ static void resolve_package_path(const char* raw_path, char* out, size_t out_siz
     } else {
         size_t pkg_len = (size_t)(slash - raw_path);
         if (pkg_len == 0 || pkg_len >= sizeof(package_name)) {
-            printf("Compiler Error: Invalid package import: %s\n", raw_path);
-            exit(1);
+            compiler_error_exit("VCP005", "Invalid package import: %s", raw_path);
         }
         memcpy(package_name, raw_path, pkg_len);
         package_name[pkg_len] = '\0';
@@ -492,8 +509,7 @@ static void resolve_package_path(const char* raw_path, char* out, size_t out_siz
     char package_root[MAX_PATH_LEN];
     if (!join_path2(project_root_path, ".viper/packages", path1, sizeof(path1)) ||
         !join_path2(path1, package_name, package_root, sizeof(package_root))) {
-        printf("Compiler Error: Package path is too long: %s\n", raw_path);
-        exit(1);
+        compiler_error_exit("VCP006", "Package path is too long: %s", raw_path);
     }
 
     // Prefer version-pinned install if `.viper/packages/<pkg>/current` exists.
@@ -515,14 +531,13 @@ static void resolve_package_path(const char* raw_path, char* out, size_t out_siz
 
     // Backward-compatible fallback: `.viper/packages/<pkg>/<subpath>`
     if (!join_path2(package_root, subpath, out, out_size)) {
-        printf("Compiler Error: Package path is too long: %s\n", raw_path);
-        exit(1);
+        compiler_error_exit("VCP006", "Package path is too long: %s", raw_path);
     }
 
     if (!module_source_exists(out)) {
-        printf("Compiler Error: Package module not found for '%s' (resolved: %s). Run 'viper pkg install'.\n",
-               raw_path, out);
-        exit(1);
+        compiler_error_exit("VCP007",
+                            "Package module not found for '%s' (resolved: %s). Run 'viper pkg install'.",
+                            raw_path, out);
     }
 }
 
@@ -587,8 +602,7 @@ static void decode_use_path(Token token, char* out, size_t out_size) {
     }
     if (length < 0) length = 0;
     if ((size_t)length >= out_size) {
-        printf("Compiler Error: Module path is too long.\n");
-        exit(1);
+        compiler_error_exit("VCP008", "Module path is too long.");
     }
     memcpy(out, start, (size_t)length);
     out[length] = '\0';
@@ -610,8 +624,7 @@ static void resolve_module_path(const char* raw_path, char* out, size_t out_size
         size_t base_len = strlen(base);
         size_t raw_len = strlen(raw_path);
         if (base_len + 1 + raw_len + 1 > out_size) {
-            printf("Compiler Error: Resolved module path is too long.\n");
-            exit(1);
+            compiler_error_exit("VCP009", "Resolved module path is too long.");
         }
         memcpy(out, base, base_len);
         out[base_len] = '/';
@@ -701,6 +714,11 @@ typedef unsigned int EffectMask;
 
 typedef struct {
     ObjFunction* fn;
+    int param_count;
+    const char** param_names;
+    int* param_name_lens;
+    StaticType* param_types;
+    char* param_name_storage;
     bool has_return_type;
     StaticType return_type;
     EffectMask declared_effects;
@@ -801,6 +819,25 @@ static void register_function_symbol(ObjFunction* fn) {
     fn_registry[fn_count++] = fn;
 }
 
+static void free_function_type_registry(void) {
+    if (!fn_type_registry) return;
+    for (int i = 0; i < fn_type_count; i++) {
+        free(fn_type_registry[i].param_name_storage);
+        free(fn_type_registry[i].param_names);
+        free(fn_type_registry[i].param_name_lens);
+        free(fn_type_registry[i].param_types);
+        fn_type_registry[i].param_name_storage = NULL;
+        fn_type_registry[i].param_names = NULL;
+        fn_type_registry[i].param_name_lens = NULL;
+        fn_type_registry[i].param_types = NULL;
+        fn_type_registry[i].param_count = 0;
+    }
+    free(fn_type_registry);
+    fn_type_registry = NULL;
+    fn_type_count = 0;
+    fn_type_cap = 0;
+}
+
 static void register_struct_symbol(ObjStruct* st) {
     if (!ensure_capacity((void**)&st_registry, &st_cap, st_count + 1, sizeof(ObjStruct*))) {
         compiler_fatal_oom();
@@ -827,10 +864,28 @@ static FunctionTypeInfo* ensure_function_type_info(ObjFunction* fn) {
 
     info = &fn_type_registry[fn_type_count++];
     info->fn = fn;
+    info->param_count = 0;
+    info->param_names = NULL;
+    info->param_name_lens = NULL;
+    info->param_types = NULL;
+    info->param_name_storage = NULL;
     info->has_return_type = false;
     info->return_type = static_type_unknown();
     info->declared_effects = 0;
     return info;
+}
+
+static void clear_function_param_contract(FunctionTypeInfo* info) {
+    if (!info) return;
+    free(info->param_name_storage);
+    free(info->param_names);
+    free(info->param_name_lens);
+    free(info->param_types);
+    info->param_name_storage = NULL;
+    info->param_names = NULL;
+    info->param_name_lens = NULL;
+    info->param_types = NULL;
+    info->param_count = 0;
 }
 
 static void clear_namespace_registry(void) {
@@ -861,15 +916,15 @@ static bool register_namespace_symbol(const char* alias, int alias_len,
     if (!alias) { alias = ""; alias_len = 0; }
     
     if (alias_len >= MAX_NAMESPACE_ALIAS_LEN) {
-        printf("Compiler Error: Namespace alias too long for import '%s'.\n", module_path);
+        compiler_error("VCP010", "Namespace alias too long for import '%s'.", module_path);
         return false;
     }
 
     int existing = find_namespace_entry(alias, alias_len, kind, name, name_len);
     if (existing >= 0) {
         if (ns_registry[existing].obj != obj) {
-            printf("Compiler Error: Namespaced symbol conflict for '%.*s.%.*s'.\n",
-                   alias_len, alias, name_len, name);
+            compiler_error("VCP011", "Namespaced symbol conflict for '%.*s.%.*s'.",
+                           alias_len, alias, name_len, name);
             return false;
         }
         return true;
@@ -1040,8 +1095,8 @@ static StaticType resolve_type_annotation_in_namespace(Token token,
     if (!st) st = resolve_struct(token.start, token.length);
     if (st) return static_type_make(STATIC_TYPE_STRUCT_INSTANCE, st);
 
-    printf("Compiler Error: Unknown type annotation '%.*s'.\n", token.length, token.start);
-    exit(1);
+    compiler_error_exit("VCP012", "Unknown type annotation '%.*s'.", token.length, token.start);
+    return static_type_unknown();
 }
 
 static StaticType resolve_type_annotation(Token token) {
@@ -1128,11 +1183,11 @@ static void compiler_type_mismatch(const char* context,
     format_static_type(actual, actual_name, sizeof(actual_name));
 
     if (name && name_len > 0) {
-        printf("Compiler Error: Type mismatch for %s '%.*s': expected '%s', got '%s'.\n",
-               context, name_len, name, expected_name, actual_name);
+        compiler_error("VCP013", "Type mismatch for %s '%.*s': expected '%s', got '%s'.",
+                       context, name_len, name, expected_name, actual_name);
     } else {
-        printf("Compiler Error: Type mismatch for %s: expected '%s', got '%s'.\n",
-               context, expected_name, actual_name);
+        compiler_error("VCP013", "Type mismatch for %s: expected '%s', got '%s'.",
+                       context, expected_name, actual_name);
     }
     exit(1);
 }
@@ -1184,9 +1239,9 @@ static void format_effect_mask(EffectMask mask, char* out, size_t out_size) {
 static void compiler_effect_mismatch(Token fn_name, EffectMask missing_mask) {
     char missing[256];
     format_effect_mask(missing_mask, missing, sizeof(missing));
-    printf("Compiler Error: Effect mismatch for function '%.*s' on line %d: missing declared effects for inferred '%s'.\n",
-           fn_name.length, fn_name.start, fn_name.line, missing);
-    exit(1);
+    compiler_error_exit("VCP014",
+                        "Effect mismatch for function '%.*s' on line %d: missing declared effects for inferred '%s'.",
+                        fn_name.length, fn_name.start, fn_name.line, missing);
 }
 
 static EffectMask infer_expr_effect_mask(AstNode* expr);
@@ -1366,6 +1421,7 @@ typedef struct {
     int kind;
     char name[MAX_ABI_NAME_LEN];
     int metric;
+    char params[MAX_ABI_PARAMS_LEN];
     char return_type[MAX_ABI_NAME_LEN];
     EffectMask effects;
 } AbiSymbol;
@@ -1388,6 +1444,9 @@ static const char* abi_symbol_label(int kind) {
     return (kind == ABI_KIND_FUNCTION) ? "function" : "struct";
 }
 
+static int count_abi_params(const char* text);
+static bool validate_abi_params_token(const char* text, int metric);
+
 static int find_abi_symbol(const AbiSymbol* symbols, int count, int kind, const char* name) {
     if (!symbols || !name) return -1;
     for (int i = 0; i < count; i++) {
@@ -1408,22 +1467,28 @@ static int find_module_symbol(const ModuleSymbol* symbols, int count,
 
 static bool append_abi_symbol(AbiSymbol** symbols, int* count, int* cap,
                               int kind, const char* name, int metric,
-                              const char* return_type, EffectMask effects,
+                              const char* params, const char* return_type, EffectMask effects,
                               const char* abi_path, int line_no) {
     if (!symbols || !count || !cap || !name) return false;
     if (metric < 0 || metric > 255) {
-        printf("Compiler Error: Invalid ABI metric on %s:%d (%s %s %d).\n",
-               abi_path, line_no, (kind == ABI_KIND_FUNCTION ? "fn" : "st"), name, metric);
+        compiler_error("VCP015", "Invalid ABI metric on %s:%d (%s %s %d).",
+                       abi_path, line_no, (kind == ABI_KIND_FUNCTION ? "fn" : "st"), name, metric);
+        return false;
+    }
+    if (kind == ABI_KIND_FUNCTION &&
+        !validate_abi_params_token(params ? params : "", metric)) {
+        compiler_error("VCP045", "Invalid ABI params field on %s:%d.", abi_path, line_no);
         return false;
     }
 
     int existing = find_abi_symbol(*symbols, *count, kind, name);
     if (existing >= 0) {
         if ((*symbols)[existing].metric != metric ||
+            strcmp((*symbols)[existing].params, params ? params : "") != 0 ||
             strcmp((*symbols)[existing].return_type, return_type ? return_type : "") != 0 ||
             (*symbols)[existing].effects != effects) {
-            printf("Compiler Error: Conflicting ABI entries on %s:%d for %s '%s'.\n",
-                   abi_path, line_no, abi_symbol_label(kind), name);
+            compiler_error("VCP016", "Conflicting ABI entries on %s:%d for %s '%s'.",
+                           abi_path, line_no, abi_symbol_label(kind), name);
             return false;
         }
         return true;
@@ -1437,6 +1502,7 @@ static bool append_abi_symbol(AbiSymbol** symbols, int* count, int* cap,
     out->kind = kind;
     snprintf(out->name, sizeof(out->name), "%s", name);
     out->metric = metric;
+    copy_path(out->params, sizeof(out->params), params ? params : "");
     copy_path(out->return_type, sizeof(out->return_type), return_type ? return_type : "");
     out->effects = effects;
     (*count)++;
@@ -1474,6 +1540,40 @@ static bool parse_abi_effects_token(const char* text, EffectMask* out_mask) {
     return true;
 }
 
+static int count_abi_params(const char* text) {
+    if (!text || text[0] == '\0') return -1;
+    if (strcmp(text, "-") == 0) return 0;
+
+    int count = 0;
+    const char* p = text;
+    while (*p) {
+        const char* name_start = p;
+        while (*p && *p != ':' && *p != ',') p++;
+        size_t name_len = (size_t)(p - name_start);
+        if (name_len == 0 || name_len >= MAX_ABI_NAME_LEN || *p != ':') return -1;
+        p++;
+
+        const char* type_start = p;
+        while (*p && *p != ',') p++;
+        size_t type_len = (size_t)(p - type_start);
+        if (type_len == 0 || type_len >= MAX_ABI_NAME_LEN) return -1;
+        count++;
+
+        if (*p == ',') {
+            p++;
+            if (*p == '\0') return -1;
+        }
+    }
+
+    return count;
+}
+
+static bool validate_abi_params_token(const char* text, int metric) {
+    if (!text || text[0] == '\0') return true;
+    int count = count_abi_params(text);
+    return count >= 0 && count == metric;
+}
+
 static bool load_module_abi_symbols(const char* abi_path, AbiSymbol** out_symbols, int* out_count) {
     *out_symbols = NULL;
     *out_count = 0;
@@ -1484,7 +1584,7 @@ static bool load_module_abi_symbols(const char* abi_path, AbiSymbol** out_symbol
 
     bool ok = true;
     int line_no = 0;
-    char line[512];
+    char line[1024];
     while (fgets(line, sizeof(line), file) != NULL) {
         line_no++;
 
@@ -1497,7 +1597,7 @@ static bool load_module_abi_symbols(const char* abi_path, AbiSymbol** out_symbol
         char* metric_tok = strtok(NULL, " \t\r\n");
 
         if (!kind_tok || !name_tok || !metric_tok) {
-            printf("Compiler Error: Invalid ABI entry on %s:%d.\n", abi_path, line_no);
+            compiler_error("VCP017", "Invalid ABI entry on %s:%d.", abi_path, line_no);
             ok = false;
             break;
         }
@@ -1508,36 +1608,52 @@ static bool load_module_abi_symbols(const char* abi_path, AbiSymbol** out_symbol
         } else if (strcmp(kind_tok, "st") == 0) {
             kind = ABI_KIND_STRUCT;
         } else {
-            printf("Compiler Error: Invalid ABI symbol kind on %s:%d: %s\n",
-                   abi_path, line_no, kind_tok);
+            compiler_error("VCP018", "Invalid ABI symbol kind on %s:%d: %s",
+                           abi_path, line_no, kind_tok);
             ok = false;
             break;
         }
 
         size_t name_len = strlen(name_tok);
         if (name_len == 0 || name_len >= MAX_ABI_NAME_LEN) {
-            printf("Compiler Error: Invalid ABI symbol name on %s:%d.\n", abi_path, line_no);
+            compiler_error("VCP019", "Invalid ABI symbol name on %s:%d.", abi_path, line_no);
             ok = false;
             break;
         }
 
         int metric = 0;
         if (!parse_metric_token(metric_tok, &metric)) {
-            printf("Compiler Error: Invalid ABI metric on %s:%d.\n", abi_path, line_no);
+            compiler_error("VCP015", "Invalid ABI metric on %s:%d.", abi_path, line_no);
             ok = false;
             break;
         }
 
+        char params[MAX_ABI_PARAMS_LEN];
         char return_type[MAX_ABI_NAME_LEN];
+        params[0] = '\0';
         return_type[0] = '\0';
         EffectMask effects = 0;
+        bool seen_params = false;
         bool seen_ret = false;
         bool seen_eff = false;
         char* extra_tok = NULL;
         while ((extra_tok = strtok(NULL, " \t\r\n")) != NULL) {
-            if (strncmp(extra_tok, "ret=", 4) == 0) {
+            if (strncmp(extra_tok, "params=", 7) == 0) {
+                if (seen_params) {
+                    compiler_error("VCP044", "Duplicate ABI params field on %s:%d.", abi_path, line_no);
+                    ok = false;
+                    break;
+                }
+                copy_path(params, sizeof(params), extra_tok + 7);
+                if (!validate_abi_params_token(params, metric)) {
+                    compiler_error("VCP045", "Invalid ABI params field on %s:%d.", abi_path, line_no);
+                    ok = false;
+                    break;
+                }
+                seen_params = true;
+            } else if (strncmp(extra_tok, "ret=", 4) == 0) {
                 if (seen_ret) {
-                    printf("Compiler Error: Duplicate ABI return type on %s:%d.\n", abi_path, line_no);
+                    compiler_error("VCP020", "Duplicate ABI return type on %s:%d.", abi_path, line_no);
                     ok = false;
                     break;
                 }
@@ -1545,13 +1661,13 @@ static bool load_module_abi_symbols(const char* abi_path, AbiSymbol** out_symbol
                 seen_ret = true;
             } else if (strncmp(extra_tok, "eff=", 4) == 0) {
                 if (seen_eff || !parse_abi_effects_token(extra_tok + 4, &effects)) {
-                    printf("Compiler Error: Invalid ABI effects on %s:%d.\n", abi_path, line_no);
+                    compiler_error("VCP021", "Invalid ABI effects on %s:%d.", abi_path, line_no);
                     ok = false;
                     break;
                 }
                 seen_eff = true;
             } else {
-                printf("Compiler Error: Invalid ABI entry on %s:%d.\n", abi_path, line_no);
+                compiler_error("VCP017", "Invalid ABI entry on %s:%d.", abi_path, line_no);
                 ok = false;
                 break;
             }
@@ -1559,6 +1675,7 @@ static bool load_module_abi_symbols(const char* abi_path, AbiSymbol** out_symbol
         if (!ok) break;
 
         if (!append_abi_symbol(out_symbols, out_count, &cap, kind, name_tok, metric,
+                               params,
                                return_type, effects, abi_path, line_no)) {
             ok = false;
             break;
@@ -1578,6 +1695,91 @@ static bool load_module_abi_symbols(const char* abi_path, AbiSymbol** out_symbol
     return true;
 }
 
+static void populate_imported_function_param_contract(FunctionTypeInfo* info,
+                                                      const AbiSymbol* abi,
+                                                      const char* namespace_alias, int alias_len,
+                                                      const char* module_path) {
+    if (!info || !abi) return;
+
+    clear_function_param_contract(info);
+    if (abi->params[0] == '\0') return;
+    if (strcmp(abi->params, "-") == 0) return;
+
+    int count = count_abi_params(abi->params);
+    if (count < 0 || count != abi->metric) {
+        compiler_error("VCP045", "Invalid ABI params field for package module '%s': function '%s'.",
+                       module_path, abi->name);
+        exit(1);
+    }
+    if (count == 0) return;
+
+    info->param_names = (const char**)calloc((size_t)count, sizeof(const char*));
+    info->param_name_lens = (int*)calloc((size_t)count, sizeof(int));
+    info->param_types = (StaticType*)calloc((size_t)count, sizeof(StaticType));
+    if (!info->param_names || !info->param_name_lens || !info->param_types) {
+        compiler_fatal_oom();
+    }
+
+    size_t total_name_bytes = 0;
+    const char* scan = abi->params;
+    while (*scan) {
+        const char* colon = strchr(scan, ':');
+        if (!colon) {
+            compiler_error("VCP045", "Invalid ABI params field for package module '%s': function '%s'.",
+                           module_path, abi->name);
+            exit(1);
+        }
+        total_name_bytes += (size_t)(colon - scan) + 1;
+        const char* comma = strchr(colon + 1, ',');
+        if (!comma) break;
+        scan = comma + 1;
+    }
+
+    info->param_name_storage = (char*)malloc(total_name_bytes > 0 ? total_name_bytes : 1);
+    if (!info->param_name_storage) compiler_fatal_oom();
+
+    info->param_count = count;
+    char* storage_cursor = info->param_name_storage;
+    const char* p = abi->params;
+    for (int i = 0; i < count; i++) {
+        const char* colon = strchr(p, ':');
+        if (!colon) {
+            compiler_error("VCP045", "Invalid ABI params field for package module '%s': function '%s'.",
+                           module_path, abi->name);
+            exit(1);
+        }
+        const char* comma = strchr(colon + 1, ',');
+        const char* entry_end = comma ? comma : (abi->params + strlen(abi->params));
+
+        int name_len = (int)(colon - p);
+        int type_len = (int)(entry_end - (colon + 1));
+        memcpy(storage_cursor, p, (size_t)name_len);
+        storage_cursor[name_len] = '\0';
+        info->param_names[i] = storage_cursor;
+        info->param_name_lens[i] = name_len;
+        storage_cursor += name_len + 1;
+
+        if (type_len == 1 && colon[1] == '-') {
+            info->param_types[i] = static_type_unknown();
+        } else {
+            char type_name[MAX_ABI_NAME_LEN];
+            if (type_len <= 0 || type_len >= MAX_ABI_NAME_LEN) {
+                compiler_error("VCP045", "Invalid ABI params field for package module '%s': function '%s'.",
+                               module_path, abi->name);
+                exit(1);
+            }
+            memcpy(type_name, colon + 1, (size_t)type_len);
+            type_name[type_len] = '\0';
+            info->param_types[i] = resolve_type_annotation_text_in_namespace(
+                type_name,
+                (namespace_alias && alias_len > 0) ? namespace_alias : NULL,
+                (namespace_alias && alias_len > 0) ? alias_len : 0);
+        }
+
+        p = comma ? comma + 1 : entry_end;
+    }
+}
+
 static bool append_module_symbol(ModuleSymbol** symbols, int* count, int* cap,
                                  int kind, const char* name, int name_len,
                                  int metric, Obj* obj, const char* module_path) {
@@ -1586,8 +1788,8 @@ static bool append_module_symbol(ModuleSymbol** symbols, int* count, int* cap,
     int existing = find_module_symbol(*symbols, *count, kind, name, name_len);
     if (existing >= 0) {
         if ((*symbols)[existing].metric != metric || (*symbols)[existing].obj != obj) {
-            printf("Compiler Error: Export collision in bytecode module '%s' for %s '%.*s'.\n",
-                   module_path, abi_symbol_label(kind), name_len, name);
+            compiler_error("VCP022", "Export collision in bytecode module '%s' for %s '%.*s'.",
+                           module_path, abi_symbol_label(kind), name_len, name);
             return false;
         }
         return true;
@@ -1614,24 +1816,24 @@ static bool check_registry_collision(const ModuleSymbol* symbol, const char* mod
 
     if (symbol->kind == ABI_KIND_FUNCTION) {
         if (fn) {
-            printf("Compiler Error: Import conflict for package '%s': function '%.*s' already exists.\n",
-                   module_path, symbol->name_len, symbol->name);
+            compiler_error("VCP023", "Import conflict for package '%s': function '%.*s' already exists.",
+                           module_path, symbol->name_len, symbol->name);
             return false;
         }
         if (st) {
-            printf("Compiler Error: Import conflict for package '%s': function '%.*s' collides with struct.\n",
-                   module_path, symbol->name_len, symbol->name);
+            compiler_error("VCP023", "Import conflict for package '%s': function '%.*s' collides with struct.",
+                           module_path, symbol->name_len, symbol->name);
             return false;
         }
     } else {
         if (st) {
-            printf("Compiler Error: Import conflict for package '%s': struct '%.*s' already exists.\n",
-                   module_path, symbol->name_len, symbol->name);
+            compiler_error("VCP023", "Import conflict for package '%s': struct '%.*s' already exists.",
+                           module_path, symbol->name_len, symbol->name);
             return false;
         }
         if (fn) {
-            printf("Compiler Error: Import conflict for package '%s': struct '%.*s' collides with function.\n",
-                   module_path, symbol->name_len, symbol->name);
+            compiler_error("VCP023", "Import conflict for package '%s': struct '%.*s' collides with function.",
+                           module_path, symbol->name_len, symbol->name);
             return false;
         }
     }
@@ -1782,8 +1984,7 @@ static bool import_precompiled_package_module(const char* resolved_module_path,
     AbiSymbol* abi_symbols = NULL;
     int abi_count = 0;
     if (!load_module_abi_symbols(vabi_path, &abi_symbols, &abi_count)) {
-        printf("Compiler Error: Could not read ABI file '%s'.\n", vabi_path);
-        exit(1);
+        compiler_error_exit("VCP024", "Could not read ABI file '%s'.", vabi_path);
     }
 
     ObjFunction* root = read_bytecode_file(vbb_path);
@@ -1870,8 +2071,9 @@ static bool import_precompiled_package_module(const char* resolved_module_path,
         int found = find_module_symbol(module_symbols, symbol_count,
                                        abi->kind, abi->name, name_len);
         if (found < 0) {
-            printf("Compiler Error: ABI mismatch for package module '%s': missing %s '%s' in bytecode.\n",
-                   resolved_module_path, abi_symbol_label(abi->kind), abi->name);
+            compiler_error("VCP025",
+                           "ABI mismatch for package module '%s': missing %s '%s' in bytecode.",
+                           resolved_module_path, abi_symbol_label(abi->kind), abi->name);
             free(module_symbols);
             free(abi_symbols);
             free(queue);
@@ -1880,9 +2082,10 @@ static bool import_precompiled_package_module(const char* resolved_module_path,
 
         ModuleSymbol* symbol = &module_symbols[found];
         if (symbol->metric != abi->metric) {
-            printf("Compiler Error: ABI mismatch for package module '%s': %s '%s' metric %d != %d.\n",
-                   resolved_module_path, abi_symbol_label(abi->kind), abi->name,
-                   symbol->metric, abi->metric);
+            compiler_error("VCP026",
+                           "ABI mismatch for package module '%s': %s '%s' metric %d != %d.",
+                           resolved_module_path, abi_symbol_label(abi->kind), abi->name,
+                           symbol->metric, abi->metric);
             free(module_symbols);
             free(abi_symbols);
             free(queue);
@@ -1924,6 +2127,8 @@ static bool import_precompiled_package_module(const char* resolved_module_path,
 
         ObjFunction* fn = (ObjFunction*)module_symbols[found].obj;
         FunctionTypeInfo* info = ensure_function_type_info(fn);
+        populate_imported_function_param_contract(info, abi, namespace_alias, alias_len,
+                                                  resolved_module_path);
         info->declared_effects = abi->effects;
         if (abi->return_type[0] != '\0' && strcmp(abi->return_type, "-") != 0) {
             info->has_return_type = true;
@@ -1931,6 +2136,9 @@ static bool import_precompiled_package_module(const char* resolved_module_path,
                 abi->return_type,
                 (namespace_alias && alias_len > 0) ? namespace_alias : NULL,
                 (namespace_alias && alias_len > 0) ? alias_len : 0);
+        } else {
+            info->has_return_type = false;
+            info->return_type = static_type_unknown();
         }
     }
 
@@ -1972,6 +2180,57 @@ static StaticType infer_function_return_type(ObjFunction* fn) {
     FunctionTypeInfo* info = find_function_type_info(fn);
     if (!info || !info->has_return_type) return static_type_unknown();
     return info->return_type;
+}
+
+static void compiler_call_arity_mismatch(const char* fn_name, int fn_name_len,
+                                         int expected, int actual) {
+    compiler_error("VCP042", "Argument count mismatch for function '%.*s': expected %d, got %d.",
+                   fn_name_len, fn_name, expected, actual);
+    exit(1);
+}
+
+static void compiler_call_param_mismatch(Token fn_name, Token param_name,
+                                         StaticType expected, StaticType actual) {
+    char expected_name[MAX_ABI_NAME_LEN];
+    char actual_name[MAX_ABI_NAME_LEN];
+    format_static_type(expected, expected_name, sizeof(expected_name));
+    format_static_type(actual, actual_name, sizeof(actual_name));
+    compiler_error("VCP043",
+                   "Type mismatch for parameter '%.*s' in function '%.*s': expected '%s', got '%s'.",
+                   param_name.length, param_name.start,
+                   fn_name.length, fn_name.start,
+                   expected_name, actual_name);
+    exit(1);
+}
+
+static void validate_static_call_contract(AstNode* call_expr, ObjFunction* callee_fn) {
+    if (!call_expr || call_expr->type != AST_CALL_EXPR || !callee_fn) return;
+    if (call_expr->data.call_expr.arg_count != callee_fn->arity) {
+        compiler_call_arity_mismatch(call_expr->data.call_expr.name.start,
+                                     call_expr->data.call_expr.name.length,
+                                     callee_fn->arity,
+                                     call_expr->data.call_expr.arg_count);
+    }
+
+    FunctionTypeInfo* info = find_function_type_info(callee_fn);
+    if (!info || info->param_count <= 0 || !info->param_types) return;
+
+    for (int i = 0; i < call_expr->data.call_expr.arg_count && i < info->param_count; i++) {
+        StaticType expected = info->param_types[i];
+        if (!static_type_is_known(expected)) continue;
+
+        StaticType actual = infer_expr_type(call_expr->data.call_expr.args[i]);
+        if (!static_type_is_known(actual)) continue;
+        if (!static_type_is_compatible(actual, expected)) {
+            Token param_name = {
+                TOKEN_IDENTIFIER,
+                (info->param_names && info->param_names[i]) ? info->param_names[i] : "",
+                (info->param_name_lens && info->param_name_lens[i] > 0) ? info->param_name_lens[i] : 0,
+                call_expr->data.call_expr.name.line
+            };
+            compiler_call_param_mismatch(call_expr->data.call_expr.name, param_name, expected, actual);
+        }
+    }
 }
 
 static StaticType infer_identifier_type(const char* name, int length) {
@@ -2022,10 +2281,10 @@ static StaticType infer_call_expr_type(AstNode* expr) {
     } else if (callee_expr && callee_expr->type == AST_IDENTIFIER) {
         callee_fn = resolve_namespace_function(current_module_alias, current_alias_len, name, namelen);
         if (!callee_fn) callee_fn = resolve_namespace_function(NULL, 0, name, namelen);
-        if (!callee_fn) callee_fn = resolve_function(name, namelen);
+            if (!callee_fn) callee_fn = resolve_function(name, namelen);
 
-        callee_st = callee_fn ? NULL : resolve_namespace_struct(current_module_alias, current_alias_len,
-                                                                name, namelen);
+            callee_st = callee_fn ? NULL : resolve_namespace_struct(current_module_alias, current_alias_len,
+                                                                    name, namelen);
         if (!callee_st) callee_st = resolve_namespace_struct(NULL, 0, name, namelen);
         if (!callee_st) callee_st = resolve_struct(name, namelen);
     } else {
@@ -2039,6 +2298,70 @@ static StaticType infer_call_expr_type(AstNode* expr) {
 
 static int compile_expr(AstNode* expr);
 static void compile_stmt(AstNode* stmt);
+
+static int ast_line(AstNode* expr) {
+    if (!expr) return 0;
+
+    switch (expr->type) {
+        case AST_IDENTIFIER:
+            return expr->data.identifier.name.line;
+        case AST_BINARY_EXPR:
+            return expr->data.binary.op.line;
+        case AST_VAR_DECL:
+            return expr->data.var_decl.name.line;
+        case AST_ASSIGN_EXPR:
+            return expr->data.assign.name.line;
+        case AST_EXPR_STMT:
+            return ast_line(expr->data.expr_stmt.expr);
+        case AST_USE_STMT:
+            return expr->data.use_stmt.path.line;
+        case AST_BLOCK_STMT:
+        case AST_PROGRAM:
+            if (expr->data.block.count > 0) return ast_line(expr->data.block.statements[0]);
+            return 0;
+        case AST_IF_STMT:
+            return ast_line(expr->data.if_stmt.condition);
+        case AST_WHILE_STMT:
+            return ast_line(expr->data.while_stmt.condition);
+        case AST_FUNC_DECL:
+            return expr->data.func_decl.name.line;
+        case AST_STRUCT_DECL:
+            return expr->data.struct_decl.name.line;
+        case AST_SYNC_STMT:
+            return ast_line(expr->data.sync_stmt.body);
+        case AST_CALL_EXPR:
+            return expr->data.call_expr.name.line;
+        case AST_RETURN_STMT:
+            return ast_line(expr->data.return_stmt.value);
+        case AST_GET_EXPR:
+        case AST_SAFE_GET_EXPR:
+            return expr->data.get_expr.name.line;
+        case AST_SET_EXPR:
+            return expr->data.set_expr.name.line;
+        case AST_SPAWN_EXPR:
+            return ast_line(expr->data.spawn_expr.expr);
+        case AST_AWAIT_EXPR:
+            return ast_line(expr->data.await_expr.expr);
+        case AST_TRY_EXPR:
+            return ast_line(expr->data.try_expr.try_block);
+        case AST_TYPEOF_EXPR:
+            return ast_line(expr->data.typeof_expr.expr);
+        case AST_CLONE_EXPR:
+        case AST_EVAL_EXPR:
+        case AST_KEYS_EXPR:
+            return ast_line(expr->data.clone_expr.expr);
+        case AST_HAS_EXPR:
+            return ast_line(expr->data.has_expr.obj);
+        case AST_INDEX_EXPR:
+            return ast_line(expr->data.index_expr.target);
+        case AST_MATCH_EXPR:
+            return ast_line(expr->data.match_expr.left);
+        case AST_ERROR_PROPAGATE_EXPR:
+            return ast_line(expr->data.error_propagate.expr);
+        default:
+            return 0;
+    }
+}
 
 static StaticType infer_expr_type(AstNode* expr) {
     if (!expr) return static_type_unknown();
@@ -2059,7 +2382,9 @@ static StaticType infer_expr_type(AstNode* expr) {
         case AST_BINARY_EXPR: {
             TokenType op = expr->data.binary.op.type;
             if (op == TOKEN_EQUAL_EQUAL || op == TOKEN_BANG_EQUAL ||
-                op == TOKEN_LESS || op == TOKEN_GREATER || op == TOKEN_MATCH) {
+                op == TOKEN_LESS || op == TOKEN_LESS_EQUAL ||
+                op == TOKEN_GREATER || op == TOKEN_GREATER_EQUAL ||
+                op == TOKEN_MATCH) {
                 return static_type_make(STATIC_TYPE_BOOL, NULL);
             }
 
@@ -2124,6 +2449,7 @@ static StaticType infer_expr_type(AstNode* expr) {
 
 static int compile_expr(AstNode* expr) {
     if (!expr) return -1;
+    set_chunk_write_line(ast_line(expr));
 
     if (expr->type == AST_NUMBER) {
         int ci = add_constant(current_chunk(), (Value){VAL_NUMBER, {.number = expr->data.number_val}});
@@ -2213,9 +2539,9 @@ static int compile_expr(AstNode* expr) {
                 return rD;
             }
 
-            printf("Compiler Error: Undefined variable '%.*s'\n",
-                expr->data.identifier.name.length, expr->data.identifier.name.start);
-            exit(1);
+            compiler_error_exit("VCP027", "Undefined variable '%.*s'",
+                                expr->data.identifier.name.length,
+                                expr->data.identifier.name.start);
         }
         return cst.locals[local_idx].reg;
     }
@@ -2260,9 +2586,8 @@ static int compile_expr(AstNode* expr) {
             return src;
         }
 
-        printf("Compiler Error: Undefined variable '%.*s' for assignment\n",
-            expr->data.assign.name.length, expr->data.assign.name.start);
-        exit(1);
+        compiler_error_exit("VCP028", "Undefined variable '%.*s' for assignment",
+                            expr->data.assign.name.length, expr->data.assign.name.start);
     }
 
     if (expr->type == AST_BINARY_EXPR) {
@@ -2291,6 +2616,26 @@ static int compile_expr(AstNode* expr) {
 
         int rL = compile_expr(expr->data.binary.left);
         int rR = compile_expr(expr->data.binary.right);
+
+        if (expr->data.binary.op.type == TOKEN_BANG_EQUAL ||
+            expr->data.binary.op.type == TOKEN_LESS_EQUAL ||
+            expr->data.binary.op.type == TOKEN_GREATER_EQUAL) {
+            int rTmp = cst.next_reg++;
+            int rD = cst.next_reg++;
+            uint8_t compare = OP_EQUAL;
+            switch (expr->data.binary.op.type) {
+                case TOKEN_BANG_EQUAL:    compare = OP_EQUAL;   break;
+                case TOKEN_LESS_EQUAL:    compare = OP_GREATER; break;
+                case TOKEN_GREATER_EQUAL: compare = OP_LESS;    break;
+                default: break;
+            }
+            set_chunk_write_line(ast_line(expr));
+            write_chunk(current_chunk(), ENCODE_INST(compare, rTmp, rL, rR));
+            set_chunk_write_line(ast_line(expr));
+            write_chunk(current_chunk(), ENCODE_INST(OP_NOT, rD, rTmp, 0));
+            return rD;
+        }
+
         int rD = cst.next_reg++;
         uint8_t op = OP_ADD;
         switch (expr->data.binary.op.type) {
@@ -2305,6 +2650,7 @@ static int compile_expr(AstNode* expr) {
             case TOKEN_CARET_PLUS:  op = OP_ADD_SAT; break;
             default: break;
         }
+        set_chunk_write_line(ast_line(expr));
         write_chunk(current_chunk(), ENCODE_INST(op, rD, rL, rR));
         return rD;
     }
@@ -2313,6 +2659,7 @@ static int compile_expr(AstNode* expr) {
         int rL = compile_expr(expr->data.match_expr.left);
         int rR = compile_expr(expr->data.match_expr.right);
         int rD = cst.next_reg++;
+        set_chunk_write_line(ast_line(expr));
         write_chunk(current_chunk(), ENCODE_INST(OP_MATCH, rD, rL, rR));
         return rD;
     }
@@ -2324,11 +2671,13 @@ static int compile_expr(AstNode* expr) {
         if (expr->data.index_expr.value) {
             // SET_INDEX
             int rVal = compile_expr(expr->data.index_expr.value);
+            set_chunk_write_line(ast_line(expr));
             write_chunk(current_chunk(), ENCODE_INST(OP_SET_INDEX, rObj, rIdx, rVal));
             return rVal;
         } else {
             // GET_INDEX
             int rDest = cst.next_reg++;
+            set_chunk_write_line(ast_line(expr));
             write_chunk(current_chunk(), ENCODE_INST(OP_GET_INDEX, rDest, rObj, rIdx));
             return rDest;
         }
@@ -2344,8 +2693,7 @@ static int compile_expr(AstNode* expr) {
         int native_idx = -1;
 
         if (arg_count > 255) {
-            printf("Compiler Error: Too many call arguments (%d).\n", arg_count);
-            exit(1);
+            compiler_error_exit("VCP029", "Too many call arguments (%d).", arg_count);
         }
 
         if (arg_count > 0) {
@@ -2367,8 +2715,8 @@ static int compile_expr(AstNode* expr) {
                 // If namespace resolution fails, maybe it's a native method?
                 native_idx = find_native_index(member.start, member.length);
                 if (native_idx == -1) {
-                    printf("Compiler Error: Unknown namespaced callable '%.*s.%.*s'.\n",
-                           alias.length, alias.start, member.length, member.start);
+                    compiler_error("VCP030", "Unknown namespaced callable '%.*s.%.*s'.",
+                                   alias.length, alias.start, member.length, member.start);
                     free(arg_regs);
                     exit(1);
                 }
@@ -2380,7 +2728,8 @@ static int compile_expr(AstNode* expr) {
                 // For native methods (like obj.get_fn()), the object itself is the first argument!
                 int obj_reg = resolve_local(alias.start, alias.length);
                 if (obj_reg == -1) {
-                     printf("Compiler Error: Undefined object '%.*s' for method call.\n", alias.length, alias.start);
+                     compiler_error("VCP031", "Undefined object '%.*s' for method call.",
+                                    alias.length, alias.start);
                      free(arg_regs);
                      exit(1);
                 }
@@ -2401,6 +2750,7 @@ static int compile_expr(AstNode* expr) {
                     write_chunk(current_chunk(), ENCODE_INST(OP_MOVE, argReg, arg_regs[i], 0));
                 }
                 int destReg = cst.next_reg++;
+                set_chunk_write_line(ast_line(expr));
                 write_chunk(current_chunk(), ENCODE_INST(OP_CALL_NATIVE, (uint8_t)native_idx, (uint8_t)arg_count, (uint8_t)destReg));
                 free(arg_regs);
                 return destReg;
@@ -2436,6 +2786,7 @@ static int compile_expr(AstNode* expr) {
                         write_chunk(current_chunk(), ENCODE_INST(OP_MOVE, argReg, arg_regs[i], 0));
                     }
                     int destReg = cst.next_reg++;
+                    set_chunk_write_line(ast_line(expr));
                     write_chunk(current_chunk(), ENCODE_INST(OP_CALL, fnReg, (uint8_t)arg_count, (uint8_t)destReg));
                     free(arg_regs);
                     return destReg;
@@ -2446,11 +2797,11 @@ static int compile_expr(AstNode* expr) {
                         callee_fn = late_fn;
                     } else {
                         const char* hint = capability_hint_for_symbol(name, namelen);
-                        if (hint) {
-                            printf("Compiler Error: Unknown callable '%.*s' (%s, profile=%s)\n",
-                                   namelen, name, hint, VIPER_PROFILE_NAME);
+                    if (hint) {
+                            compiler_error("VCP032", "Unknown callable '%.*s' (%s, profile=%s)",
+                                           namelen, name, hint, VIPER_PROFILE_NAME);
                         } else {
-                            printf("Compiler Error: Unknown callable '%.*s'\n", namelen, name);
+                            compiler_error("VCP032", "Unknown callable '%.*s'", namelen, name);
                         }
                         free(arg_regs);
                         exit(1);
@@ -2458,9 +2809,13 @@ static int compile_expr(AstNode* expr) {
                 }
             }
         } else {
-            printf("Compiler Error: Unsupported call target.\n");
+            compiler_error("VCP033", "Unsupported call target.");
             free(arg_regs);
             exit(1);
+        }
+
+        if (callee_fn) {
+            validate_static_call_contract(expr, callee_fn);
         }
 
         // We only reach here if it's a STATIC func, STATIC struct, or STATIC built-in native.
@@ -2474,6 +2829,7 @@ static int compile_expr(AstNode* expr) {
                 write_chunk(current_chunk(), ENCODE_INST(OP_MOVE, argReg, arg_regs[i], 0));
             }
             int destReg = cst.next_reg++;
+            set_chunk_write_line(ast_line(expr));
             write_chunk(current_chunk(), ENCODE_INST(OP_CALL_NATIVE, (uint8_t)native_idx, (uint8_t)arg_count, (uint8_t)destReg));
             free(arg_regs);
             return destReg;
@@ -2490,6 +2846,7 @@ static int compile_expr(AstNode* expr) {
         }
 
         int destReg = cst.next_reg++;
+        set_chunk_write_line(ast_line(expr));
         write_chunk(current_chunk(), ENCODE_INST(OP_CALL, fnReg, (uint8_t)arg_count, (uint8_t)destReg));
         free(arg_regs);
         return destReg;
@@ -2498,8 +2855,7 @@ static int compile_expr(AstNode* expr) {
     if (expr->type == AST_SPAWN_EXPR) {
         AstNode* call_expr = expr->data.spawn_expr.expr;
         if (call_expr->type != AST_CALL_EXPR) {
-            printf("Compiler Error: 'spawn' keyword requires a function call.\n");
-            exit(1);
+            compiler_error_exit("VCP034", "'spawn' keyword requires a function call.");
         }
         
         const char* name = call_expr->data.call_expr.name.start;
@@ -2514,10 +2870,10 @@ static int compile_expr(AstNode* expr) {
         if (!callee_fn) {
             const char* hint = capability_hint_for_symbol(name, namelen);
             if (hint) {
-                printf("Compiler Error: Unknown spawn callable '%.*s' (%s, profile=%s)\n",
-                       namelen, name, hint, VIPER_PROFILE_NAME);
+                compiler_error("VCP035", "Unknown spawn callable '%.*s' (%s, profile=%s)",
+                               namelen, name, hint, VIPER_PROFILE_NAME);
             } else {
-                printf("Compiler Error: Unknown spawn callable '%.*s'\n", namelen, name);
+                compiler_error("VCP035", "Unknown spawn callable '%.*s'", namelen, name);
             }
             exit(1);
         }
@@ -2707,6 +3063,7 @@ static int compile_expr(AstNode* expr) {
 
 static void compile_stmt(AstNode* stmt) {
     if (!stmt) return;
+    set_chunk_write_line(ast_line(stmt));
 
     if (stmt->type == AST_VAR_DECL) {
         bool has_declared_type = stmt->data.var_decl.type_annot.length > 0;
@@ -2808,10 +3165,9 @@ static void compile_stmt(AstNode* stmt) {
         ObjFunction* fn = resolve_namespace_function(current_module_alias, current_alias_len,
                                                        stmt->data.func_decl.name.start, stmt->data.func_decl.name.length);
         if (!fn) {
-             printf("Compiler Error: Proto for %.*s not found (alias: %.*s)\n", 
-                    stmt->data.func_decl.name.length, stmt->data.func_decl.name.start,
-                    current_alias_len, current_module_alias);
-             exit(1);
+             compiler_error_exit("VCP036", "Proto for %.*s not found (alias: %.*s)",
+                                 stmt->data.func_decl.name.length, stmt->data.func_decl.name.start,
+                                 current_alias_len, current_module_alias);
         }
         
         CompilerState prevCompiler = cst;
@@ -2826,7 +3182,19 @@ static void compile_stmt(AstNode* stmt) {
         
         begin_scope();
         for (int i = 0; i < stmt->data.func_decl.param_count; i++) {
-            add_local(stmt->data.func_decl.params[i].start, stmt->data.func_decl.params[i].length, cst.next_reg++, 0);
+            StaticType param_type = static_type_unknown();
+            bool has_param_type = false;
+            if (fn_info && i < fn_info->param_count) {
+                param_type = fn_info->param_types ? fn_info->param_types[i] : static_type_unknown();
+                has_param_type = static_type_is_known(param_type);
+            }
+            int reg = cst.next_reg++;
+            add_local_typed(stmt->data.func_decl.params[i].start,
+                            stmt->data.func_decl.params[i].length,
+                            reg, 0, has_param_type, param_type);
+            if (has_param_type) {
+                emit_type_assert(reg, param_type);
+            }
         }
         compile_stmt(stmt->data.func_decl.body);
         write_chunk(current_chunk(), ENCODE_INST(OP_RETURN, 0, 0, 0));
@@ -2843,9 +3211,8 @@ static void compile_stmt(AstNode* stmt) {
                                 stmt->data.struct_decl.name.length);
         }
         if (!st) {
-            printf("Compiler Error: Struct proto for %.*s not found.\n",
-                   stmt->data.struct_decl.name.length, stmt->data.struct_decl.name.start);
-            exit(1);
+            compiler_error_exit("VCP037", "Struct proto for %.*s not found.",
+                                stmt->data.struct_decl.name.length, stmt->data.struct_decl.name.start);
         }
 
         int reg = cst.next_reg++;
@@ -2876,8 +3243,7 @@ static void compile_stmt(AstNode* stmt) {
         decode_use_path(stmt->data.use_stmt.path, raw_path, sizeof(raw_path));
         if (stmt->data.use_stmt.alias.length > 0) {
             if ((size_t)stmt->data.use_stmt.alias.length >= sizeof(alias_buf)) {
-                printf("Compiler Error: Namespace alias is too long.\n");
-                exit(1);
+                compiler_error_exit("VCP038", "Namespace alias is too long.");
             }
             memcpy(alias_buf, stmt->data.use_stmt.alias.start, (size_t)stmt->data.use_stmt.alias.length);
             alias_buf[stmt->data.use_stmt.alias.length] = '\0';
@@ -2904,9 +3270,8 @@ static void compile_stmt(AstNode* stmt) {
 
         char* source = NULL;
         if (!load_module_source(resolved_path, &source)) {
-            printf("Compiler Error: Could not open module '%s' (resolved as '%s').\n",
-                   raw_path, resolved_path);
-            exit(1);
+            compiler_error_exit("VCP039", "Could not open module '%s' (resolved as '%s').",
+                                raw_path, resolved_path);
         }
         remember_imported_module(resolved_path);
 
@@ -2935,8 +3300,8 @@ static void compile_stmt(AstNode* stmt) {
         int export_count = 0;
         bool has_public = false;
         if (!collect_module_export_decls(mod_ast, &exports, &export_count, &has_public)) {
-            printf("Compiler Error: Out of memory while collecting exports for '%s'.\n", resolved_path);
-            exit(1);
+            compiler_error_exit("VCP040", "Out of memory while collecting exports for '%s'.",
+                                resolved_path);
         }
 
         if (mod_ast->type == AST_PROGRAM) {
@@ -2959,8 +3324,8 @@ static void compile_stmt(AstNode* stmt) {
                                                       alias, alias_len,
                                                       apply_public_filter, resolved_path)) {
                 free(exports);
-                printf("Compiler Error: Failed to apply import visibility for '%s'.\n", resolved_path);
-                exit(1);
+                compiler_error_exit("VCP041", "Failed to apply import visibility for '%s'.",
+                                    resolved_path);
             }
         }
         free(exports); 
@@ -3042,6 +3407,25 @@ static void register_function_prototypes(AstNode* node, const char* alias, int a
         register_namespace_symbol(alias, alias_len, ABI_KIND_FUNCTION, fn->name, fn->name_len, (Obj*)fn, "builtin");
 
         FunctionTypeInfo* info = ensure_function_type_info(fn);
+        clear_function_param_contract(info);
+        if (node->data.func_decl.param_count > 0) {
+            info->param_names = (const char**)calloc((size_t)node->data.func_decl.param_count, sizeof(const char*));
+            info->param_name_lens = (int*)calloc((size_t)node->data.func_decl.param_count, sizeof(int));
+            info->param_types = (StaticType*)calloc((size_t)node->data.func_decl.param_count, sizeof(StaticType));
+            if (!info->param_names || !info->param_name_lens || !info->param_types) compiler_fatal_oom();
+            info->param_count = node->data.func_decl.param_count;
+            for (int i = 0; i < node->data.func_decl.param_count; i++) {
+                info->param_names[i] = node->data.func_decl.params[i].start;
+                info->param_name_lens[i] = node->data.func_decl.params[i].length;
+                if (node->data.func_decl.param_types &&
+                    node->data.func_decl.param_types[i].length > 0) {
+                    info->param_types[i] = resolve_type_annotation_in_namespace(
+                        node->data.func_decl.param_types[i], alias, alias_len);
+                } else {
+                    info->param_types[i] = static_type_unknown();
+                }
+            }
+        }
         if (node->data.func_decl.return_type.length > 0) {
             info->has_return_type = true;
             info->return_type = resolve_type_annotation_in_namespace(node->data.func_decl.return_type,
@@ -3059,7 +3443,7 @@ ObjFunction* compile(AstNode* program) {
     clear_namespace_registry();
     fn_count = 0;
     st_count = 0;
-    fn_type_count = 0;
+    free_function_type_registry();
     global_var_count = 0;
     cst.local_cap = 0;
     cst.local_count = 0;

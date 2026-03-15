@@ -1,0 +1,6 @@
+use "@web" as web
+@effect(os)
+fn bad() {
+    ret web.webPing()
+}
+bad()

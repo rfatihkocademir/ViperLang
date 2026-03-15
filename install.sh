@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -e
 
-echo "=== ViperLang v3 Installer ==="
-echo "Features: M:N Scheduler, Tiered JIT, Real Concurrency, Zero-Copy I/O"
+echo "=== ViperLang Installer ==="
+echo "Features: semantic state handoff, focused resume/query, typed ABI, effect contracts"
 echo ""
 
 # Check for required dependencies
-command -v gcc >/dev/null 2>&1 || { echo "Error: gcc is required for the JIT compiler. Install it first."; exit 1; }
+command -v gcc >/dev/null 2>&1 || { echo "Error: gcc is required to build ViperLang. Install it first."; exit 1; }
 command -v make >/dev/null 2>&1 || { echo "Error: make is required. Install it first."; exit 1; }
 
 # Check for libffi
@@ -17,47 +17,50 @@ if ! ldconfig -p 2>/dev/null | grep -q libffi || ! find /usr/lib* /usr/local/lib
     echo ""
 fi
 
-echo "Building ViperLang v3 from source..."
+# Check for sqlite3 headers/libs used by the runtime.
+if ! ldconfig -p 2>/dev/null | grep -q sqlite3 || ! find /usr/include* /usr/local/include* -name 'sqlite3.h' 2>/dev/null | head -1 | grep -q .; then
+    echo "Warning: sqlite3 development files may not be installed."
+    echo "  Debian/Ubuntu: sudo apt install libsqlite3-dev"
+    echo "  Fedora:        sudo dnf install sqlite-devel"
+    echo ""
+fi
+
+echo "Building ViperLang from source..."
 make clean
 make
 
-# Define target paths
 BIN_DIR="/usr/local/bin"
-LIB_DIR="/usr/local/lib/viper/std"
+VIPER_HOME="/usr/local/lib/viper"
+STD_DIR="${VIPER_HOME}/std"
+LLM_DIR="${VIPER_HOME}/docs/llm"
 
 echo ""
-echo "Installing binary to $BIN_DIR/viper..."
-sudo mkdir -p $BIN_DIR
-sudo cp viper $BIN_DIR/viper
-sudo chmod +x $BIN_DIR/viper
+echo "Installing binary to ${BIN_DIR}/viper..."
+sudo mkdir -p "${BIN_DIR}"
+sudo cp viper "${BIN_DIR}/viper"
+sudo chmod +x "${BIN_DIR}/viper"
 
-echo "Installing standard library to $LIB_DIR..."
-sudo mkdir -p $LIB_DIR
+echo "Installing standard library to ${STD_DIR}..."
+sudo mkdir -p "${STD_DIR}"
+sudo cp lib/std/*.vp "${STD_DIR}/"
+sudo cp lib/std/*.so "${STD_DIR}/"
 
-# Copy standard library modules (.vp files)
-sudo cp lib/std/*.vp $LIB_DIR/
-
-# Copy compiled shared libraries (.so files)
-sudo cp lib/std/*.so $LIB_DIR/
-
-# Copy LLM Reference Guide (used by viper pkg init)
-echo "Installing LLM Reference Guide..."
-sudo mkdir -p /usr/local/lib/viper
-if [ -f docs/LLM_REFERENCE.md ]; then
-    sudo cp docs/LLM_REFERENCE.md /usr/local/lib/viper/LLM_REFERENCE.md
-fi
+echo "Installing LLM onboarding pack to ${LLM_DIR}..."
+sudo mkdir -p "${LLM_DIR}"
+sudo cp docs/llm/*.md "${LLM_DIR}/"
 
 echo ""
-echo "✅ ViperLang v3 installed successfully!"
+echo "✅ ViperLang installed successfully!"
 echo ""
-echo "New in v3:"
-echo " - Real Concurrency (Fibers + M:N Scheduler)"
-echo " - Tiered JIT Compilation"
-echo " - Advanced Memory Profiler (run with pr_profile())"
-echo " - Zero-Copy Asynchronous I/O"
+echo "Installed components:"
+echo " - Binary: ${BIN_DIR}/viper"
+echo " - Standard library: ${STD_DIR}"
+echo " - LLM onboarding pack: ${LLM_DIR}"
 echo ""
-echo "You can now run 'viper' from anywhere:"
+echo "Quick start:"
 echo "  viper my_script.vp"
+echo "  viper pkg init my_project"
 echo ""
-echo "Standard library available at: $LIB_DIR"
-echo "Binary installed at: $BIN_DIR/viper"
+echo "LLM-native workflow:"
+echo "  viper --emit-project-state --focus=<symbol> --impact <entry.vp>"
+echo "  viper --resume-project-state=<state.vstate> --brief"

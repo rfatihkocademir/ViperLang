@@ -9,6 +9,7 @@
 #include "parser.h"
 #include "capabilities.h"
 #include <regex.h>
+#include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
 #include "scheduler.h"
@@ -21,6 +22,15 @@ static bool ensure_frame_capacity(VM* vm, int needed);
 static bool ensure_register_capacity(VM* vm, int needed);
 static void vm_fatal_oom(void);
 static Value deep_clone_value(Value value);
+static void vm_print_stack_trace(VM* vm, CallFrame* current_frame);
+static CallFrame* vm_active_frame(VM* vm);
+static int vm_instruction_line(CallFrame* frame, uint32_t ip);
+static void vm_raise_va(VM* vm, CallFrame* frame, const char* kind, const char* code, const char* fmt, va_list args);
+static void vm_raise(VM* vm, CallFrame* frame, const char* kind, const char* code, const char* fmt, ...);
+static void vm_runtime_error(VM* vm, CallFrame* frame, const char* code, const char* fmt, ...);
+static void vm_panic_error(VM* vm, CallFrame* frame, const char* code, const char* fmt, ...);
+static void vm_type_error(VM* vm, CallFrame* frame, const char* code, const char* fmt, ...);
+static int current_chunk_write_line = 0;
 
 
 Value call_viper_function(ObjFunction* fn, int argCount, Value* args) {
@@ -68,11 +78,101 @@ Value call_viper_function(ObjFunction* fn, int argCount, Value* args) {
 }
 
 static void vm_fatal_oom(void) {
-    printf("VM Panic: Out of memory.\n");
-    exit(1);
+    vm_panic_error(current_vm, vm_active_frame(current_vm), "VVM001", "Out of memory.");
 }
 
 extern __thread const char* last_panic_msg;
+extern __thread const char* last_panic_code;
+
+static CallFrame* vm_active_frame(VM* vm) {
+    if (!vm || vm->frame_count <= 0) return NULL;
+    return &vm->frames[vm->frame_count - 1];
+}
+
+static int vm_instruction_line(CallFrame* frame, uint32_t ip) {
+    if (!frame || !frame->function || !frame->function->chunk.lines) return 0;
+    if (frame->function->chunk.count <= 0) return 0;
+
+    int count = frame->function->chunk.count;
+    int idx = (ip < (uint32_t)count) ? (int)ip : count - 1;
+    for (int probe = idx; probe >= 0; probe--) {
+        int line = frame->function->chunk.lines[probe];
+        if (line > 0) return line;
+    }
+    for (int probe = idx + 1; probe < count; probe++) {
+        int line = frame->function->chunk.lines[probe];
+        if (line > 0) return line;
+    }
+    return 0;
+}
+
+static void vm_raise_va(VM* vm, CallFrame* frame, const char* kind, const char* code, const char* fmt, va_list args) {
+    printf("%s", kind);
+    if (code && code[0] != '\0') {
+        printf(" [%s]", code);
+    }
+    printf(": ");
+    vprintf(fmt, args);
+    printf("\n");
+    if (!frame) frame = vm_active_frame(vm);
+    vm_print_stack_trace(vm, frame);
+    exit(1);
+}
+
+static void vm_raise(VM* vm, CallFrame* frame, const char* kind, const char* code, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vm_raise_va(vm, frame, kind, code, fmt, args);
+    va_end(args);
+}
+
+static void vm_runtime_error(VM* vm, CallFrame* frame, const char* code, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vm_raise_va(vm, frame, "Runtime Error", code ? code : "VRT000", fmt, args);
+    va_end(args);
+}
+
+static void vm_panic_error(VM* vm, CallFrame* frame, const char* code, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vm_raise_va(vm, frame, "VM Panic", code ? code : "VVM000", fmt, args);
+    va_end(args);
+}
+
+static void vm_type_error(VM* vm, CallFrame* frame, const char* code, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vm_raise_va(vm, frame, "TypeError", code ? code : "VTP000", fmt, args);
+    va_end(args);
+}
+
+static void vm_print_stack_trace(VM* vm, CallFrame* current_frame) {
+    if (!vm || vm->frame_count <= 0) return;
+
+    printf("Stack trace:\n");
+    for (int i = vm->frame_count - 1; i >= 0; i--) {
+        CallFrame* frame = &vm->frames[i];
+        const char* name = "<script>";
+        int name_len = 8;
+        if (frame->function && frame->function->name && frame->function->name_len > 0) {
+            name = frame->function->name;
+            name_len = frame->function->name_len;
+        }
+
+        uint32_t ip = frame->ip;
+        if (current_frame && frame == current_frame) {
+            ip = current_frame->ip;
+        }
+        if (ip > 0) ip -= 1;
+        int line = vm_instruction_line(frame, ip);
+        if (line > 0) {
+            printf("  at %.*s line=%d ip=%u\n", name_len, name, line, ip);
+        } else {
+            printf("  at %.*s ip=%u\n", name_len, name, ip);
+        }
+    }
+}
 
 static bool ensure_frame_capacity(VM* vm, int needed) {
     if (vm->frame_capacity >= needed) return true;
@@ -103,11 +203,17 @@ static bool ensure_register_capacity(VM* vm, int needed) {
 
 void init_chunk(Chunk* chunk) {
     chunk->code = NULL;
+    chunk->lines = NULL;
     chunk->count = 0;
     chunk->capacity = 0;
+    chunk->line_capacity = 0;
     chunk->constants = NULL;
     chunk->constant_count = 0;
     chunk->constant_capacity = 0;
+}
+
+void set_chunk_write_line(int line) {
+    current_chunk_write_line = line > 0 ? line : 0;
 }
 
 void write_chunk(Chunk* chunk, Instruction inst) {
@@ -115,7 +221,12 @@ void write_chunk(Chunk* chunk, Instruction inst) {
         chunk->capacity = chunk->capacity < 8 ? 8 : chunk->capacity * 2;
         chunk->code = realloc(chunk->code, sizeof(Instruction) * chunk->capacity);
     }
+    if (chunk->line_capacity < chunk->count + 1) {
+        chunk->line_capacity = chunk->line_capacity < 8 ? 8 : chunk->line_capacity * 2;
+        chunk->lines = realloc(chunk->lines, sizeof(int) * chunk->line_capacity);
+    }
     chunk->code[chunk->count] = inst;
+    chunk->lines[chunk->count] = current_chunk_write_line;
     chunk->count++;
 }
 
@@ -156,8 +267,8 @@ void init_vm(VM* vm) {
 static void write_ffi_value(void* dest, ffi_type* f_type, Value v) {
     if (f_type->type == FFI_TYPE_STRUCT) {
         if (!IS_OBJ(v) || AS_OBJ(v)->type != OBJ_INSTANCE) {
-            printf("Runtime Error: Expected ObjInstance for FFI struct argument.\n");
-            exit(1);
+            vm_runtime_error(current_vm, vm_active_frame(current_vm), "VRT001",
+                             "Expected ObjInstance for FFI struct argument.");
         }
         ObjInstance* inst = (ObjInstance*)AS_OBJ(v);
         size_t offset = 0;
@@ -167,24 +278,54 @@ static void write_ffi_value(void* dest, ffi_type* f_type, Value v) {
             if (offset % align != 0) offset += align - (offset % align);
             
             if (i >= inst->klass->field_count) {
-                printf("Runtime Error: FFI Struct has more fields than Viper ObjInstance.\n");
-                exit(1);
+                vm_runtime_error(current_vm, vm_active_frame(current_vm), "VRT002",
+                                 "FFI Struct has more fields than Viper ObjInstance.");
             }
             write_ffi_value((char*)dest + offset, etype, inst->fields[i]);
             offset += etype->size;
         }
     } else {
-        if (f_type == &ffi_type_sint32) *(int32_t*)dest = (int32_t)v.as.number;
-        else if (f_type == &ffi_type_sint64) *(int64_t*)dest = (int64_t)v.as.number;
-        else if (f_type == &ffi_type_float) *(float*)dest = (float)v.as.number;
-        else if (f_type == &ffi_type_double) *(double*)dest = (double)v.as.number;
+        if (f_type == &ffi_type_sint32) {
+            if (!IS_NUMBER(v) && !IS_BOOL(v)) {
+                vm_runtime_error(current_vm, vm_active_frame(current_vm), "VRT003",
+                                 "FFI expected int32 argument.");
+            }
+            *(int32_t*)dest = IS_BOOL(v) ? (int32_t)(v.as.boolean ? 1 : 0) : (int32_t)v.as.number;
+        }
+        else if (f_type == &ffi_type_sint64) {
+            if (!IS_NUMBER(v) && !IS_BOOL(v)) {
+                vm_runtime_error(current_vm, vm_active_frame(current_vm), "VRT004",
+                                 "FFI expected int64 argument.");
+            }
+            *(int64_t*)dest = IS_BOOL(v) ? (int64_t)(v.as.boolean ? 1 : 0) : (int64_t)v.as.number;
+        }
+        else if (f_type == &ffi_type_float) {
+            if (!IS_NUMBER(v) && !IS_BOOL(v)) {
+                vm_runtime_error(current_vm, vm_active_frame(current_vm), "VRT005",
+                                 "FFI expected float argument.");
+            }
+            *(float*)dest = IS_BOOL(v) ? (float)(v.as.boolean ? 1.0 : 0.0) : (float)v.as.number;
+        }
+        else if (f_type == &ffi_type_double) {
+            if (!IS_NUMBER(v) && !IS_BOOL(v)) {
+                vm_runtime_error(current_vm, vm_active_frame(current_vm), "VRT006",
+                                 "FFI expected double argument.");
+            }
+            *(double*)dest = IS_BOOL(v) ? (double)(v.as.boolean ? 1.0 : 0.0) : (double)v.as.number;
+        }
         else if (f_type == &ffi_type_pointer) {
              if (v.type == VAL_OBJ && AS_OBJ(v)->type == OBJ_STRING) *(void**)dest = AS_STRING(v)->chars;
              else if (v.type == VAL_OBJ && AS_OBJ(v)->type == OBJ_DL_HANDLE) *(void**)dest = ((ObjDlHandle*)AS_OBJ(v))->handle;
              else if (v.type == VAL_OBJ && AS_OBJ(v)->type == OBJ_POINTER) *(void**)dest = ((ObjPointer*)AS_OBJ(v))->ptr;
              else if (v.type == VAL_NIL) *(void**)dest = NULL;
-             else { printf("Runtime Error: Unsupported pointer arg conversion.\n"); exit(1); }
-        } else { printf("Runtime Error: Unsupported FFI arg type.\n"); exit(1); }
+             else {
+                 vm_runtime_error(current_vm, vm_active_frame(current_vm), "VRT007",
+                                  "Unsupported pointer arg conversion.");
+             }
+        } else {
+            vm_runtime_error(current_vm, vm_active_frame(current_vm), "VRT008",
+                             "Unsupported FFI arg type.");
+        }
     }
 }
 
@@ -301,8 +442,7 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
         frame = &vm->frames[vm->frame_count - 1]; // Refresh frame in case of stack changes
         
         if (frame->ip >= (uint32_t)frame->function->chunk.count) {
-            printf("VM Panic: IP out of bounds.\n");
-            exit(1);
+            vm_panic_error(vm, frame, "VVM002", "IP out of bounds.");
         }
 
         if (!ensure_register_capacity(vm, frame->base + REGISTER_WINDOW)) {
@@ -366,7 +506,9 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
                 break;
             case OP_DIV:
                 if (FRAME_REG(frame, rB).type == VAL_NUMBER && FRAME_REG(frame, rC).type == VAL_NUMBER) {
-                    if (FRAME_REG(frame, rC).as.number == 0) { printf("VM Panic: Division by zero.\n"); exit(1); }
+                    if (FRAME_REG(frame, rC).as.number == 0) {
+                        vm_panic_error(vm, frame, "VVM003", "Division by zero.");
+                    }
                     FRAME_REG(frame, rA) = (Value){VAL_NUMBER, {.number = FRAME_REG(frame, rB).as.number / FRAME_REG(frame, rC).as.number}};
                 }
                 break;
@@ -472,8 +614,7 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
                     if (AS_OBJ(callee)->type == OBJ_FUNCTION) {
                         ObjFunction* fn = AS_FUNCTION(callee);
                         if (rB != fn->arity) {
-                            printf("Runtime Error: Expected %d args, got %d\n", fn->arity, rB);
-                            exit(1);
+                            vm_runtime_error(vm, frame, "VRT009", "Expected %d args, got %d.", fn->arity, rB);
                         }
                         // Tier-2 PGO JIT Compilation
                         if (fn->hot_count++ > 100 && !fn->jit_fn) {
@@ -531,8 +672,9 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
                     } else if (AS_OBJ(callee)->type == OBJ_STRUCT) {
                         ObjStruct* st = (ObjStruct*)AS_OBJ(callee);
                         if (rB > st->field_count) {
-                            printf("Runtime Error: Expected at most %d fields for struct %s, got %d.\n", st->field_count, st->name, rB);
-                            exit(1);
+                            vm_runtime_error(vm, frame, "VRT010",
+                                             "Expected at most %d fields for struct %s, got %d.",
+                                             st->field_count, st->name, rB);
                         }
                         ObjInstance* instance = new_instance(st);
                         for (int i = 0; i < rB; i++) {
@@ -543,8 +685,9 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
                         ObjDynamicFunction* dyn = (ObjDynamicFunction*)AS_OBJ(callee);
                         ffi_cif* cif = (ffi_cif*)dyn->cif;
                         if (rB != cif->nargs) {
-                            printf("Runtime Error: Dynamic FFI expected %d args, got %d.\n", cif->nargs, rB);
-                            exit(1);
+                            vm_runtime_error(vm, frame, "VRT011",
+                                             "Dynamic FFI expected %d args, got %d.",
+                                             cif->nargs, rB);
                         }
                         
                         void** arg_values = malloc(sizeof(void*) * (rB > 0 ? rB : 1));
@@ -576,12 +719,10 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
 
                         FRAME_REG(frame, rC) = result;
                     } else {
-                        printf("Runtime Error: Object not callable\n");
-                        exit(1);
+                        vm_runtime_error(vm, frame, "VRT012", "Object not callable.");
                     }
                 } else {
-                    printf("Runtime Error: Value not callable\n");
-                    exit(1);
+                    vm_runtime_error(vm, frame, "VRT013", "Value not callable.");
                 }
                 break;
             }
@@ -592,8 +733,7 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
             case OP_GET_FIELD: {
                 Value valObj = FRAME_REG(frame, rB);
                 if (!IS_OBJ(valObj) || AS_OBJ(valObj)->type != OBJ_INSTANCE) {
-                    printf("Runtime Error: Only instances have fields.\n");
-                    exit(1);
+                    vm_runtime_error(vm, frame, "VRT014", "Only instances have fields.");
                 }
                 ObjInstance* instance = (ObjInstance*)AS_OBJ(valObj);
                 ObjString* fieldName = AS_STRING(frame->function->chunk.constants[rC]);
@@ -606,8 +746,8 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
                     }
                 }
                 if (idx == -1) {
-                    printf("Runtime Error: Undefined field '%.*s'\n", fieldName->length, fieldName->chars);
-                    exit(1);
+                    vm_runtime_error(vm, frame, "VRT015", "Undefined field '%.*s'.",
+                                     fieldName->length, fieldName->chars);
                 }
                 FRAME_REG(frame, rA) = instance->fields[idx];
                 break;
@@ -615,8 +755,7 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
             case OP_SET_FIELD: {
                 Value valObj = FRAME_REG(frame, rA);
                 if (!IS_OBJ(valObj) || AS_OBJ(valObj)->type != OBJ_INSTANCE) {
-                    printf("Runtime Error: Only instances have fields.\n");
-                    exit(1);
+                    vm_runtime_error(vm, frame, "VRT014", "Only instances have fields.");
                 }
                 ObjInstance* instance = (ObjInstance*)AS_OBJ(valObj);
                 ObjString* fieldName = AS_STRING(frame->function->chunk.constants[rB]);
@@ -629,8 +768,8 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
                     }
                 }
                 if (idx == -1) {
-                    printf("Runtime Error: Undefined field '%.*s'\n", fieldName->length, fieldName->chars);
-                    exit(1);
+                    vm_runtime_error(vm, frame, "VRT015", "Undefined field '%.*s'.",
+                                     fieldName->length, fieldName->chars);
                 }
                 instance->fields[idx] = FRAME_REG(frame, rC);
                 break;
@@ -638,14 +777,13 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
             case OP_CALL_NATIVE: {
                 // A = native_index, B = arg_count, C = dest_reg
                 if (!native_is_enabled(rA)) {
-                    printf("Runtime Error: Native '%s' is disabled (capability=%s, profile=%s).\n",
-                           get_native_name(rA), native_capability(rA), VIPER_PROFILE_NAME);
-                    exit(1);
+                    vm_runtime_error(vm, frame, "VRT016",
+                                     "Native '%s' is disabled (capability=%s, profile=%s).",
+                                     get_native_name(rA), native_capability(rA), VIPER_PROFILE_NAME);
                 }
                 NativeFn native = get_native_by_index(rA);
                 if (native == NULL) {
-                    printf("Runtime Error: Unknown native function index %d.\n", rA);
-                    exit(1);
+                    vm_runtime_error(vm, frame, "VRT017", "Unknown native function index %d.", rA);
                 }
                 // Arguments are packed right before destination register.
                 Value* args = &vm->registers[frame->base + rC - rB];
@@ -659,8 +797,7 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
                         frame->ip = handler->catch_ip;            // Jump exactly to "else" branch
                         continue; // Jump loop!
                     } else {
-                        printf("Panic: %s\n", last_panic_msg);
-                        exit(1);
+                        vm_raise(vm, frame, "Panic", last_panic_code ? last_panic_code : "VPN000", "%s", last_panic_msg);
                     }
                 }
                 
@@ -672,20 +809,17 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
                 Value index = FRAME_REG(frame, rC);
                 if (IS_OBJ(target) && AS_OBJ(target)->type == OBJ_ARRAY) {
                     if (!IS_NUMBER(index)) {
-                        printf("Runtime Error: Array index must be a number.\n");
-                        exit(1);
+                        vm_runtime_error(vm, frame, "VRT018", "Array index must be a number.");
                     }
                     ObjArray* array = (ObjArray*)AS_OBJ(target);
                     int idx = (int)index.as.number;
                     if (idx < 0 || idx >= array->count) {
-                        printf("Runtime Error: Array index out of bounds.\n");
-                        exit(1);
+                        vm_runtime_error(vm, frame, "VRT019", "Array index out of bounds.");
                     }
                     FRAME_REG(frame, rA) = array->elements[idx];
                 } else if (IS_OBJ(target) && AS_OBJ(target)->type == OBJ_INSTANCE) {
                     if (!IS_OBJ(index) || AS_OBJ(index)->type != OBJ_STRING) {
-                        printf("Runtime Error: Instance property index must be a string.\n");
-                        exit(1);
+                        vm_runtime_error(vm, frame, "VRT020", "Instance property index must be a string.");
                     }
                     ObjInstance* instance = (ObjInstance*)AS_OBJ(target);
                     ObjString* fieldName = AS_STRING(index);
@@ -698,13 +832,12 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
                         }
                     }
                     if (idx == -1) {
-                        printf("Runtime Error: Undefined field '%.*s'\n", fieldName->length, fieldName->chars);
-                        exit(1);
+                        vm_runtime_error(vm, frame, "VRT015", "Undefined field '%.*s'.",
+                                         fieldName->length, fieldName->chars);
                     }
                     FRAME_REG(frame, rA) = instance->fields[idx];
                 } else {
-                    printf("Runtime Error: Only arrays and instances support indexing.\n");
-                    exit(1);
+                    vm_runtime_error(vm, frame, "VRT021", "Only arrays and instances support indexing.");
                 }
                 break;
             }
@@ -714,20 +847,17 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
                 Value value = FRAME_REG(frame, rC);
                 if (IS_OBJ(target) && AS_OBJ(target)->type == OBJ_ARRAY) {
                     if (!IS_NUMBER(index)) {
-                        printf("Runtime Error: Array index must be a number.\n");
-                        exit(1);
+                        vm_runtime_error(vm, frame, "VRT018", "Array index must be a number.");
                     }
                     ObjArray* array = (ObjArray*)AS_OBJ(target);
                     int idx = (int)index.as.number;
                     if (idx < 0 || idx >= array->count) {
-                        printf("Runtime Error: Array index out of bounds.\n");
-                        exit(1);
+                        vm_runtime_error(vm, frame, "VRT019", "Array index out of bounds.");
                     }
                     array->elements[idx] = value;
                 } else if (IS_OBJ(target) && AS_OBJ(target)->type == OBJ_INSTANCE) {
                     if (!IS_OBJ(index) || AS_OBJ(index)->type != OBJ_STRING) {
-                        printf("Runtime Error: Instance property index must be a string.\n");
-                        exit(1);
+                        vm_runtime_error(vm, frame, "VRT020", "Instance property index must be a string.");
                     }
                     ObjInstance* instance = (ObjInstance*)AS_OBJ(target);
                     ObjString* fieldName = AS_STRING(index);
@@ -740,13 +870,12 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
                         }
                     }
                     if (idx == -1) {
-                        printf("Runtime Error: Undefined field '%.*s'\n", fieldName->length, fieldName->chars);
-                        exit(1);
+                        vm_runtime_error(vm, frame, "VRT015", "Undefined field '%.*s'.",
+                                         fieldName->length, fieldName->chars);
                     }
                     instance->fields[idx] = value;
                 } else {
-                    printf("Runtime Error: Only arrays and instances support indexing.\n");
-                    exit(1);
+                    vm_runtime_error(vm, frame, "VRT021", "Only arrays and instances support indexing.");
                 }
                 break;
             }
@@ -775,14 +904,12 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
             case OP_SPAWN: {
                 Value callee = FRAME_REG(frame, rB);
                 if (!IS_OBJ(callee) || AS_OBJ(callee)->type != OBJ_FUNCTION) {
-                    printf("Runtime Error: Can only spawn functions.\n");
-                    exit(1);
+                    vm_runtime_error(vm, frame, "VRT022", "Can only spawn functions.");
                 }
                 
                 ObjFunction* fn = (ObjFunction*)AS_OBJ(callee);
                 if (rC != fn->arity) {
-                    printf("Runtime Error: Spawn expected %d args, got %d.\n", fn->arity, rC);
-                    exit(1);
+                    vm_runtime_error(vm, frame, "VRT023", "Spawn expected %d args, got %d.", fn->arity, rC);
                 }
                 
                 VM* child_vm = malloc(sizeof(VM));
@@ -798,8 +925,7 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
 
                 // Setup the frame for the function
                 if (!ensure_frame_capacity(child_vm, 1) || !ensure_register_capacity(child_vm, REGISTER_WINDOW)) {
-                    printf("Runtime Error: Out of memory spawning fiber.\n");
-                    exit(1);
+                    vm_runtime_error(vm, frame, "VRT024", "Out of memory spawning fiber.");
                 }
                 
                 // fn is at base
@@ -826,8 +952,7 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
             case OP_AWAIT: {
                 Value th = FRAME_REG(frame, rB);
                 if (!IS_OBJ(th) || AS_OBJ(th)->type != OBJ_THREAD) {
-                    printf("Runtime Error: Can only await Thread objects.\n");
-                    exit(1);
+                    vm_runtime_error(vm, frame, "VRT025", "Can only await Thread objects.");
                 }
                 ObjThread* t = (ObjThread*)AS_OBJ(th);
                 if (!t->finished) {
@@ -912,8 +1037,7 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
                 uint16_t offset = (DECODE_B(inst) << 8) | DECODE_C(inst);
                 
                 if (vm->catch_count >= MAX_CATCH_HANDLERS) {
-                    printf("Runtime Error: Exceeded maximum nested try blocks.\n");
-                    exit(1);
+                    vm_runtime_error(vm, frame, "VRT026", "Exceeded maximum nested try blocks.");
                 }
                 
                 CatchHandler* handler = &vm->catch_stack[vm->catch_count++];
@@ -992,14 +1116,12 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
             case OP_EVAL: {
                 Value valCode = FRAME_REG(frame, rB);
                 if (!IS_OBJ(valCode) || AS_OBJ(valCode)->type != OBJ_STRING) {
-                    printf("Runtime Error: eval() expects string.\n");
-                    exit(1);
+                    vm_runtime_error(vm, frame, "VRT027", "eval() expects string.");
                 }
                 ObjString* codeStr = AS_STRING(valCode);
                 AstNode* ast = parse(codeStr->chars);
                 if (!ast) {
-                    printf("Runtime Error: eval() failed to parse code.\n");
-                    exit(1);
+                    vm_runtime_error(vm, frame, "VRT028", "eval() failed to parse code.");
                 }
                 
                 // We want eval to return a value, so force compiler to emit RETURN instead of HALT
@@ -1008,8 +1130,7 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
                 compiler_set_emit_halt(true); // Restore default
                 
                 if (!fn) {
-                    printf("Runtime Error: eval() failed to compile code.\n");
-                    exit(1);
+                    vm_runtime_error(vm, frame, "VRT029", "eval() failed to compile code.");
                 }
                 
                 Value result = call_viper_function(fn, 0, NULL);
@@ -1030,18 +1151,52 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
                 ObjString* expected = AS_STRING(frame->function->chunk.constants[rB]);
                 
                 const char* actual_type = NULL;
+                int actual_type_len = 0;
                 switch (val.type) {
-                    case VAL_NUMBER:  actual_type = "int";    break; // Viper uses 'int' for numeric
-                    case VAL_BOOL:    actual_type = "bool";   break;
-                    case VAL_NIL:     actual_type = "nil";    break;
+                    case VAL_NUMBER:  actual_type = "int";    actual_type_len = 3; break; // Viper uses 'int' for numeric
+                    case VAL_BOOL:    actual_type = "bool";   actual_type_len = 4; break;
+                    case VAL_NIL:     actual_type = "nil";    actual_type_len = 3; break;
                     case VAL_OBJ: {
                         Obj* obj = AS_OBJ(val);
                         switch (obj->type) {
-                            case OBJ_STRING:   actual_type = "str";    break;
-                            case OBJ_ARRAY:    actual_type = "array";  break;
-                            case OBJ_FUNCTION: actual_type = "fn";     break;
-                            case OBJ_INSTANCE: actual_type = "struct"; break;
-                            default:           actual_type = "obj";    break;
+                            case OBJ_STRING:
+                                actual_type = "str";
+                                actual_type_len = 3;
+                                break;
+                            case OBJ_ARRAY:
+                                actual_type = "array";
+                                actual_type_len = 5;
+                                break;
+                            case OBJ_FUNCTION:
+                                actual_type = "fn";
+                                actual_type_len = 2;
+                                break;
+                            case OBJ_INSTANCE: {
+                                ObjInstance* instance = (ObjInstance*)obj;
+                                if (instance->klass && instance->klass->name && instance->klass->name_len > 0) {
+                                    actual_type = instance->klass->name;
+                                    actual_type_len = instance->klass->name_len;
+                                } else {
+                                    actual_type = "struct";
+                                    actual_type_len = 6;
+                                }
+                                break;
+                            }
+                            case OBJ_STRUCT: {
+                                ObjStruct* klass = (ObjStruct*)obj;
+                                if (klass->name && klass->name_len > 0) {
+                                    actual_type = klass->name;
+                                    actual_type_len = klass->name_len;
+                                } else {
+                                    actual_type = "struct";
+                                    actual_type_len = 6;
+                                }
+                                break;
+                            }
+                            default:
+                                actual_type = "obj";
+                                actual_type_len = 3;
+                                break;
                         }
                         break;
                     }
@@ -1049,8 +1204,8 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
                 
                 // Also accept "float" as alias for numeric
                 bool type_ok = false;
-                if (actual_type && (int)strlen(actual_type) == expected->length &&
-                    memcmp(actual_type, expected->chars, expected->length) == 0) {
+                if (actual_type && actual_type_len == expected->length &&
+                    memcmp(actual_type, expected->chars, (size_t)expected->length) == 0) {
                     type_ok = true;
                 }
                 // Numeric aliases all map to the single runtime number representation.
@@ -1073,6 +1228,15 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
                 if (!type_ok && val.type == VAL_OBJ && AS_OBJ(val)->type == OBJ_STRING) {
                     if ((expected->length == 1 && expected->chars[0] == 's') ||
                         (expected->length == 6 && memcmp(expected->chars, "string", 6) == 0)) {
+                        type_ok = true;
+                    }
+                }
+                // Generic struct annotations accept any struct object/instance.
+                if (!type_ok && val.type == VAL_OBJ) {
+                    Obj* obj = AS_OBJ(val);
+                    if ((obj->type == OBJ_INSTANCE || obj->type == OBJ_STRUCT) &&
+                        ((expected->length == 6 && memcmp(expected->chars, "struct", 6) == 0) ||
+                         (expected->length == 2 && memcmp(expected->chars, "st", 2) == 0))) {
                         type_ok = true;
                     }
                 }
@@ -1101,10 +1265,9 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
                 }
                 
                 if (!type_ok) {
-                    printf("TypeError: Expected type '%.*s', got '%s'\n",
-                           expected->length, expected->chars,
-                           actual_type ? actual_type : "unknown");
-                    exit(1);
+                    vm_type_error(vm, frame, "VTP001", "Expected type '%.*s', got '%s'.",
+                                  expected->length, expected->chars,
+                                  actual_type ? actual_type : "unknown");
                 }
                 break;
             }
@@ -1148,8 +1311,7 @@ InterpretResult interpret(VM* vm, struct sObjFunction* main_fn, int max_steps) {
             case OP_HALT:
                 return INTERPRET_OK;
             default:
-                printf("VM Error: Unknown opcode %d.\n", op);
-                exit(1);
+                vm_raise(vm, frame, "VM Error", "VVM004", "Unknown opcode %d.", op);
         }
     }
 }

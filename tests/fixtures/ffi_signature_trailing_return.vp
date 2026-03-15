@@ -1,0 +1,7 @@
+@effect(ffi)
+fn main() {
+    var libc = load_dl("libc.so.6")
+    libc.get_fn("puts", "s->ix")
+}
+
+main()

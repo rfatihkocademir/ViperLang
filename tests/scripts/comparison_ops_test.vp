@@ -1,0 +1,30 @@
+if 2 <= 2 {
+} else {
+    panic("le-eq")
+}
+
+if 1 <= 2 {
+} else {
+    panic("le")
+}
+
+if 3 >= 2 {
+} else {
+    panic("ge")
+}
+
+if 3 >= 3 {
+} else {
+    panic("ge-eq")
+}
+
+if 3 != 2 {
+} else {
+    panic("ne")
+}
+
+if 2 != 2 {
+    panic("ne-false")
+}
+
+pr("comparison-ops-ok")

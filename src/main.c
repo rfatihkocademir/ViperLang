@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <stdarg.h>
 #include <unistd.h>
 
 #include "bytecode.h"
@@ -39,24 +40,41 @@ typedef struct {
     int capacity;
 } FnVisit;
 
+static void cli_error_exit(const char* kind, const char* code, int exit_code, const char* fmt, ...) {
+    va_list args;
+    fprintf(stderr, "%s [%s]: ", kind, code);
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fprintf(stderr, "\n");
+    exit(exit_code);
+}
+
+static int cli_error_return(const char* kind, const char* code, int return_code, const char* fmt, ...) {
+    va_list args;
+    fprintf(stderr, "%s [%s]: ", kind, code);
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fprintf(stderr, "\n");
+    return return_code;
+}
+
 static char* read_file(const char* path) {
     FILE* file = fopen(path, "rb");
     if (file == NULL) {
-        fprintf(stderr, "Could not open file \"%s\".\n", path);
-        exit(74);
+        cli_error_exit("CLI Error", "VCL001", 74, "Could not open file \"%s\".", path);
     }
     fseek(file, 0L, SEEK_END);
     size_t fileSize = (size_t)ftell(file);
     rewind(file);
     char* buffer = (char*)malloc(fileSize + 1);
     if (buffer == NULL) {
-        fprintf(stderr, "Not enough memory to read \"%s\".\n", path);
-        exit(74);
+        cli_error_exit("CLI Error", "VCL002", 74, "Not enough memory to read \"%s\".", path);
     }
     size_t bytesRead = fread(buffer, sizeof(char), fileSize, file);
     if (bytesRead < fileSize) {
-        fprintf(stderr, "Could not read file \"%s\".\n", path);
-        exit(74);
+        cli_error_exit("CLI Error", "VCL003", 74, "Could not read file \"%s\".", path);
     }
     buffer[bytesRead] = '\0';
     fclose(file);
@@ -104,8 +122,7 @@ static void run_bytecode_file(const char* path) {
     init_native_core();
     ObjFunction* main_fn = read_bytecode_file(path);
     if (!main_fn) {
-        fprintf(stderr, "Could not load bytecode file \"%s\".\n", path);
-        exit(1);
+        cli_error_exit("CLI Error", "VCL004", 1, "Could not load bytecode file \"%s\".", path);
     }
 
     VM* vm = malloc(sizeof(VM));
@@ -307,13 +324,12 @@ static int cmd_build_app(int argc, const char* argv[]) {
     }
 
     if (!file_exists(entry)) {
-        fprintf(stderr, "Build Error: entry file not found: %s\n", entry);
-        return 1;
+        return cli_error_return("Build Error", "VBL001", 1, "Entry file not found: %s", entry);
     }
     if (!file_exists("Makefile")) {
-        fprintf(stderr, "Build Error: Makefile not found in current directory.\n");
-        fprintf(stderr, "Run this command from the Viper source root.\n");
-        return 1;
+        fprintf(stderr, "Build Hint [VBL003]: Run this command from the Viper source root.\n");
+        return cli_error_return("Build Error", "VBL002", 1,
+                                "Makefile not found in current directory.");
     }
 
     compiler_set_contract_output(false);
@@ -342,12 +358,11 @@ static int cmd_build_app(int argc, const char* argv[]) {
 
     char app_dir[PATH_MAX];
     if (!join_path(out_dir, app_name, app_dir, sizeof(app_dir))) {
-        fprintf(stderr, "Build Error: output path too long.\n");
-        return 1;
+        return cli_error_return("Build Error", "VBL004", 1, "Output path too long.");
     }
     if (!ensure_dir_recursive(app_dir)) {
-        fprintf(stderr, "Build Error: cannot create output dir: %s\n", app_dir);
-        return 1;
+        return cli_error_return("Build Error", "VBL005", 1,
+                                "Cannot create output dir: %s", app_dir);
     }
 
     char vbb_path[PATH_MAX];
@@ -358,23 +373,22 @@ static int cmd_build_app(int argc, const char* argv[]) {
         !join_path(app_dir, "viper-runtime", runtime_path, sizeof(runtime_path)) ||
         !join_path(app_dir, "capabilities.lock", lock_path, sizeof(lock_path)) ||
         !join_path(app_dir, "run.sh", run_path, sizeof(run_path))) {
-        fprintf(stderr, "Build Error: output path too long.\n");
-        return 1;
+        return cli_error_return("Build Error", "VBL004", 1, "Output path too long.");
     }
 
     if (!write_bytecode_file(vbb_path, main_fn)) {
-        fprintf(stderr, "Build Error: could not write bytecode: %s\n", vbb_path);
-        return 1;
+        return cli_error_return("Build Error", "VBL006", 1,
+                                "Could not write bytecode: %s", vbb_path);
     }
     if (!write_caps_lock(lock_path, &caps, used)) {
-        fprintf(stderr, "Build Error: could not write lock file: %s\n", lock_path);
-        return 1;
+        return cli_error_return("Build Error", "VBL007", 1,
+                                "Could not write lock file: %s", lock_path);
     }
 
     char q_runtime[PATH_MAX * 2];
     if (!shell_quote_double(runtime_path, q_runtime, sizeof(q_runtime))) {
-        fprintf(stderr, "Build Error: runtime output path is not shell-safe.\n");
-        return 1;
+        return cli_error_return("Build Error", "VBL008", 1,
+                                "Runtime output path is not shell-safe.");
     }
 
     char cmd[4096];
@@ -386,14 +400,13 @@ static int cmd_build_app(int argc, const char* argv[]) {
              q_runtime);
     int status = system(cmd);
     if (status != 0) {
-        fprintf(stderr, "Build Error: runtime build failed.\n");
-        return 1;
+        return cli_error_return("Build Error", "VBL009", 1, "Runtime build failed.");
     }
 
     FILE* run_fp = fopen(run_path, "w");
     if (!run_fp) {
-        fprintf(stderr, "Build Error: could not write launcher: %s\n", run_path);
-        return 1;
+        return cli_error_return("Build Error", "VBL010", 1,
+                                "Could not write launcher: %s", run_path);
     }
     fprintf(run_fp,
             "#!/usr/bin/env sh\n"
@@ -778,8 +791,7 @@ int main(int argc, const char* argv[]) {
         bool ok = write_bytecode_file(emit_bytecode_out, main_fn);
         free(source);
         if (!ok) {
-            fprintf(stderr, "Could not write bytecode file \"%s\".\n", emit_bytecode_out);
-            exit(1);
+            cli_error_exit("CLI Error", "VCL005", 1, "Could not write bytecode file \"%s\".", emit_bytecode_out);
         }
         free_memory();
         return 0;

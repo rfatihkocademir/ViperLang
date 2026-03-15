@@ -1,38 +1,66 @@
 // ViperLang Standard IO Library (@std/io)
 // Built using True Dynamic FFI bindings.
 
+use "@std/fs" as fs
 
 st File {
     handle
+    path
 }
 
 pub fn open(path, mode) {
     var libc = load_dl("libc.so.6")
     var _fopen = libc.get_fn("fopen", "s,s->p")
     var handle = _fopen(path, mode)
-    // NOTE: In the future, we would check for NULL points here
-    // but FFI pointer handling currently assumes strings or generic pointers.
-    // For now, if handle is 0/null it will crash natively if used, which mimics C.
+    if handle == nil {
+        ret 0
+    }
     
     var file_obj = File()
     file_obj.handle = handle
+    file_obj.path = path
     ret file_obj
 }
 
 pub fn close(file) {
+    if file == nil {
+        ret 0
+    }
+    if file == 0 {
+        ret 0
+    }
     var libc = load_dl("libc.so.6")
     var _fclose = libc.get_fn("fclose", "p->i")
-    _fclose(file.handle)
+    ret _fclose(file.handle)
 }
 
 pub fn write_text(file, text) {
+    if file == nil {
+        ret 0
+    }
+    if file == 0 {
+        ret 0
+    }
     var libc = load_dl("libc.so.6")
     var _fputs = libc.get_fn("fputs", "s,p->i")
-    _fputs(text, file.handle)
+    var _fflush = libc.get_fn("fflush", "p->i")
+    var status = _fputs(text, file.handle)
+    _fflush(file.handle)
+    ret status
+}
+
+pub fn read_text(file) {
+    if file == nil {
+        ret 0
+    }
+    if file == 0 {
+        ret 0
+    }
+    ret fs.read(file.path)
 }
 
 pub fn remove_file(path) {
     var libc = load_dl("libc.so.6")
     var _remove = libc.get_fn("remove", "s->i")
-    _remove(path)
+    ret _remove(path)
 }

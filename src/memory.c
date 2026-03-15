@@ -4,6 +4,7 @@
 #include "native.h"
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <time.h>
 
@@ -12,6 +13,16 @@
 static uint8_t* nursery_start = NULL;
 static uint8_t* nursery_top = NULL;
 static uint8_t* nursery_end = NULL;
+
+static void memory_error_exit(const char* code, const char* fmt, ...) {
+    va_list args;
+    fprintf(stderr, "Memory Error [%s]: ", code);
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fprintf(stderr, "\n");
+    exit(1);
+}
 
 static uint64_t get_time_us_local(void) {
     struct timespec ts;
@@ -22,8 +33,7 @@ static uint64_t get_time_us_local(void) {
 void init_memory(void) {
     nursery_start = malloc(NURSERY_SIZE);
     if (!nursery_start) {
-        fprintf(stderr, "Fatal: Could not allocate nursery\n");
-        exit(1);
+        memory_error_exit("VME001", "Could not allocate nursery.");
     }
     nursery_top = nursery_start;
     nursery_end = nursery_start + NURSERY_SIZE;
@@ -56,8 +66,7 @@ void* viper_allocate(size_t size, int type) {
     
     void* ptr = malloc(size);
     if (!ptr) {
-        fprintf(stderr, "Fatal: Out of memory\n");
-        exit(1);
+        memory_error_exit("VME002", "Out of memory.");
     }
     
     // Header for heap objects

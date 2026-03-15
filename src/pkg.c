@@ -24,6 +24,7 @@
 #define MAX_NAME_LEN 256
 #define MAX_VERSION_LEN 64
 #define MAX_ABI_EFFECTS_LEN 256
+#define MAX_ABI_PARAMS_LEN 512
 #define ABI_KIND_FUNCTION 1
 #define ABI_KIND_STRUCT 2
 
@@ -36,6 +37,7 @@ typedef struct {
     int kind; // 1=function, 2=struct
     char name[MAX_NAME_LEN];
     int metric; // arity or field_count
+    char params[MAX_ABI_PARAMS_LEN];
     char return_type[MAX_NAME_LEN];
     char effects[MAX_ABI_EFFECTS_LEN];
 } AbiSymbol;
@@ -45,6 +47,7 @@ typedef struct {
     int kind;
     char name[MAX_NAME_LEN];
     int metric;
+    char params[MAX_ABI_PARAMS_LEN];
     char return_type[MAX_NAME_LEN];
     char effects[MAX_ABI_EFFECTS_LEN];
 } AbiEntry;
@@ -91,6 +94,67 @@ static bool format_ast_effects(Token* effects, int effect_count, char* out, size
     return true;
 }
 
+static bool format_ast_params(Token* params, Token* param_types, int param_count,
+                              char* out, size_t out_size) {
+    if (!out || out_size == 0) return false;
+    out[0] = '\0';
+    if (!params || param_count <= 0) {
+        copy_text(out, out_size, "-");
+        return true;
+    }
+
+    size_t len = 0;
+    for (int i = 0; i < param_count; i++) {
+        Token name = params[i];
+        Token type_annot = {0};
+        if (param_types) type_annot = param_types[i];
+        if (name.length <= 0 || !name.start) return false;
+
+        const char* type_text = "-";
+        int type_len = 1;
+        if (type_annot.length > 0 && type_annot.start) {
+            type_text = type_annot.start;
+            type_len = type_annot.length;
+        }
+
+        if (!append_fmt(out, out_size, &len, "%s%.*s:%.*s",
+                        i > 0 ? "," : "",
+                        name.length, name.start,
+                        type_len, type_text)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool validate_abi_params_text(const char* params, int metric) {
+    if (!params || params[0] == '\0') return true;
+    if (strcmp(params, "-") == 0) return metric == 0;
+
+    int count = 0;
+    const char* p = params;
+    while (*p) {
+        const char* name_start = p;
+        while (*p && *p != ':' && *p != ',') p++;
+        size_t name_len = (size_t)(p - name_start);
+        if (name_len == 0 || name_len >= MAX_NAME_LEN || *p != ':') return false;
+        p++;
+
+        const char* type_start = p;
+        while (*p && *p != ',') p++;
+        size_t type_len = (size_t)(p - type_start);
+        if (type_len == 0 || type_len >= MAX_NAME_LEN) return false;
+        count++;
+
+        if (*p == ',') {
+            p++;
+            if (*p == '\0') return false;
+        }
+    }
+
+    return count == metric;
+}
+
 static bool append_fmt(char* out, size_t out_size, size_t* len, const char* fmt, ...) {
     if (!out || !len || !fmt || *len >= out_size) return false;
     va_list ap;
@@ -102,6 +166,15 @@ static bool append_fmt(char* out, size_t out_size, size_t* len, const char* fmt,
     if (*len + n >= out_size) return false;
     *len += n;
     return true;
+}
+
+static void pkg_error(const char* code, const char* fmt, ...) {
+    va_list args;
+    fprintf(stderr, "Package Error [%s]: ", code);
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fprintf(stderr, "\n");
 }
 
 static bool shell_quote_double(const char* in, char* out, size_t out_size) {
@@ -425,14 +498,19 @@ static bool vp_to_vabi_path(const char* vp_path, char* out, size_t out_size) {
 
 static bool append_abi_symbol(AbiSymbol** syms, int* count, int* cap,
                               int kind, const char* name, int name_len, int metric,
-                              const char* return_type, const char* effects) {
+                              const char* params, const char* return_type, const char* effects) {
     if (!name || name_len <= 0 || name_len >= MAX_NAME_LEN) return false;
+    if (kind == ABI_KIND_FUNCTION &&
+        !validate_abi_params_text(params ? params : "", metric)) {
+        return false;
+    }
 
     for (int i = 0; i < *count; i++) {
         if ((*syms)[i].kind == kind &&
             (int)strlen((*syms)[i].name) == name_len &&
             memcmp((*syms)[i].name, name, (size_t)name_len) == 0) {
             (*syms)[i].metric = metric;
+            copy_text((*syms)[i].params, sizeof((*syms)[i].params), params ? params : "");
             copy_text((*syms)[i].return_type, sizeof((*syms)[i].return_type), return_type ? return_type : "");
             copy_text((*syms)[i].effects, sizeof((*syms)[i].effects), effects ? effects : "-");
             return true;
@@ -452,6 +530,7 @@ static bool append_abi_symbol(AbiSymbol** syms, int* count, int* cap,
     memcpy(out_sym->name, name, (size_t)name_len);
     out_sym->name[name_len] = '\0';
     out_sym->metric = metric;
+    copy_text(out_sym->params, sizeof(out_sym->params), params ? params : "");
     copy_text(out_sym->return_type, sizeof(out_sym->return_type), return_type ? return_type : "");
     copy_text(out_sym->effects, sizeof(out_sym->effects), effects ? effects : "-");
     (*count)++;
@@ -468,12 +547,17 @@ static int find_abi_symbol(const AbiSymbol* syms, int count, int kind, const cha
 
 static bool append_abi_symbol_strict(AbiSymbol** syms, int* count, int* cap,
                                      int kind, const char* name, int name_len, int metric,
-                                     const char* return_type, const char* effects) {
+                                     const char* params, const char* return_type, const char* effects) {
     if (!name || name_len <= 0 || name_len >= MAX_NAME_LEN || metric < 0) return false;
+    if (kind == ABI_KIND_FUNCTION &&
+        !validate_abi_params_text(params ? params : "", metric)) {
+        return false;
+    }
 
     int existing = find_abi_symbol(*syms, *count, kind, name);
     if (existing >= 0) {
         if ((*syms)[existing].metric != metric ||
+            strcmp((*syms)[existing].params, params ? params : "") != 0 ||
             strcmp((*syms)[existing].return_type, return_type ? return_type : "") != 0 ||
             strcmp((*syms)[existing].effects, effects ? effects : "-") != 0) {
             return false;
@@ -494,6 +578,7 @@ static bool append_abi_symbol_strict(AbiSymbol** syms, int* count, int* cap,
     memcpy(out_sym->name, name, (size_t)name_len);
     out_sym->name[name_len] = '\0';
     out_sym->metric = metric;
+    copy_text(out_sym->params, sizeof(out_sym->params), params ? params : "");
     copy_text(out_sym->return_type, sizeof(out_sym->return_type), return_type ? return_type : "");
     copy_text(out_sym->effects, sizeof(out_sym->effects), effects ? effects : "-");
     (*count)++;
@@ -544,8 +629,18 @@ static bool collect_public_exports_from_ast(AstNode* ast, AbiSymbol** out_syms, 
 
         if (stmt->type == AST_FUNC_DECL && stmt->data.func_decl.is_public) {
             *out_has_public = true;
+            char params[MAX_ABI_PARAMS_LEN];
             char return_type[MAX_NAME_LEN];
             char effects[MAX_ABI_EFFECTS_LEN];
+            if (!format_ast_params(stmt->data.func_decl.params,
+                                   stmt->data.func_decl.param_types,
+                                   stmt->data.func_decl.param_count,
+                                   params, sizeof(params))) {
+                free(*out_syms);
+                *out_syms = NULL;
+                *out_count = 0;
+                return false;
+            }
             copy_token_text(return_type, sizeof(return_type), stmt->data.func_decl.return_type);
             if (!format_ast_effects(stmt->data.func_decl.effects, stmt->data.func_decl.effect_count,
                                     effects, sizeof(effects))) {
@@ -556,8 +651,9 @@ static bool collect_public_exports_from_ast(AstNode* ast, AbiSymbol** out_syms, 
             }
             if (!append_abi_symbol(out_syms, out_count, &cap, ABI_KIND_FUNCTION,
                                    stmt->data.func_decl.name.start,
-                                   stmt->data.func_decl.name.length, 0,
-                                   return_type, effects)) {
+                                   stmt->data.func_decl.name.length,
+                                   stmt->data.func_decl.param_count,
+                                   params, return_type, effects)) {
                 free(*out_syms);
                 *out_syms = NULL;
                 *out_count = 0;
@@ -568,7 +664,7 @@ static bool collect_public_exports_from_ast(AstNode* ast, AbiSymbol** out_syms, 
             if (!append_abi_symbol(out_syms, out_count, &cap, ABI_KIND_STRUCT,
                                    stmt->data.struct_decl.name.start,
                                    stmt->data.struct_decl.name.length, 0,
-                                   "", "-")) {
+                                   "", "", "-")) {
                 free(*out_syms);
                 *out_syms = NULL;
                 *out_count = 0;
@@ -603,25 +699,39 @@ static bool abi_change_is_breaking(int kind, int old_metric, int new_metric, con
 static bool abi_entry_contract_equal(const AbiEntry* lhs, const AbiEntry* rhs) {
     if (!lhs || !rhs) return false;
     return lhs->metric == rhs->metric &&
+           strcmp(lhs->params, rhs->params) == 0 &&
            strcmp(lhs->return_type, rhs->return_type) == 0 &&
            strcmp(lhs->effects, rhs->effects) == 0;
 }
 
-static bool format_abi_contract(const char* return_type, const char* effects,
+static bool format_abi_contract(const char* params, const char* return_type, const char* effects,
                                 char* out, size_t out_size) {
     size_t len = 0;
     if (!out || out_size == 0) return false;
     out[0] = '\0';
+    if (params && params[0] != '\0') {
+        return append_fmt(out, out_size, &len, "params=%s ret=%s eff=%s",
+                          params,
+                          (return_type && return_type[0] != '\0') ? return_type : "-",
+                          (effects && effects[0] != '\0') ? effects : "-");
+    }
     return append_fmt(out, out_size, &len, "ret=%s eff=%s",
                       (return_type && return_type[0] != '\0') ? return_type : "-",
                       (effects && effects[0] != '\0') ? effects : "-");
 }
 
-static bool parse_abi_optional_fields(char* token, char* out_return_type, size_t return_type_size,
+static bool parse_abi_optional_fields(char* token,
+                                      char* out_params, size_t params_size,
+                                      char* out_return_type, size_t return_type_size,
                                       char* out_effects, size_t effects_size) {
-    if (!out_return_type || !out_effects || return_type_size == 0 || effects_size == 0) return false;
+    if (!out_params || !out_return_type || !out_effects ||
+        params_size == 0 || return_type_size == 0 || effects_size == 0) return false;
     if (!token) return true;
 
+    if (strncmp(token, "params=", 7) == 0) {
+        copy_text(out_params, params_size, token + 7);
+        return true;
+    }
     if (strncmp(token, "ret=", 4) == 0) {
         copy_text(out_return_type, return_type_size, token + 4);
         return true;
@@ -658,6 +768,7 @@ static bool write_module_abi_file(const char* path, ObjFunction* main_fn,
                                                                 ABI_KIND_FUNCTION, fn->name, fn->name_len);
             if (!append_abi_symbol(&syms, &sym_count, &sym_cap, ABI_KIND_FUNCTION,
                                    fn->name, fn->name_len, fn->arity,
+                                   meta ? meta->params : "",
                                    meta ? meta->return_type : "",
                                    meta ? meta->effects : "-")) {
                 free(syms);
@@ -671,7 +782,7 @@ static bool write_module_abi_file(const char* path, ObjFunction* main_fn,
                 continue;
             }
             if (!append_abi_symbol(&syms, &sym_count, &sym_cap, ABI_KIND_STRUCT,
-                                   st->name, st->name_len, st->field_count, "", "-")) {
+                                   st->name, st->name_len, st->field_count, "", "", "-")) {
                 free(syms);
                 return false;
             }
@@ -691,8 +802,9 @@ static bool write_module_abi_file(const char* path, ObjFunction* main_fn,
     bool ok = fprintf(out, "# viper abi v2\n") > 0;
     for (int i = 0; ok && i < sym_count; i++) {
         if (syms[i].kind == ABI_KIND_FUNCTION) {
-            ok = fprintf(out, "fn %s %d ret=%s eff=%s\n",
+            ok = fprintf(out, "fn %s %d params=%s ret=%s eff=%s\n",
                          syms[i].name, syms[i].metric,
+                         syms[i].params[0] != '\0' ? syms[i].params : "-",
                          syms[i].return_type[0] != '\0' ? syms[i].return_type : "-",
                          syms[i].effects[0] != '\0' ? syms[i].effects : "-") > 0;
         } else {
@@ -849,7 +961,7 @@ static bool load_abi_file_symbols(const char* path, AbiSymbol** out_syms, int* o
         char* name_tok = strtok(NULL, " \t\r\n");
         char* metric_tok = strtok(NULL, " \t\r\n");
         if (!kind_tok || !name_tok || !metric_tok) {
-            fprintf(stderr, "vpm: invalid ABI line at %s:%d\n", path, line_no);
+            pkg_error("VPK001", "Invalid ABI line at %s:%d", path, line_no);
             ok = false;
             break;
         }
@@ -860,37 +972,45 @@ static bool load_abi_file_symbols(const char* path, AbiSymbol** out_syms, int* o
         } else if (strcmp(kind_tok, "st") == 0) {
             kind = ABI_KIND_STRUCT;
         } else {
-            fprintf(stderr, "vpm: invalid ABI symbol kind at %s:%d\n", path, line_no);
+            pkg_error("VPK002", "Invalid ABI symbol kind at %s:%d", path, line_no);
             ok = false;
             break;
         }
 
         int metric = 0;
         if (!parse_metric_token(metric_tok, &metric)) {
-            fprintf(stderr, "vpm: invalid ABI metric at %s:%d\n", path, line_no);
+            pkg_error("VPK003", "Invalid ABI metric at %s:%d", path, line_no);
             ok = false;
             break;
         }
 
         char return_type[MAX_NAME_LEN];
+        char params[MAX_ABI_PARAMS_LEN];
         char effects[MAX_ABI_EFFECTS_LEN];
+        params[0] = '\0';
         return_type[0] = '\0';
         copy_text(effects, sizeof(effects), "-");
         char* extra_tok = NULL;
         while ((extra_tok = strtok(NULL, " \t\r\n")) != NULL) {
-            if (!parse_abi_optional_fields(extra_tok, return_type, sizeof(return_type),
+            if (!parse_abi_optional_fields(extra_tok, params, sizeof(params),
+                                           return_type, sizeof(return_type),
                                            effects, sizeof(effects))) {
-                fprintf(stderr, "vpm: invalid ABI line at %s:%d\n", path, line_no);
+                pkg_error("VPK001", "Invalid ABI line at %s:%d", path, line_no);
                 ok = false;
                 break;
             }
         }
         if (!ok) break;
+        if (kind == ABI_KIND_FUNCTION && !validate_abi_params_text(params, metric)) {
+            pkg_error("VPK001", "Invalid ABI line at %s:%d", path, line_no);
+            ok = false;
+            break;
+        }
 
         int name_len = (int)strlen(name_tok);
         if (!append_abi_symbol_strict(out_syms, out_count, &cap, kind, name_tok, name_len, metric,
-                                      return_type, effects)) {
-            fprintf(stderr, "vpm: conflicting ABI symbol at %s:%d\n", path, line_no);
+                                      params, return_type, effects)) {
+            pkg_error("VPK004", "Conflicting ABI symbol at %s:%d", path, line_no);
             ok = false;
             break;
         }
@@ -932,7 +1052,7 @@ static bool collect_bytecode_symbols(ObjFunction* root, AbiSymbol** out_syms, in
             if (!is_main &&
                 !append_abi_symbol_strict(out_syms, out_count, &sym_cap,
                                           ABI_KIND_FUNCTION, fn->name, fn->name_len, fn->arity,
-                                          "", "-")) {
+                                          "", "", "-")) {
                 ok = false;
                 break;
             }
@@ -962,7 +1082,7 @@ static bool collect_bytecode_symbols(ObjFunction* root, AbiSymbol** out_syms, in
             ObjStruct* st = (ObjStruct*)obj;
             if (!append_abi_symbol_strict(out_syms, out_count, &sym_cap,
                                           ABI_KIND_STRUCT, st->name, st->name_len, st->field_count,
-                                          "", "-")) {
+                                          "", "", "-")) {
                 ok = false;
                 break;
             }
@@ -982,13 +1102,13 @@ static bool verify_module_abi_pair(const char* vbb_path, const char* vabi_path) 
     AbiSymbol* expected = NULL;
     int expected_count = 0;
     if (!load_abi_file_symbols(vabi_path, &expected, &expected_count)) {
-        fprintf(stderr, "vpm: failed to parse ABI file %s\n", vabi_path);
+        pkg_error("VPK005", "Failed to parse ABI file %s", vabi_path);
         return false;
     }
 
     ObjFunction* root = read_bytecode_file(vbb_path);
     if (!root) {
-        fprintf(stderr, "vpm: failed to read bytecode file %s\n", vbb_path);
+        pkg_error("VPK006", "Failed to read bytecode file %s", vbb_path);
         free(expected);
         return false;
     }
@@ -996,7 +1116,7 @@ static bool verify_module_abi_pair(const char* vbb_path, const char* vabi_path) 
     AbiSymbol* actual = NULL;
     int actual_count = 0;
     if (!collect_bytecode_symbols(root, &actual, &actual_count)) {
-        fprintf(stderr, "vpm: failed to collect bytecode symbols from %s\n", vbb_path);
+        pkg_error("VPK007", "Failed to collect bytecode symbols from %s", vbb_path);
         free(expected);
         return false;
     }
@@ -1005,15 +1125,15 @@ static bool verify_module_abi_pair(const char* vbb_path, const char* vabi_path) 
     for (int i = 0; i < expected_count; i++) {
         int found = find_abi_symbol(actual, actual_count, expected[i].kind, expected[i].name);
         if (found < 0) {
-            fprintf(stderr, "vpm: ABI mismatch (%s): missing %s '%s'\n",
-                    vbb_path, abi_kind_label(expected[i].kind), expected[i].name);
+            pkg_error("VPK008", "ABI mismatch (%s): missing %s '%s'",
+                      vbb_path, abi_kind_label(expected[i].kind), expected[i].name);
             ok = false;
             continue;
         }
         if (actual[found].metric != expected[i].metric) {
-            fprintf(stderr, "vpm: ABI mismatch (%s): %s '%s' metric %d != %d\n",
-                    vbb_path, abi_kind_label(expected[i].kind), expected[i].name,
-                    actual[found].metric, expected[i].metric);
+            pkg_error("VPK009", "ABI mismatch (%s): %s '%s' metric %d != %d",
+                      vbb_path, abi_kind_label(expected[i].kind), expected[i].name,
+                      actual[found].metric, expected[i].metric);
             ok = false;
         }
     }
@@ -1066,7 +1186,7 @@ static bool check_abi_tree(const char* root_dir, int* checked_count, int* failed
         (*checked_count)++;
         char vabi_path[MAX_PATH_LEN];
         if (!vbb_to_vabi_path(path, vabi_path, sizeof(vabi_path)) || !file_exists(vabi_path)) {
-            fprintf(stderr, "vpm: missing ABI file for module %s\n", path);
+            pkg_error("VPK010", "Missing ABI file for module %s", path);
             (*failed_count)++;
             continue;
         }
@@ -1107,13 +1227,14 @@ static int find_abi_entry(const AbiEntry* entries, int count, const char* module
 
 static bool append_abi_entry(AbiEntry** entries, int* count, int* cap,
                              const char* module, int kind, const char* name, int metric,
-                             const char* return_type, const char* effects) {
+                             const char* params, const char* return_type, const char* effects) {
     if (!entries || !count || !cap || !module || !name || metric < 0) return false;
     if (strlen(module) >= MAX_PATH_LEN || strlen(name) >= MAX_NAME_LEN) return false;
 
     int existing = find_abi_entry(*entries, *count, module, kind, name);
     if (existing >= 0) {
         if ((*entries)[existing].metric != metric ||
+            strcmp((*entries)[existing].params, params ? params : "") != 0 ||
             strcmp((*entries)[existing].return_type, return_type ? return_type : "") != 0 ||
             strcmp((*entries)[existing].effects, effects ? effects : "-") != 0) {
             return false;
@@ -1134,6 +1255,7 @@ static bool append_abi_entry(AbiEntry** entries, int* count, int* cap,
     out->kind = kind;
     copy_text(out->name, sizeof(out->name), name);
     out->metric = metric;
+    copy_text(out->params, sizeof(out->params), params ? params : "");
     copy_text(out->return_type, sizeof(out->return_type), return_type ? return_type : "");
     copy_text(out->effects, sizeof(out->effects), effects ? effects : "-");
     (*count)++;
@@ -1209,8 +1331,8 @@ static bool collect_package_abi_entries_tree(const char* root_dir, const char* b
         for (int i = 0; i < symbol_count; i++) {
             if (!append_abi_entry(entries, count, cap, module_rel,
                                   symbols[i].kind, symbols[i].name, symbols[i].metric,
-                                  symbols[i].return_type, symbols[i].effects)) {
-                fprintf(stderr, "vpm: conflicting ABI entry in %s\n", path);
+                                  symbols[i].params, symbols[i].return_type, symbols[i].effects)) {
+                pkg_error("VPK011", "Conflicting ABI entry in %s", path);
                 free(symbols);
                 ok = false;
                 break;
@@ -1466,7 +1588,7 @@ static bool install_dependency_stub(const char* project_root, const char* pkg, c
             if (!shell_quote_double(primary_branch, q_branch, sizeof(q_branch)) ||
                 !shell_quote_double(url, q_url, sizeof(q_url)) ||
                 !shell_quote_double(version_dir, q_version_dir, sizeof(q_version_dir))) {
-                fprintf(stderr, "vpm: package path is too long for shell command.\n");
+                pkg_error("VPK012", "Package path is too long for shell command.");
                 return false;
             }
             
@@ -1474,7 +1596,7 @@ static bool install_dependency_stub(const char* project_root, const char* pkg, c
             if (!append_fmt(clone_cmd, sizeof(clone_cmd), &clone_len,
                             "git clone --depth 1 --branch %s %s %s",
                             q_branch, q_url, q_version_dir)) {
-                fprintf(stderr, "vpm: clone command is too long.\n");
+                pkg_error("VPK013", "Clone command is too long.");
                 return false;
             }
             printf("vpm: Fetching remote package %s...\n", pkg);
@@ -1482,20 +1604,20 @@ static bool install_dependency_stub(const char* project_root, const char* pkg, c
             if (res != 0) {
                 // fallback to master if main fails
                 if (!shell_quote_double(fallback_branch, q_branch, sizeof(q_branch))) {
-                    fprintf(stderr, "vpm: package branch is too long for shell command.\n");
+                    pkg_error("VPK014", "Package branch is too long for shell command.");
                     return false;
                 }
                 clone_len = 0;
                 if (!append_fmt(clone_cmd, sizeof(clone_cmd), &clone_len,
                                 "git clone --depth 1 --branch %s %s %s",
                                 q_branch, q_url, q_version_dir)) {
-                    fprintf(stderr, "vpm: clone command is too long.\n");
+                    pkg_error("VPK013", "Clone command is too long.");
                     return false;
                 }
                 res = system(clone_cmd);
             }
             if (res != 0) {
-                fprintf(stderr, "vpm: Failed to fetch %s\n", pkg);
+                pkg_error("VPK015", "Failed to fetch %s", pkg);
                 return false;
             }
         }
@@ -1658,16 +1780,90 @@ static bool copy_file_if_exists(const char* src, const char* dst) {
     return true;
 }
 
+static bool copy_llm_pack_file(const char* filename, const char* dst) {
+    if (!filename || !dst) return false;
+
+    char src[MAX_PATH_LEN];
+    if (join_path("/usr/local/lib/viper/docs/llm", filename, src, sizeof(src)) &&
+        copy_file_if_exists(src, dst)) {
+        return true;
+    }
+
+    if (join_path("docs/llm", filename, src, sizeof(src)) &&
+        copy_file_if_exists(src, dst)) {
+        return true;
+    }
+
+    char exe_path[MAX_PATH_LEN];
+    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (len > 0) {
+        exe_path[len] = '\0';
+        char exe_dir[MAX_PATH_LEN];
+        path_dirname(exe_path, exe_dir, sizeof(exe_dir));
+        char docs_dir[MAX_PATH_LEN];
+        if (join_path(exe_dir, "docs/llm", docs_dir, sizeof(docs_dir)) &&
+            join_path(docs_dir, filename, src, sizeof(src)) &&
+            copy_file_if_exists(src, dst)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void scaffold_llm_pack(const char* project_root) {
+    static const char* files[] = {
+        "README.md",
+        "MODEL_SPEC.md",
+        "STDLIB.md",
+        "ERRORS.md",
+        "TOOLING.md",
+        "BUILD.md",
+        "PACKAGING.md",
+        "TESTING.md",
+        "RECIPES.md",
+        "WORKFLOW.md",
+        "PROMPTS.md"
+    };
+
+    if (!project_root) return;
+
+    char docs_dir[MAX_PATH_LEN];
+    char llm_dir[MAX_PATH_LEN];
+    if (!join_path(project_root, "docs", docs_dir, sizeof(docs_dir)) ||
+        !join_path(docs_dir, "llm", llm_dir, sizeof(llm_dir))) {
+        pkg_error("VPK016", "Could not resolve docs/llm path.");
+        return;
+    }
+
+    if (!ensure_dir_recursive(llm_dir)) {
+        pkg_error("VPK017", "Failed to create docs/llm.");
+        return;
+    }
+
+    int copied = 0;
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        char dst[MAX_PATH_LEN];
+        if (!join_path(llm_dir, files[i], dst, sizeof(dst))) continue;
+        if (file_exists(dst)) continue;
+        if (copy_llm_pack_file(files[i], dst)) copied++;
+    }
+
+    if (copied > 0) {
+        printf("vpm: created docs/llm onboarding pack\n");
+    }
+}
+
 static int cmd_init(const char* project_name) {
     char cwd[MAX_PATH_LEN];
     if (getcwd(cwd, sizeof(cwd)) == NULL) {
-        fprintf(stderr, "vpm: could not resolve current directory.\n");
+        pkg_error("VPK018", "Could not resolve current directory.");
         return 1;
     }
 
     char manifest[MAX_PATH_LEN];
     if (!join_path(cwd, "viper.vpmod", manifest, sizeof(manifest))) {
-        fprintf(stderr, "vpm: path is too long.\n");
+        pkg_error("VPK019", "Path is too long.");
         return 1;
     }
 
@@ -1680,7 +1876,7 @@ static int cmd_init(const char* project_name) {
                  "// Managed by Viper Package Manager\n",
                  name);
         if (!write_text_file(manifest, content)) {
-            fprintf(stderr, "vpm: failed to write viper.vpmod.\n");
+            pkg_error("VPK020", "Failed to write viper.vpmod.");
             return 1;
         }
         printf("vpm: created viper.vpmod\n");
@@ -1690,23 +1886,23 @@ static int cmd_init(const char* project_name) {
 
     char packages_dir[MAX_PATH_LEN];
     if (!join_path(cwd, ".viper/packages", packages_dir, sizeof(packages_dir))) {
-        fprintf(stderr, "vpm: path is too long.\n");
+        pkg_error("VPK019", "Path is too long.");
         return 1;
     }
 
     if (!ensure_dir_recursive(packages_dir)) {
-        fprintf(stderr, "vpm: failed to create .viper/packages\n");
+        pkg_error("VPK021", "Failed to create .viper/packages.");
         return 1;
     }
 
     char lock_path[MAX_PATH_LEN];
     if (!join_path(cwd, "viper.lock", lock_path, sizeof(lock_path))) {
-        fprintf(stderr, "vpm: path is too long.\n");
+        pkg_error("VPK019", "Path is too long.");
         return 1;
     }
     if (!file_exists(lock_path)) {
         if (!write_text_file(lock_path, "# viper lockfile v1\n")) {
-            fprintf(stderr, "vpm: failed to initialize viper.lock\n");
+            pkg_error("VPK022", "Failed to initialize viper.lock.");
             return 1;
         }
         printf("vpm: created viper.lock\n");
@@ -1714,69 +1910,44 @@ static int cmd_init(const char* project_name) {
 
     printf("vpm: initialized package store at .viper/packages\n");
 
-    // Auto-generate LLM_REFERENCE.md for AI assistants
-    char llm_ref_dst[MAX_PATH_LEN];
-    if (join_path(cwd, "LLM_REFERENCE.md", llm_ref_dst, sizeof(llm_ref_dst)) &&
-        !file_exists(llm_ref_dst)) {
-        bool copied = false;
-        // Try 1: system install path
-        copied = copy_file_if_exists("/usr/local/lib/viper/LLM_REFERENCE.md", llm_ref_dst);
-        // Try 2: relative to CWD
-        if (!copied) copied = copy_file_if_exists("docs/LLM_REFERENCE.md", llm_ref_dst);
-        // Try 3: relative to executable
-        if (!copied) {
-            char exe_path[MAX_PATH_LEN];
-            ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-            if (len > 0) {
-                exe_path[len] = '\0';
-                char exe_dir[MAX_PATH_LEN];
-                path_dirname(exe_path, exe_dir, sizeof(exe_dir));
-                char ref_path[MAX_PATH_LEN];
-                if (join_path(exe_dir, "docs/LLM_REFERENCE.md", ref_path, sizeof(ref_path))) {
-                    copied = copy_file_if_exists(ref_path, llm_ref_dst);
-                }
-            }
-        }
-        if (copied) {
-            printf("vpm: created LLM_REFERENCE.md (AI language guide)\n");
-        }
-    }
+    // Auto-generate docs/llm onboarding pack for AI assistants.
+    scaffold_llm_pack(cwd);
 
     return 0;
 }
 
 static int cmd_add(const char* pkg, const char* version) {
     if (!is_valid_package_name(pkg)) {
-        fprintf(stderr, "vpm: invalid package name '%s'\n", pkg ? pkg : "");
+        pkg_error("VPK023", "Invalid package name '%s'", pkg ? pkg : "");
         return 1;
     }
 
     const char* ver = (version && version[0] != '\0') ? version : "latest";
     if (!is_valid_version(ver)) {
-        fprintf(stderr, "vpm: invalid version '%s'\n", ver);
+        pkg_error("VPK024", "Invalid version '%s'", ver);
         return 1;
     }
 
     char root[MAX_PATH_LEN];
     if (!find_project_root(root, sizeof(root))) {
-        fprintf(stderr, "vpm: no viper.vpmod found (run 'viper pkg init').\n");
+        pkg_error("VPK025", "No viper.vpmod found (run 'viper pkg init').");
         return 1;
     }
 
     char manifest[MAX_PATH_LEN];
     if (!join_path(root, "viper.vpmod", manifest, sizeof(manifest))) {
-        fprintf(stderr, "vpm: path is too long.\n");
+        pkg_error("VPK019", "Path is too long.");
         return 1;
     }
 
     if (!save_manifest_set_dependency(manifest, pkg, ver)) {
-        fprintf(stderr, "vpm: failed to update manifest.\n");
+        pkg_error("VPK026", "Failed to update manifest.");
         return 1;
     }
 
     int installed = 0;
     if (!run_install(root, manifest, &installed)) {
-        fprintf(stderr, "vpm: install failed after add.\n");
+        pkg_error("VPK027", "Install failed after add.");
         return 1;
     }
 
@@ -1787,31 +1958,31 @@ static int cmd_add(const char* pkg, const char* version) {
 
 static int cmd_remove(const char* pkg) {
     if (!is_valid_package_name(pkg)) {
-        fprintf(stderr, "vpm: invalid package name '%s'\n", pkg ? pkg : "");
+        pkg_error("VPK023", "Invalid package name '%s'", pkg ? pkg : "");
         return 1;
     }
 
     char root[MAX_PATH_LEN];
     if (!find_project_root(root, sizeof(root))) {
-        fprintf(stderr, "vpm: no viper.vpmod found (run 'viper pkg init').\n");
+        pkg_error("VPK025", "No viper.vpmod found (run 'viper pkg init').");
         return 1;
     }
 
     char manifest[MAX_PATH_LEN];
     if (!join_path(root, "viper.vpmod", manifest, sizeof(manifest))) {
-        fprintf(stderr, "vpm: path is too long.\n");
+        pkg_error("VPK019", "Path is too long.");
         return 1;
     }
 
     bool removed = false;
     if (!save_manifest_remove_dependency(manifest, pkg, &removed)) {
-        fprintf(stderr, "vpm: failed to update manifest.\n");
+        pkg_error("VPK026", "Failed to update manifest.");
         return 1;
     }
 
     int installed = 0;
     if (!run_install(root, manifest, &installed)) {
-        fprintf(stderr, "vpm: failed to refresh lock/install state.\n");
+        pkg_error("VPK028", "Failed to refresh lock/install state.");
         return 1;
     }
 
@@ -1826,19 +1997,19 @@ static int cmd_remove(const char* pkg) {
 static int cmd_install(void) {
     char root[MAX_PATH_LEN];
     if (!find_project_root(root, sizeof(root))) {
-        fprintf(stderr, "vpm: no viper.vpmod found (run 'viper pkg init').\n");
+        pkg_error("VPK025", "No viper.vpmod found (run 'viper pkg init').");
         return 1;
     }
 
     char manifest[MAX_PATH_LEN];
     if (!join_path(root, "viper.vpmod", manifest, sizeof(manifest))) {
-        fprintf(stderr, "vpm: path is too long.\n");
+        pkg_error("VPK019", "Path is too long.");
         return 1;
     }
 
     int installed = 0;
     if (!run_install(root, manifest, &installed)) {
-        fprintf(stderr, "vpm: install failed.\n");
+        pkg_error("VPK029", "Install failed.");
         return 1;
     }
 
@@ -1849,20 +2020,20 @@ static int cmd_install(void) {
 static int cmd_lock(void) {
     char root[MAX_PATH_LEN];
     if (!find_project_root(root, sizeof(root))) {
-        fprintf(stderr, "vpm: no viper.vpmod found (run 'viper pkg init').\n");
+        pkg_error("VPK025", "No viper.vpmod found (run 'viper pkg init').");
         return 1;
     }
 
     char manifest[MAX_PATH_LEN];
     if (!join_path(root, "viper.vpmod", manifest, sizeof(manifest))) {
-        fprintf(stderr, "vpm: path is too long.\n");
+        pkg_error("VPK019", "Path is too long.");
         return 1;
     }
 
     Dependency* deps = NULL;
     int dep_count = 0;
     if (!load_manifest_dependencies(manifest, &deps, &dep_count)) {
-        fprintf(stderr, "vpm: failed to read dependencies from manifest.\n");
+        pkg_error("VPK030", "Failed to read dependencies from manifest.");
         return 1;
     }
 
@@ -1870,7 +2041,7 @@ static int cmd_lock(void) {
     free(deps);
 
     if (!ok) {
-        fprintf(stderr, "vpm: failed to write lockfile.\n");
+        pkg_error("VPK031", "Failed to write lockfile.");
         return 1;
     }
 
@@ -1881,20 +2052,20 @@ static int cmd_lock(void) {
 static int cmd_list(void) {
     char root[MAX_PATH_LEN];
     if (!find_project_root(root, sizeof(root))) {
-        fprintf(stderr, "vpm: no viper.vpmod found (run 'viper pkg init').\n");
+        pkg_error("VPK025", "No viper.vpmod found (run 'viper pkg init').");
         return 1;
     }
 
     char manifest[MAX_PATH_LEN];
     if (!join_path(root, "viper.vpmod", manifest, sizeof(manifest))) {
-        fprintf(stderr, "vpm: path is too long.\n");
+        pkg_error("VPK019", "Path is too long.");
         return 1;
     }
 
     Dependency* deps = NULL;
     int dep_count = 0;
     if (!load_manifest_dependencies(manifest, &deps, &dep_count)) {
-        fprintf(stderr, "vpm: could not read manifest.\n");
+        pkg_error("VPK032", "Could not read manifest.");
         return 1;
     }
 
@@ -1913,20 +2084,20 @@ static int cmd_list(void) {
 static int cmd_build(void) {
     char root[MAX_PATH_LEN];
     if (!find_project_root(root, sizeof(root))) {
-        fprintf(stderr, "vpm: no viper.vpmod found (run 'viper pkg init').\n");
+        pkg_error("VPK025", "No viper.vpmod found (run 'viper pkg init').");
         return 1;
     }
 
     char manifest[MAX_PATH_LEN];
     if (!join_path(root, "viper.vpmod", manifest, sizeof(manifest))) {
-        fprintf(stderr, "vpm: path is too long.\n");
+        pkg_error("VPK019", "Path is too long.");
         return 1;
     }
 
     Dependency* deps = NULL;
     int dep_count = 0;
     if (!load_manifest_dependencies(manifest, &deps, &dep_count)) {
-        fprintf(stderr, "vpm: could not read manifest.\n");
+        pkg_error("VPK032", "Could not read manifest.");
         return 1;
     }
 
@@ -1941,7 +2112,7 @@ static int cmd_build(void) {
     free(deps);
 
     if (!ok) {
-        fprintf(stderr, "vpm: package build failed (run 'viper pkg install' first).\n");
+        pkg_error("VPK033", "Package build failed (run 'viper pkg install' first).");
         return 1;
     }
 
@@ -1952,20 +2123,20 @@ static int cmd_build(void) {
 static int cmd_abi_check(void) {
     char root[MAX_PATH_LEN];
     if (!find_project_root(root, sizeof(root))) {
-        fprintf(stderr, "vpm: no viper.vpmod found (run 'viper pkg init').\n");
+        pkg_error("VPK025", "No viper.vpmod found (run 'viper pkg init').");
         return 1;
     }
 
     char manifest[MAX_PATH_LEN];
     if (!join_path(root, "viper.vpmod", manifest, sizeof(manifest))) {
-        fprintf(stderr, "vpm: path is too long.\n");
+        pkg_error("VPK019", "Path is too long.");
         return 1;
     }
 
     Dependency* deps = NULL;
     int dep_count = 0;
     if (!load_manifest_dependencies(manifest, &deps, &dep_count)) {
-        fprintf(stderr, "vpm: could not read manifest.\n");
+        pkg_error("VPK032", "Could not read manifest.");
         return 1;
     }
 
@@ -1985,7 +2156,7 @@ static int cmd_abi_check(void) {
             break;
         }
         if (!is_directory(version_dir)) {
-            fprintf(stderr, "vpm: installed package path missing: %s(%s)\n", deps[i].name, deps[i].version);
+            pkg_error("VPK034", "Installed package path missing: %s(%s)", deps[i].name, deps[i].version);
             failed++;
             continue;
         }
@@ -1997,11 +2168,11 @@ static int cmd_abi_check(void) {
     free(deps);
 
     if (!ok) {
-        fprintf(stderr, "vpm: abi check failed due to filesystem error.\n");
+        pkg_error("VPK035", "ABI check failed due to filesystem error.");
         return 1;
     }
     if (failed > 0) {
-        fprintf(stderr, "vpm: abi check failed (%d/%d module artifact mismatch)\n", failed, checked);
+        pkg_error("VPK036", "ABI check failed (%d/%d module artifact mismatch)", failed, checked);
         return 1;
     }
 
@@ -2011,18 +2182,18 @@ static int cmd_abi_check(void) {
 
 static int cmd_abi_diff(const char* pkg, const char* from_ver, const char* to_ver, bool fail_on_breaking) {
     if (!is_valid_package_name(pkg)) {
-        fprintf(stderr, "vpm: invalid package name '%s'\n", pkg ? pkg : "");
+        pkg_error("VPK023", "Invalid package name '%s'", pkg ? pkg : "");
         return 1;
     }
     if (!is_valid_version(from_ver) || !is_valid_version(to_ver)) {
-        fprintf(stderr, "vpm: invalid version range '%s' -> '%s'\n",
-                from_ver ? from_ver : "", to_ver ? to_ver : "");
+        pkg_error("VPK037", "Invalid version range '%s' -> '%s'",
+                  from_ver ? from_ver : "", to_ver ? to_ver : "");
         return 1;
     }
 
     char root[MAX_PATH_LEN];
     if (!find_project_root(root, sizeof(root))) {
-        fprintf(stderr, "vpm: no viper.vpmod found (run 'viper pkg init').\n");
+        pkg_error("VPK025", "No viper.vpmod found (run 'viper pkg init').");
         return 1;
     }
 
@@ -2030,15 +2201,15 @@ static int cmd_abi_diff(const char* pkg, const char* from_ver, const char* to_ve
     char to_dir[MAX_PATH_LEN];
     if (!dependency_version_dir(root, pkg, from_ver, from_dir, sizeof(from_dir)) ||
         !dependency_version_dir(root, pkg, to_ver, to_dir, sizeof(to_dir))) {
-        fprintf(stderr, "vpm: path is too long.\n");
+        pkg_error("VPK019", "Path is too long.");
         return 1;
     }
     if (!is_directory(from_dir)) {
-        fprintf(stderr, "vpm: package version not found: %s(%s)\n", pkg, from_ver);
+        pkg_error("VPK038", "Package version not found: %s(%s)", pkg, from_ver);
         return 1;
     }
     if (!is_directory(to_dir)) {
-        fprintf(stderr, "vpm: package version not found: %s(%s)\n", pkg, to_ver);
+        pkg_error("VPK038", "Package version not found: %s(%s)", pkg, to_ver);
         return 1;
     }
 
@@ -2050,7 +2221,7 @@ static int cmd_abi_diff(const char* pkg, const char* from_ver, const char* to_ve
         !collect_package_abi_entries(to_dir, &rhs, &rhs_count)) {
         free(lhs);
         free(rhs);
-        fprintf(stderr, "vpm: failed to read ABI entries for diff.\n");
+        pkg_error("VPK039", "Failed to read ABI entries for diff.");
         return 1;
     }
 
@@ -2075,8 +2246,10 @@ static int cmd_abi_diff(const char* pkg, const char* from_ver, const char* to_ve
             bool is_breaking = abi_change_is_breaking(lhs[i].kind, lhs[i].metric, rhs[j].metric, &reason);
             char lhs_contract[512];
             char rhs_contract[512];
-            format_abi_contract(lhs[i].return_type, lhs[i].effects, lhs_contract, sizeof(lhs_contract));
-            format_abi_contract(rhs[j].return_type, rhs[j].effects, rhs_contract, sizeof(rhs_contract));
+            format_abi_contract(lhs[i].params, lhs[i].return_type, lhs[i].effects,
+                                lhs_contract, sizeof(lhs_contract));
+            format_abi_contract(rhs[j].params, rhs[j].return_type, rhs[j].effects,
+                                rhs_contract, sizeof(rhs_contract));
             printf("%s CHANGED %s %s %s %d -> %d [%s -> %s]",
                    is_breaking ? "BREAKING" : "NON_BREAKING",
                    lhs[i].module, abi_kind_tag(lhs[i].kind),
@@ -2094,7 +2267,8 @@ static int cmd_abi_diff(const char* pkg, const char* from_ver, const char* to_ve
         int j = find_abi_entry(lhs, lhs_count, rhs[i].module, rhs[i].kind, rhs[i].name);
         if (j < 0) {
             char rhs_contract[512];
-            format_abi_contract(rhs[i].return_type, rhs[i].effects, rhs_contract, sizeof(rhs_contract));
+            format_abi_contract(rhs[i].params, rhs[i].return_type, rhs[i].effects,
+                                rhs_contract, sizeof(rhs_contract));
             printf("NON_BREAKING ADDED %s %s %s %d [%s]\n",
                    rhs[i].module, abi_kind_tag(rhs[i].kind), rhs[i].name, rhs[i].metric,
                    rhs_contract);
@@ -2110,7 +2284,7 @@ static int cmd_abi_diff(const char* pkg, const char* from_ver, const char* to_ve
            added, removed, changed, breaking, non_breaking);
 
     if (fail_on_breaking && breaking > 0) {
-        fprintf(stderr, "vpm: breaking changes detected.\n");
+        pkg_error("VPK040", "Breaking changes detected.");
         free(lhs);
         free(rhs);
         return 2;

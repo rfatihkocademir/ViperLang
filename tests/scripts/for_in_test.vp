@@ -1,0 +1,18 @@
+var items = [10, 20, 30]
+var sum = 0
+var text = ""
+
+for item in items {
+    sum = sum + item
+    text = text + item + ","
+}
+
+if sum != 60 {
+    panic("for-sum")
+}
+
+if text != "10,20,30," {
+    panic("for-text")
+}
+
+pr("for-in-ok")

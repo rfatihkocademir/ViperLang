@@ -1,0 +1,2 @@
+use "@web" as web
+pr(web.webSecret())

@@ -1,0 +1,13 @@
+fn leaf() {
+    os_env(1)
+}
+
+fn middle() {
+    leaf()
+}
+
+fn top() {
+    middle()
+}
+
+top()

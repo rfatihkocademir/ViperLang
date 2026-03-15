@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -11,10 +12,19 @@
 
 static int g_epoll_fd = -1;
 
+static void async_error(const char* code, const char* fmt, ...) {
+    va_list args;
+    fprintf(stderr, "Async Error [%s]: ", code);
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fprintf(stderr, "\n");
+}
+
 void init_async_io() {
     g_epoll_fd = epoll_create1(0);
     if (g_epoll_fd == -1) {
-        perror("epoll_create1");
+        async_error("VAS001", "epoll_create1 failed: %s", strerror(errno));
         exit(1);
     }
 }
@@ -55,7 +65,7 @@ int async_poll(int timeout_ms) {
     int n = epoll_wait(g_epoll_fd, events, MAX_EVENTS, timeout_ms);
     if (n < 0) {
         if (errno == EINTR) return 0;
-        perror("epoll_wait");
+        async_error("VAS002", "epoll_wait failed: %s", strerror(errno));
         return -1;
     }
     

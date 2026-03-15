@@ -1,0 +1,13 @@
+fn leaf() {
+    panic("boom")
+}
+
+fn middle() {
+    leaf()
+}
+
+fn top() {
+    middle()
+}
+
+top()

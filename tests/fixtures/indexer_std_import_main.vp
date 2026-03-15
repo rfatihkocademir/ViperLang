@@ -1,0 +1,7 @@
+use "indexer_std_import_lib.vp" as user
+
+fn render(key) -> str {
+    ret user.read_user(key)
+}
+
+render("USER")

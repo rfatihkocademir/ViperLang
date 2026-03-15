@@ -106,3 +106,11 @@ Bad public API:
 - If a function touches OS/FS/DB/Web, declare the effect.
 - If a function returns a struct or important scalar, annotate the return type.
 - If a file grows large, push helpers into a sibling module.
+
+## Failure Rule
+
+If execution fails with a bracketed code like `[VRT019]`:
+
+1. map the code in `docs/llm/ERRORS.md`
+2. inspect the smallest symbol slice related to that diagnosis
+3. avoid debugging from the whole raw log

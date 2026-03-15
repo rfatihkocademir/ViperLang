@@ -1,0 +1,2 @@
+use "@web" as web
+var pong: str = web.webPing()

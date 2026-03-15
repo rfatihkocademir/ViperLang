@@ -1,0 +1,14 @@
+fn leaf(items) {
+    ret items[3]
+}
+
+fn middle(items) {
+    ret leaf(items)
+}
+
+fn top() {
+    var items = [1, 2]
+    ret middle(items)
+}
+
+top()

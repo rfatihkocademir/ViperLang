@@ -108,8 +108,10 @@ typedef uint32_t Instruction;
 
 typedef struct {
     Instruction* code;
+    int* lines;
     int count;
     int capacity;
+    int line_capacity;
     
     Value* constants;
     int constant_count;
@@ -118,6 +120,7 @@ typedef struct {
 
 void init_chunk(Chunk* chunk);
 void write_chunk(Chunk* chunk, Instruction inst);
+void set_chunk_write_line(int line);
 int add_constant(Chunk* chunk, Value value);
 
 // ViperVM Runtime

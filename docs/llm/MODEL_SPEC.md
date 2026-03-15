@@ -15,6 +15,17 @@ Core rule:
 
 `In Viper, the most important artifact for an LLM is often not the source file itself, but the semantic state derived from it.`
 
+## Companion Docs
+
+Use these alongside this file:
+
+- `STDLIB.md` for real module surface
+- `TOOLING.md` for state/query/diff commands
+- `BUILD.md` for app runtime and capabilities
+- `PACKAGING.md` for `viper pkg` and ABI
+- `TESTING.md` for `@covers`, plans, and proof sidecars
+- `RECIPES.md` for common app shapes
+
 ## What A Model Should Optimize For
 
 When generating Viper, prefer:
@@ -79,12 +90,12 @@ Rules:
 ### Functions
 
 ```viper
-fn multiply(a, b) {
+fn multiply(a: int, b: int) -> int {
     ret a * b
 }
 
-pub fn read_user(user_id) -> str {
-    ret os_env(user_id)
+pub fn render_user(user_id: str) -> str {
+    ret "user:" + user_id
 }
 ```
 
@@ -94,6 +105,25 @@ Rules:
 - `pub fn` exports a function.
 - Return type uses `-> Type`.
 - Use `ret`, not `return`.
+- Parameter type annotations are supported and preferred on public or semantically important functions.
+- Prefer typed params, typed returns, and typed structs when the contract is stable.
+
+### Loops
+
+Use either `while` or simple array iteration with `for ... in`.
+
+```viper
+var i = 0
+while i < 3 {
+    pr(i)
+    i = i + 1
+}
+
+var items = [1, 2, 3]
+for item in items {
+    pr(item)
+}
+```
 
 ### Structs
 
@@ -168,6 +198,28 @@ Prefer:
 - explicit quotes
 - simple helper functions when repeated
 
+## Common Builtins
+
+These are core helpers the model should recognize:
+
+```viper
+pr("hello")
+panic("boom")
+arr_len(items)
+
+var lib = load_dl("libc.so.6")
+var puts = lib.get_fn("puts", "s->i")
+puts("hi")
+```
+
+Guidelines:
+
+- Prefer stdlib wrappers before raw FFI.
+- Use `pr(...)` for simple output in scripts and tests.
+- Use `panic(...)` only when the failure is intentional and part of the contract.
+- Use `arr_len(...)` for array length.
+- Keep `load_dl(...)` isolated in adapter modules or stdlib-like wrappers.
+
 ## Effects
 
 Effects are a first-class semantic contract.
@@ -175,9 +227,11 @@ Effects are a first-class semantic contract.
 Example:
 
 ```viper
+use "@std/os" as os
+
 @effect(os, auth)
 pub fn read_user(user_id) -> str {
-    ret os_env("USER")
+    ret os.get_env("USER")
 }
 ```
 
@@ -232,8 +286,11 @@ Common calls:
 ```viper
 os.get_env("USER")
 os.exec("echo hi")
-io.open(path, "w")
-io.write_text(file, "hello")
+var file = io.open(path, "w")
+if file != 0 {
+    io.write_text(file, "hello")
+    io.close(file)
+}
 net.serve(8080)
 net.accept(server)
 net.recv_string(client)
@@ -329,7 +386,7 @@ fn read_user() -> User {
     ret User(os.get_env("USER"), "local")
 }
 
-fn build_message(user: User) -> str {
+fn build_message(user) -> str {
     ret "{\"name\":\"" + user.name + "\",\"role\":\"" + user.role + "\"}"
 }
 

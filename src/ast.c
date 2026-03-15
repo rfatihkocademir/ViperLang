@@ -89,12 +89,13 @@ AstNode* ast_new_sync_stmt(AstNode* body) {
     return node;
 }
 
-AstNode* ast_new_func_decl(Token name, Token* params, int param_count,
+AstNode* ast_new_func_decl(Token name, Token* params, Token* param_types, int param_count,
                            Token* effects, int effect_count,
                            Token return_type, AstNode* body) {
     AstNode* node = ast_alloc(AST_FUNC_DECL);
     node->data.func_decl.name = name;
     node->data.func_decl.params = params;
+    node->data.func_decl.param_types = param_types;
     node->data.func_decl.param_count = param_count;
     node->data.func_decl.effects = effects;
     node->data.func_decl.effect_count = effect_count;
@@ -290,6 +291,21 @@ void ast_print(AstNode* node, int depth) {
                    node->data.func_decl.is_public ? "Pub " : "",
                    node->data.func_decl.name.length, node->data.func_decl.name.start,
                    node->data.func_decl.param_count);
+            if (node->data.func_decl.param_count > 0) {
+                printf(": ");
+                for (int i = 0; i < node->data.func_decl.param_count; i++) {
+                    printf("%s%.*s",
+                           (i == 0) ? "" : ", ",
+                           node->data.func_decl.params[i].length,
+                           node->data.func_decl.params[i].start);
+                    if (node->data.func_decl.param_types &&
+                        node->data.func_decl.param_types[i].length > 0) {
+                        printf(":%.*s",
+                               node->data.func_decl.param_types[i].length,
+                               node->data.func_decl.param_types[i].start);
+                    }
+                }
+            }
             if (node->data.func_decl.effect_count > 0) {
                 printf(", effects=");
                 for (int i = 0; i < node->data.func_decl.effect_count; i++) {
@@ -298,6 +314,11 @@ void ast_print(AstNode* node, int depth) {
                            node->data.func_decl.effects[i].length,
                            node->data.func_decl.effects[i].start);
                 }
+            }
+            if (node->data.func_decl.return_type.length > 0) {
+                printf(", returns=%.*s",
+                       node->data.func_decl.return_type.length,
+                       node->data.func_decl.return_type.start);
             }
             printf(")\n");
             ast_print(node->data.func_decl.body, depth + 1);

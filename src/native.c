@@ -67,13 +67,27 @@ static ObjStruct* g_web_response_struct = NULL;
 static ObjStruct* g_os_exec_result_struct = NULL;
 
 extern __thread const char* last_panic_msg;
+extern __thread const char* last_panic_code;
 
-static Value viper_panic(const char* msg) {
+static Value viper_panic_code(const char* code, const char* msg) {
+    last_panic_code = code ? code : "VPN000";
     last_panic_msg = strdup(msg); // Leak here if multiple panics, but safe for shutdown
     return (Value){VAL_NIL, {.number = 0}};
 }
-static bool g_os_features_notice_printed = false;
-static bool g_ai_features_notice_printed = false;
+
+static Value __attribute__((unused)) viper_panic(const char* msg) {
+    return viper_panic_code("VNT000", msg);
+}
+
+static Value viper_panic_errno_code(const char* code, const char* prefix) {
+    char err[256];
+    snprintf(err, sizeof(err), "%s: %s", prefix, strerror(errno));
+    return viper_panic_code(code, err);
+}
+
+static Value __attribute__((unused)) viper_panic_errno(const char* prefix) {
+    return viper_panic_errno_code("VNT000", prefix);
+}
 static char g_ai_provider[64] = "";
 static char g_ai_key[256] = "";
 
@@ -165,6 +179,43 @@ static char* dup_cstr(const char* text) {
 static Value string_value(const char* text) {
     if (!text) return (Value){VAL_NIL, {.number = 0}};
     return (Value){VAL_OBJ, {.obj = (Obj*)copy_string(text, (int)strlen(text))}};
+}
+
+static bool ffi_type_is_builtin(ffi_type* type) {
+    return type == &ffi_type_void ||
+           type == &ffi_type_sint32 ||
+           type == &ffi_type_sint64 ||
+           type == &ffi_type_float ||
+           type == &ffi_type_double ||
+           type == &ffi_type_pointer;
+}
+
+static void free_ffi_type_tree(ffi_type* type) {
+    if (!type || ffi_type_is_builtin(type)) return;
+    if (type->type == FFI_TYPE_STRUCT && type->elements) {
+        for (int i = 0; type->elements[i] != NULL; i++) {
+            free_ffi_type_tree(type->elements[i]);
+        }
+        free(type->elements);
+    }
+    free(type);
+}
+
+static void free_ffi_arg_types(ffi_type** arg_types, int count) {
+    if (!arg_types) return;
+    for (int i = 0; i < count; i++) {
+        free_ffi_type_tree(arg_types[i]);
+    }
+    free(arg_types);
+}
+
+static void skip_ffi_sig_ws(const char** p) {
+    if (!p || !*p) return;
+    while (**p && isspace((unsigned char)**p)) (*p)++;
+}
+
+static bool ffi_sig_error_is_void_only(const char* error) {
+    return error && strcmp(error, "Void is only allowed as a return type in FFI signatures.") == 0;
 }
 
 static bool parse_double_text(const char* text, double* out) {
@@ -1017,6 +1068,7 @@ void release_obj(Obj* obj) {
         } else if (obj->type == OBJ_FUNCTION) {
             ObjFunction* fn = (ObjFunction*)obj;
             free(fn->chunk.code);
+            free(fn->chunk.lines);
             free(fn->chunk.constants);
         } else if (obj->type == OBJ_STRUCT) {
             ObjStruct* st = (ObjStruct*)obj;
@@ -1039,10 +1091,12 @@ void release_obj(Obj* obj) {
             if (dl->handle) dlclose(dl->handle);
         } else if (obj->type == OBJ_DYNAMIC_FUNC) {
             ObjDynamicFunction* dyn = (ObjDynamicFunction*)obj;
+            ffi_cif* cif = (ffi_cif*)dyn->cif;
+            int nargs = cif ? (int)cif->nargs : 0;
             free((void*)dyn->signature);
+            free_ffi_arg_types((ffi_type**)dyn->arg_types, nargs);
+            free_ffi_type_tree((ffi_type*)dyn->return_type);
             free(dyn->cif);
-            free(dyn->arg_types);
-            // return_type points to static ffi_type, so we don't free it
         } else if (obj->type == OBJ_THREAD) {
             ObjThread* t = (ObjThread*)obj;
             // Native thread handle management
@@ -1178,10 +1232,12 @@ int native_count() {
 
 // Global thread-safe structure for passing panics up to 'recover'
 __thread const char* last_panic_msg = NULL;
+__thread const char* last_panic_code = NULL;
 
 static Value __attribute__((unused)) native_disabled_os(int argCount, Value* args) {
     (void)argCount;
     (void)args;
+    last_panic_code = "VNT100";
     last_panic_msg = "Capability 'os' is disabled in this runtime.";
     return (Value){VAL_NIL, {.number = 0}};
 }
@@ -1189,6 +1245,7 @@ static Value __attribute__((unused)) native_disabled_os(int argCount, Value* arg
 static Value __attribute__((unused)) native_disabled_fs(int argCount, Value* args) {
     (void)argCount;
     (void)args;
+    last_panic_code = "VNT101";
     last_panic_msg = "Capability 'fs' is disabled in this runtime.";
     return (Value){VAL_NIL, {.number = 0}};
 }
@@ -1196,6 +1253,7 @@ static Value __attribute__((unused)) native_disabled_fs(int argCount, Value* arg
 static Value __attribute__((unused)) native_disabled_web(int argCount, Value* args) {
     (void)argCount;
     (void)args;
+    last_panic_code = "VNT102";
     last_panic_msg = "Capability 'web' is disabled in this runtime.";
     return (Value){VAL_NIL, {.number = 0}};
 }
@@ -1203,6 +1261,7 @@ static Value __attribute__((unused)) native_disabled_web(int argCount, Value* ar
 static Value __attribute__((unused)) native_disabled_db(int argCount, Value* args) {
     (void)argCount;
     (void)args;
+    last_panic_code = "VNT103";
     last_panic_msg = "Capability 'db' is disabled in this runtime.";
     return (Value){VAL_NIL, {.number = 0}};
 }
@@ -1210,6 +1269,7 @@ static Value __attribute__((unused)) native_disabled_db(int argCount, Value* arg
 static Value __attribute__((unused)) native_disabled_ai(int argCount, Value* args) {
     (void)argCount;
     (void)args;
+    last_panic_code = "VNT104";
     last_panic_msg = "Capability 'ai' is disabled in this runtime.";
     return (Value){VAL_NIL, {.number = 0}};
 }
@@ -1217,6 +1277,7 @@ static Value __attribute__((unused)) native_disabled_ai(int argCount, Value* arg
 static Value __attribute__((unused)) native_disabled_cache(int argCount, Value* args) {
     (void)argCount;
     (void)args;
+    last_panic_code = "VNT105";
     last_panic_msg = "Capability 'cache' is disabled in this runtime.";
     return (Value){VAL_NIL, {.number = 0}};
 }
@@ -1224,6 +1285,7 @@ static Value __attribute__((unused)) native_disabled_cache(int argCount, Value* 
 static Value __attribute__((unused)) native_disabled_util(int argCount, Value* args) {
     (void)argCount;
     (void)args;
+    last_panic_code = "VNT106";
     last_panic_msg = "Capability 'util' is disabled in this runtime.";
     return (Value){VAL_NIL, {.number = 0}};
 }
@@ -1231,6 +1293,7 @@ static Value __attribute__((unused)) native_disabled_util(int argCount, Value* a
 static Value __attribute__((unused)) native_disabled_meta(int argCount, Value* args) {
     (void)argCount;
     (void)args;
+    last_panic_code = "VNT107";
     last_panic_msg = "Capability 'meta' is disabled in this runtime.";
     return (Value){VAL_NIL, {.number = 0}};
 }
@@ -1417,7 +1480,7 @@ static void* dlopen_relative_to(const char* base_dir, const char* path, char* re
 
 static Value native_load_dl(int argCount, Value* args) {
     if (argCount != 1 || !IS_OBJ(args[0]) || AS_OBJ(args[0])->type != OBJ_STRING) {
-        return viper_panic("load_dl expects a string argument.");
+        return viper_panic_code("VNT001", "load_dl expects a string argument.");
     }
     const char* path = AS_STRING(args[0])->chars;
     void* handle = dlopen(path, RTLD_LAZY);
@@ -1443,17 +1506,26 @@ static Value native_load_dl(int argCount, Value* args) {
     if (!handle) {
         char err[512];
         snprintf(err, sizeof(err), "Failed to load library '%s': %s", path, dlerror());
-        return viper_panic(err);
+        return viper_panic_code("VNT002", err);
     }
     return (Value){VAL_OBJ, {.obj = (Obj*)new_dl_handle(handle)}};
 }
 
-static ffi_type* parse_ffi_type(const char** p) {
+static ffi_type* parse_ffi_type(const char** p, bool allow_void, const char** error) {
+    skip_ffi_sig_ws(p);
     char c = **p;
-    if (!c) return NULL;
+    if (!c) {
+        if (error) *error = "Missing type in FFI signature.";
+        return NULL;
+    }
     (*p)++;
     switch (c) {
-        case 'v': return &ffi_type_void;
+        case 'v':
+            if (!allow_void) {
+                if (error) *error = "Void is only allowed as a return type in FFI signatures.";
+                return NULL;
+            }
+            return &ffi_type_void;
         case 'i': return &ffi_type_sint32;
         case 'I': return &ffi_type_sint64;
         case 'f': return &ffi_type_float;
@@ -1464,27 +1536,59 @@ static ffi_type* parse_ffi_type(const char** p) {
              int cap = 4;
              int count = 0;
              ffi_type** elements = malloc((cap + 1) * sizeof(ffi_type*));
+             if (!elements) {
+                 if (error) *error = "Out of memory while parsing FFI signature.";
+                 return NULL;
+             }
+             skip_ffi_sig_ws(p);
              while (**p && **p != '}') {
                  if (**p == ',') { (*p)++; continue; }
-                 ffi_type* elem = parse_ffi_type(p);
-                 if (!elem) { free(elements); return NULL; }
+                 ffi_type* elem = parse_ffi_type(p, false, error);
+                 if (!elem) {
+                     for (int i = 0; i < count; i++) free_ffi_type_tree(elements[i]);
+                     free(elements);
+                     return NULL;
+                 }
                  if (count == cap) {
                      cap *= 2;
-                     elements = realloc(elements, (cap + 1) * sizeof(ffi_type*));
+                     ffi_type** grown = realloc(elements, (cap + 1) * sizeof(ffi_type*));
+                     if (!grown) {
+                         free_ffi_type_tree(elem);
+                         for (int i = 0; i < count; i++) free_ffi_type_tree(elements[i]);
+                         free(elements);
+                         if (error) *error = "Out of memory while parsing FFI signature.";
+                         return NULL;
+                     }
+                     elements = grown;
                  }
                  elements[count++] = elem;
+                 skip_ffi_sig_ws(p);
              }
-             if (**p == '}') (*p)++;
+             if (**p != '}') {
+                 for (int i = 0; i < count; i++) free_ffi_type_tree(elements[i]);
+                 free(elements);
+                 if (error) *error = "Unterminated FFI struct type in signature.";
+                 return NULL;
+             }
+             (*p)++;
              elements[count] = NULL;
              
              ffi_type* st = malloc(sizeof(ffi_type));
+             if (!st) {
+                 for (int i = 0; i < count; i++) free_ffi_type_tree(elements[i]);
+                 free(elements);
+                 if (error) *error = "Out of memory while parsing FFI signature.";
+                 return NULL;
+             }
              st->size = 0;
              st->alignment = 0;
              st->type = FFI_TYPE_STRUCT;
              st->elements = elements;
              return st;
         }
-        default:  return NULL;
+        default:
+            if (error) *error = "Unknown type in FFI signature.";
+            return NULL;
     }
 }
 
@@ -1492,7 +1596,7 @@ static Value native_get_fn(int argCount, Value* args) {
     if (argCount != 3 || !IS_OBJ(args[0]) || AS_OBJ(args[0])->type != OBJ_DL_HANDLE ||
         !IS_OBJ(args[1]) || AS_OBJ(args[1])->type != OBJ_STRING || 
         !IS_OBJ(args[2]) || AS_OBJ(args[2])->type != OBJ_STRING) {
-        return viper_panic("get_fn expects (dl_handle, fn_name, signature).");
+        return viper_panic_code("VFF001", "get_fn expects (dl_handle, fn_name, signature).");
     }
     
     ObjDlHandle* dl = (ObjDlHandle*)AS_OBJ(args[0]);
@@ -1504,47 +1608,105 @@ static Value native_get_fn(int argCount, Value* args) {
     if (!fn_ptr) {
         char err[256];
         snprintf(err, sizeof(err), "Symbol '%s' not found.", fn_name);
-        return viper_panic(err);
+        return viper_panic_code("VFF002", err);
     }
 
     // Parse simple signature like "i,d->d"
     // Find separator "->"
     const char* sep = strstr(signature, "->");
     if (!sep) {
-        return viper_panic("Invalid signature format. Expected '...->type'.");
+        return viper_panic_code("VFF003", "Invalid signature format. Expected '...->type'.");
     }
     
     const char* r_ptr = sep + 2;
-    ffi_type* rtype = parse_ffi_type(&r_ptr);
+    const char* sig_error = NULL;
+    ffi_type* rtype = parse_ffi_type(&r_ptr, true, &sig_error);
     if (!rtype) {
-        return viper_panic("Unknown return type in signature.");
+        return viper_panic_code("VFF004", sig_error ? sig_error : "Unknown return type in signature.");
+    }
+    skip_ffi_sig_ws(&r_ptr);
+    if (*r_ptr != '\0') {
+        free_ffi_type_tree(rtype);
+        return viper_panic_code("VFF005", "Unexpected trailing characters in FFI return type.");
     }
     
     int arg_cap = 4;
     int num_args = 0;
     ffi_type** arg_types = malloc(arg_cap * sizeof(ffi_type*));
+    if (!arg_types) {
+        free_ffi_type_tree(rtype);
+        return viper_panic_code("VFF006", "Out of memory building FFI signature.");
+    }
     
     const char* p = signature;
+    bool saw_arg = false;
     while (p < sep) {
-        if (*p == ',') { p++; continue; }
-        ffi_type* t = parse_ffi_type(&p);
+        skip_ffi_sig_ws(&p);
+        if (p >= sep) break;
+        if (*p == ',') {
+            if (!saw_arg) {
+                free_ffi_arg_types(arg_types, num_args);
+                free_ffi_type_tree(rtype);
+                return viper_panic_code("VFF007", "Unexpected ',' in FFI argument list.");
+            }
+            saw_arg = false;
+            p++;
+            continue;
+        }
+        if (saw_arg) {
+            free_ffi_arg_types(arg_types, num_args);
+            free_ffi_type_tree(rtype);
+            return viper_panic_code("VFF008", "Missing ',' between FFI argument types.");
+        }
+        ffi_type* t = parse_ffi_type(&p, false, &sig_error);
         if (!t) {
-            return viper_panic("Unknown argument type in signature.");
+            free_ffi_arg_types(arg_types, num_args);
+            free_ffi_type_tree(rtype);
+            return viper_panic_code(ffi_sig_error_is_void_only(sig_error) ? "VFF004" : "VFF009",
+                                    sig_error ? sig_error : "Unknown argument type in signature.");
         }
         if (num_args == arg_cap) {
             arg_cap *= 2;
-            arg_types = realloc(arg_types, arg_cap * sizeof(ffi_type*));
+            ffi_type** grown = realloc(arg_types, arg_cap * sizeof(ffi_type*));
+            if (!grown) {
+                free_ffi_type_tree(t);
+                free_ffi_arg_types(arg_types, num_args);
+                free_ffi_type_tree(rtype);
+                return viper_panic_code("VFF006", "Out of memory building FFI signature.");
+            }
+            arg_types = grown;
         }
         arg_types[num_args++] = t;
+        saw_arg = true;
+        skip_ffi_sig_ws(&p);
+    }
+    if (!saw_arg && sep > signature) {
+        free_ffi_arg_types(arg_types, num_args);
+        free_ffi_type_tree(rtype);
+        return viper_panic_code("VFF010", "FFI argument list cannot end with ','.");
     }
     
     ffi_cif* cif = malloc(sizeof(ffi_cif));
+    if (!cif) {
+        free_ffi_arg_types(arg_types, num_args);
+        free_ffi_type_tree(rtype);
+        return viper_panic_code("VFF011", "Out of memory preparing FFI call interface.");
+    }
     if (ffi_prep_cif(cif, FFI_DEFAULT_ABI, num_args, rtype, arg_types) != FFI_OK) {
-        return viper_panic("ffi_prep_cif failed.");
+        free(cif);
+        free_ffi_arg_types(arg_types, num_args);
+        free_ffi_type_tree(rtype);
+        return viper_panic_code("VFF012", "ffi_prep_cif failed.");
     }
     
     // Copy signature string for GC to track correctly
     char* sig_copy = malloc(sig_len + 1);
+    if (!sig_copy) {
+        free(cif);
+        free_ffi_arg_types(arg_types, num_args);
+        free_ffi_type_tree(rtype);
+        return viper_panic_code("VFF013", "Out of memory storing FFI signature.");
+    }
     memcpy(sig_copy, signature, sig_len);
     sig_copy[sig_len] = '\0';
     
@@ -1554,13 +1716,13 @@ static Value native_get_fn(int argCount, Value* args) {
 
 static Value native_serve(int argCount, Value* args) {
     if (argCount != 2 || !IS_NUMBER(args[0]) || !IS_OBJ(args[1])) {
-        return viper_panic("serve expects (port: number, response: string|function).");
+        return viper_panic_code("VNT003", "serve expects (port: number, response: string|function).");
     }
     int port = (int)args[0].as.number;
     const char* response_body = (AS_OBJ(args[1])->type == OBJ_STRING) ? AS_STRING(args[1])->chars : "";
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) { perror("socket failed"); exit(1); }
+    if (server_fd < 0) return viper_panic_errno_code("VNT004", "socket failed");
     
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -1571,9 +1733,9 @@ static Value native_serve(int argCount, Value* args) {
     address.sin_port = htons(port);
 
     if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        return viper_panic("bind failed");
+        return viper_panic_errno_code("VNT005", "bind failed");
     }
-    if (listen(server_fd, 3) < 0) return viper_panic("listen failed");
+    if (listen(server_fd, 3) < 0) return viper_panic_errno_code("VNT006", "listen failed");
 
     printf("ViperLang serving on port %d...\n", port);
     
@@ -1615,8 +1777,7 @@ static Value native_serve(int argCount, Value* args) {
 
 static Value native_fetch(int argCount, Value* args) {
     if (argCount != 1 || !is_string_value(args[0])) {
-        printf("Runtime Error: fetch expects a URL string.\n");
-        exit(1);
+        return viper_panic_code("VNT007", "fetch expects a URL string.");
     }
     const char* url = AS_STRING(args[0])->chars;
     char q_url[MAX_NATIVE_TEXT];
@@ -1634,8 +1795,7 @@ static Value native_fetch(int argCount, Value* args) {
 static Value native_write(int argCount, Value* args) {
     if (argCount != 2 || !IS_OBJ(args[0]) || AS_OBJ(args[0])->type != OBJ_STRING ||
         !IS_OBJ(args[1]) || AS_OBJ(args[1])->type != OBJ_STRING) {
-        printf("Runtime Error: write expects (path, content).\n");
-        exit(1);
+        return viper_panic_code("VNT008", "write expects (path, content).");
     }
     const char* path = AS_STRING(args[0])->chars;
     const char* content = AS_STRING(args[1])->chars;
@@ -1650,16 +1810,14 @@ static Value native_write(int argCount, Value* args) {
 
 static Value native_query(int argCount, Value* args) {
     if (argCount != 1 || !is_string_value(args[0])) {
-        printf("Runtime Error: query expects an SQL string.\n");
-        exit(1);
+        return viper_panic_code("VNT009", "query expects an SQL string.");
     }
     return run_sql_capture(AS_STRING(args[0])->chars);
 }
 
 static Value native_env(int argCount, Value* args) {
     if (argCount != 1 || !IS_OBJ(args[0]) || AS_OBJ(args[0])->type != OBJ_STRING) {
-        printf("Runtime Error: env expects a key string.\n");
-        exit(1);
+        return viper_panic_code("VNT010", "env expects a key string.");
     }
     const char* key = AS_STRING(args[0])->chars;
     const char* val = getenv(key);
@@ -1794,11 +1952,7 @@ static Value native_os_cron(int argCount, Value* args) {
 
     int64_t interval_ms = 0;
     if (!parse_cron_interval_millis(AS_STRING(args[0])->chars, &interval_ms)) {
-        if (!g_os_features_notice_printed) {
-            fprintf(stderr, "viper: os.cron supports cron first field ('*' or '*/N') and '@every 10s|5m|1h'.\n");
-            g_os_features_notice_printed = true;
-        }
-        return (Value){VAL_BOOL, {.boolean = false}};
+        return viper_panic_code("VNT011", "os.cron supports cron first field ('*' or '*/N') and '@every 10s|5m|1h'.");
     }
 
     int max_runs = -1;
@@ -3319,13 +3473,13 @@ static Value native_web_res_send(int argCount, Value* args) {
 
 static Value native_web_serve(int argCount, Value* args) {
     if (argCount < 1 || !IS_NUMBER(args[0])) {
-        return viper_panic("web.serve expects (port, handler?).");
+        return viper_panic_code("VNT012", "web.serve expects (port, handler?).");
     }
     int port = (int)args[0].as.number;
     Value fallback = (argCount >= 2) ? args[1] : string_value("<h1>Viper Web</h1>");
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) { perror("socket failed"); exit(1); }
+    if (server_fd < 0) return viper_panic_errno_code("VNT013", "socket failed");
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
@@ -3336,10 +3490,10 @@ static Value native_web_serve(int argCount, Value* args) {
     address.sin_port = htons(port);
 
     if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        return viper_panic("bind failed");
+        return viper_panic_errno_code("VNT014", "bind failed");
     }
     if (listen(server_fd, 16) < 0) {
-        return viper_panic("listen failed");
+        return viper_panic_errno_code("VNT015", "listen failed");
     }
 
     printf("ViperLang web server listening on port %d...\n", port);
@@ -3953,11 +4107,7 @@ static const char* guess_image_mime(const char* path) {
 static Value native_ai_ask(int argCount, Value* args) {
     if (argCount != 1 || !is_string_value(args[0])) return (Value){VAL_NIL, {.number = 0}};
     if (!ai_provider_is_openai()) {
-        if (!g_ai_features_notice_printed) {
-            fprintf(stderr, "viper: ai.ask currently supports provider=openai.\n");
-            g_ai_features_notice_printed = true;
-        }
-        return (Value){VAL_NIL, {.number = 0}};
+        return viper_panic_code("VAI001", "ai.ask currently supports provider=openai.");
     }
 
     char prompt_json[8192];

@@ -1,0 +1,5 @@
+use "@std/os" as os
+
+pub fn read_user(key) -> str {
+    ret os.get_env(key)
+}

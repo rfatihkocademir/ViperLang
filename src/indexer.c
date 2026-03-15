@@ -69,6 +69,15 @@ typedef struct {
     char** fields;
 } IndexStruct;
 
+static void indexer_error(const char* code, const char* fmt, ...) {
+    va_list args;
+    fprintf(stderr, "Indexer Error [%s]: ", code);
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fprintf(stderr, "\n");
+}
+
 typedef struct {
     char path[MAX_PATH_LEN];
 
@@ -393,6 +402,18 @@ static bool string_list_add_token(StringList* list, Token token) {
     return string_list_add_unique(list, name);
 }
 
+static bool string_list_add_param(StringList* list, Token name, Token type_annot) {
+    if (!list || name.length <= 0) return false;
+    if (type_annot.length <= 0) return string_list_add_token(list, name);
+
+    char text[MAX_NAME_LEN * 2];
+    int written = snprintf(text, sizeof(text), "%.*s:%.*s",
+                           name.length, name.start,
+                           type_annot.length, type_annot.start);
+    if (written < 0 || (size_t)written >= sizeof(text)) return false;
+    return string_list_add_unique(list, text);
+}
+
 static void free_string_list(StringList* list) {
     if (!list) return;
     for (int i = 0; i < list->count; i++) free(list->items[i]);
@@ -692,9 +713,45 @@ static bool resolve_entry_path(const char* path, char* out, size_t out_size) {
     return join_path(cwd, path, out, out_size);
 }
 
+static bool resolve_std_module_path(const char* raw_import_path, char* out, size_t out_size) {
+    if (strncmp(raw_import_path, "@std/", 5) != 0) return false;
+
+    const char* subpath = raw_import_path + 5;
+    char filename[MAX_PATH_LEN];
+    int written = snprintf(filename, sizeof(filename), "%s.vp", subpath);
+    if (written < 0 || (size_t)written >= sizeof(filename)) return false;
+
+    const char* env_std = getenv("VIPER_STD_PATH");
+    if (env_std && env_std[0] != '\0' &&
+        join_path(env_std, filename, out, out_size) &&
+        module_source_exists(out)) {
+        return true;
+    }
+
+    char dev_std_dir[MAX_PATH_LEN];
+    if (join_path(index_project_root, "lib/std", dev_std_dir, sizeof(dev_std_dir)) &&
+        join_path(dev_std_dir, filename, out, out_size) &&
+        module_source_exists(out)) {
+        return true;
+    }
+
+    char sys_path[MAX_PATH_LEN];
+    if (join_path("/usr/local/lib/viper/std", filename, sys_path, sizeof(sys_path)) &&
+        module_source_exists(sys_path)) {
+        copy_text(out, out_size, sys_path);
+        return true;
+    }
+
+    return false;
+}
+
 static bool resolve_module_path(const char* current_module_path, const char* raw_import_path,
                                 char* out, size_t out_size) {
     if (!raw_import_path || raw_import_path[0] == '\0') return false;
+
+    if (strncmp(raw_import_path, "@std/", 5) == 0) {
+        return resolve_std_module_path(raw_import_path, out, out_size);
+    }
 
     if (is_package_import(raw_import_path)) {
         if (strstr(raw_import_path, "..") != NULL) return false;
@@ -763,20 +820,20 @@ static char* read_file(const char* path) {
             char* vbc_source = read_source_cache_file(vbc_path);
             if (vbc_source) return vbc_source;
         }
-        fprintf(stderr, "Indexer Error: Could not open file \"%s\".\n", path);
+        indexer_error("VIX001", "Could not open file \"%s\".", path);
         return NULL;
     }
 
     if (fseek(file, 0L, SEEK_END) != 0) {
         fclose(file);
-        fprintf(stderr, "Indexer Error: Could not seek file \"%s\".\n", path);
+        indexer_error("VIX002", "Could not seek file \"%s\".", path);
         return NULL;
     }
 
     long size = ftell(file);
     if (size < 0) {
         fclose(file);
-        fprintf(stderr, "Indexer Error: Could not get file size \"%s\".\n", path);
+        indexer_error("VIX003", "Could not get file size \"%s\".", path);
         return NULL;
     }
 
@@ -785,7 +842,7 @@ static char* read_file(const char* path) {
     char* buffer = (char*)malloc((size_t)size + 1);
     if (!buffer) {
         fclose(file);
-        fprintf(stderr, "Indexer Error: Not enough memory for \"%s\".\n", path);
+        indexer_error("VIX004", "Not enough memory for \"%s\".", path);
         return NULL;
     }
 
@@ -794,7 +851,7 @@ static char* read_file(const char* path) {
 
     if (bytes_read < (size_t)size) {
         free(buffer);
-        fprintf(stderr, "Indexer Error: Could not read file \"%s\".\n", path);
+        indexer_error("VIX005", "Could not read file \"%s\".", path);
         return NULL;
     }
 
@@ -1021,7 +1078,11 @@ static IndexFn* module_add_fn(ModuleIndex* module, AstNode* fn_decl) {
         token_to_text(fn_decl->data.func_decl.return_type, out->return_type, sizeof(out->return_type));
     }
     for (int i = 0; i < fn_decl->data.func_decl.param_count; i++) {
-        if (!string_list_add_token(&out->params, fn_decl->data.func_decl.params[i])) return NULL;
+        Token type_annot = {0};
+        if (fn_decl->data.func_decl.param_types) {
+            type_annot = fn_decl->data.func_decl.param_types[i];
+        }
+        if (!string_list_add_param(&out->params, fn_decl->data.func_decl.params[i], type_annot)) return NULL;
     }
     for (int i = 0; i < fn_decl->data.func_decl.effect_count; i++) {
         if (!string_list_add_token(&out->declared_effects, fn_decl->data.func_decl.effects[i])) return NULL;
@@ -1434,7 +1495,7 @@ static bool index_module_ex(ProjectIndex* project, const char* module_path,
     ModuleIndex* module = project_add_module(project, module_path);
     if (!module) {
         free(source);
-        fprintf(stderr, "Indexer Error: Out of memory while adding module.\n");
+        indexer_error("VIX006", "Out of memory while adding module.");
         return false;
     }
     int module_index = project->module_count - 1;
@@ -1442,7 +1503,7 @@ static bool index_module_ex(ProjectIndex* project, const char* module_path,
     AstNode* ast = parse(source);
     if (!ast) {
         free(source);
-        fprintf(stderr, "Indexer Error: Parse failed for \"%s\".\n", module_path);
+        indexer_error("VIX007", "Parse failed for \"%s\".", module_path);
         return false;
     }
 
@@ -1487,7 +1548,7 @@ static bool index_module_ex(ProjectIndex* project, const char* module_path,
 
                 if (!resolve_module_path(module_path, raw_path, resolved_path, sizeof(resolved_path))) {
                     free(source);
-                    fprintf(stderr, "Indexer Error: Could not resolve import in \"%s\".\n", module_path);
+                    indexer_error("VIX008", "Could not resolve import in \"%s\".", module_path);
                     return false;
                 }
 
@@ -1570,7 +1631,7 @@ static bool build_focus_slice_ex(const ProjectIndex* project, const char* focus_
                                  FocusSlice* slice, bool allow_missing) {
     if (!project || !focus_symbol || focus_symbol[0] == '\0' || !slice) return false;
     if (!init_focus_slice(slice, project)) {
-        fprintf(stderr, "Indexer Error: Out of memory while building focus slice.\n");
+        indexer_error("VIX009", "Out of memory while building focus slice.");
         return false;
     }
 
@@ -1598,7 +1659,7 @@ static bool build_focus_slice_ex(const ProjectIndex* project, const char* focus_
 
     if (slice->seed_count == 0) {
         if (allow_missing) return true;
-        fprintf(stderr, "Indexer Error: Focus symbol \"%s\" not found.\n", focus_symbol);
+        indexer_error("VIX010", "Focus symbol \"%s\" not found.", focus_symbol);
         free_focus_slice(slice);
         return false;
     }
@@ -1654,7 +1715,7 @@ static bool build_focus_slice(const ProjectIndex* project, const char* focus_sym
 static bool build_impact_slice(const ProjectIndex* project, const char* focus_symbol, FocusSlice* slice) {
     if (!project || !slice) return false;
     if (!init_focus_slice(slice, project)) {
-        fprintf(stderr, "Indexer Error: Out of memory while building impact slice.\n");
+        indexer_error("VIX011", "Out of memory while building impact slice.");
         return false;
     }
 
@@ -1664,7 +1725,7 @@ static bool build_impact_slice(const ProjectIndex* project, const char* focus_sy
     memset(&seed_targets, 0, sizeof(seed_targets));
 
     if (!init_focus_slice(&active_targets, project) || !init_focus_slice(&seed_targets, project)) {
-        fprintf(stderr, "Indexer Error: Out of memory while building impact slice.\n");
+        indexer_error("VIX011", "Out of memory while building impact slice.");
         free_focus_slice(slice);
         free_focus_slice(&active_targets);
         free_focus_slice(&seed_targets);
@@ -1827,21 +1888,21 @@ static bool load_project_state_manifest(const char* state_path, ProjectStateMani
 
     FILE* file = fopen(state_path, "r");
     if (!file) {
-        fprintf(stderr, "Indexer Error: Could not open state file \"%s\".\n", state_path);
+        indexer_error("VIX012", "Could not open state file \"%s\".", state_path);
         return false;
     }
 
     char line[4096];
     if (!fgets(line, sizeof(line), file)) {
         fclose(file);
-        fprintf(stderr, "Indexer Error: Empty state file \"%s\".\n", state_path);
+        indexer_error("VIX013", "Empty state file \"%s\".", state_path);
         return false;
     }
     size_t n = strlen(line);
     while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
     if (strcmp(line, "PSTATEv1") != 0) {
         fclose(file);
-        fprintf(stderr, "Indexer Error: Unsupported state file format \"%s\".\n", state_path);
+        indexer_error("VIX014", "Unsupported state file format \"%s\".", state_path);
         return false;
     }
 
@@ -1868,7 +1929,7 @@ static bool load_project_state_manifest(const char* state_path, ProjectStateMani
             if (!marker) {
                 fclose(file);
                 free_project_state_manifest(manifest);
-                fprintf(stderr, "Indexer Error: Malformed tracked file entry in \"%s\".\n", state_path);
+                indexer_error("VIX015", "Malformed tracked file entry in \"%s\".", state_path);
                 return false;
             }
             *marker = '\0';
@@ -1878,7 +1939,7 @@ static bool load_project_state_manifest(const char* state_path, ProjectStateMani
                 !string_list_append(&manifest->tracked_hashes, hash)) {
                 fclose(file);
                 free_project_state_manifest(manifest);
-                fprintf(stderr, "Indexer Error: Out of memory while reading state file.\n");
+                indexer_error("VIX016", "Out of memory while reading state file.");
                 return false;
             }
             continue;
@@ -1889,7 +1950,7 @@ static bool load_project_state_manifest(const char* state_path, ProjectStateMani
             if (!marker) {
                 fclose(file);
                 free_project_state_manifest(manifest);
-                fprintf(stderr, "Indexer Error: Malformed tracked test entry in \"%s\".\n", state_path);
+                indexer_error("VIX017", "Malformed tracked test entry in \"%s\".", state_path);
                 return false;
             }
             *marker = '\0';
@@ -1899,7 +1960,7 @@ static bool load_project_state_manifest(const char* state_path, ProjectStateMani
                 !string_list_append(&manifest->tracked_test_hashes, hash)) {
                 fclose(file);
                 free_project_state_manifest(manifest);
-                fprintf(stderr, "Indexer Error: Out of memory while reading state file.\n");
+                indexer_error("VIX016", "Out of memory while reading state file.");
                 return false;
             }
             continue;
@@ -1927,17 +1988,17 @@ static bool load_project_state_manifest(const char* state_path, ProjectStateMani
     fclose(file);
     if (manifest->root[0] == '\0' || manifest->entry[0] == '\0') {
         free_project_state_manifest(manifest);
-        fprintf(stderr, "Indexer Error: Incomplete state file \"%s\".\n", state_path);
+        indexer_error("VIX018", "Incomplete state file \"%s\".", state_path);
         return false;
     }
     if (manifest->tracked_paths.count != manifest->tracked_hashes.count) {
         free_project_state_manifest(manifest);
-        fprintf(stderr, "Indexer Error: Corrupt tracked file list in \"%s\".\n", state_path);
+        indexer_error("VIX019", "Corrupt tracked file list in \"%s\".", state_path);
         return false;
     }
     if (manifest->tracked_test_paths.count != manifest->tracked_test_hashes.count) {
         free_project_state_manifest(manifest);
-        fprintf(stderr, "Indexer Error: Corrupt tracked test list in \"%s\".\n", state_path);
+        indexer_error("VIX020", "Corrupt tracked test list in \"%s\".", state_path);
         return false;
     }
     return true;
@@ -6333,12 +6394,12 @@ static void emit_context_pack_text(FILE* out, const ProjectIndex* project, const
 static bool build_project_index(const char* entry_file, ProjectIndex* project,
                                 char* entry_path, size_t entry_path_size) {
     if (!resolve_entry_path(entry_file, entry_path, entry_path_size)) {
-        fprintf(stderr, "Indexer Error: Could not resolve entry file path.\n");
+        indexer_error("VIX021", "Could not resolve entry file path.");
         return false;
     }
 
     if (!find_project_root_from_entry(entry_path, index_project_root, sizeof(index_project_root))) {
-        fprintf(stderr, "Indexer Error: Could not resolve project root.\n");
+        indexer_error("VIX022", "Could not resolve project root.");
         return false;
     }
 
@@ -6388,7 +6449,7 @@ static FILE* open_index_output(const char* out_path) {
     if (!out_path || out_path[0] == '\0') return stdout;
     FILE* out = fopen(out_path, "w");
     if (!out) {
-        fprintf(stderr, "Indexer Error: Could not open output file \"%s\".\n", out_path);
+        indexer_error("VIX023", "Could not open output file \"%s\".", out_path);
         return NULL;
     }
     return out;
@@ -6419,7 +6480,7 @@ bool resume_project_state(const char* state_path, const char* out_path,
         free_state_symbol_rows(&all_rows);
         free_state_symbol_rows(&selected_rows);
         free_project_state_manifest(&manifest);
-        fprintf(stderr, "Indexer Error: Could not resume from state file \"%s\".\n", state_path);
+        indexer_error("VIX024", "Could not resume from state file \"%s\".", state_path);
         return false;
     }
     if (stale_count > 0 &&
@@ -6430,7 +6491,7 @@ bool resume_project_state(const char* state_path, const char* out_path,
         free_state_symbol_rows(&all_rows);
         free_state_symbol_rows(&selected_rows);
         free_project_state_manifest(&manifest);
-        fprintf(stderr, "Indexer Error: Could not map stale modules in state file \"%s\".\n", state_path);
+        indexer_error("VIX025", "Could not map stale modules in state file \"%s\".", state_path);
         return false;
     }
 
@@ -6442,7 +6503,7 @@ bool resume_project_state(const char* state_path, const char* out_path,
             free_state_symbol_rows(&all_rows);
             free_state_symbol_rows(&selected_rows);
             free_project_state_manifest(&manifest);
-            fprintf(stderr, "Indexer Error: Could not load symbol ledger for \"%s\".\n", state_path);
+            indexer_error("VIX026", "Could not load symbol ledger for \"%s\".", state_path);
             return false;
         }
     }
@@ -6454,7 +6515,7 @@ bool resume_project_state(const char* state_path, const char* out_path,
             free_state_symbol_rows(&all_rows);
             free_state_symbol_rows(&selected_rows);
             free_project_state_manifest(&manifest);
-            fprintf(stderr, "Indexer Error: Could not focus resume state on \"%s\".\n", focus_symbol);
+            indexer_error("VIX027", "Could not focus resume state on \"%s\".", focus_symbol);
             return false;
         }
     } else if (brief_output) {
@@ -6516,7 +6577,7 @@ bool resume_project_state(const char* state_path, const char* out_path,
         free_state_symbol_rows(&all_rows);
         free_state_symbol_rows(&selected_rows);
         free_project_state_manifest(&manifest);
-        fprintf(stderr, "Indexer Error: Could not emit state verification summary for \"%s\".\n", state_path);
+        indexer_error("VIX028", "Could not emit state verification summary for \"%s\".", state_path);
         return false;
     }
     if (stale_count > 0) {
@@ -6547,7 +6608,7 @@ bool resume_project_state(const char* state_path, const char* out_path,
             free_state_symbol_rows(&all_rows);
             free_state_symbol_rows(&selected_rows);
             free_project_state_manifest(&manifest);
-            fprintf(stderr, "Indexer Error: Could not emit stale symbol map for \"%s\".\n", state_path);
+            indexer_error("VIX029", "Could not emit stale symbol map for \"%s\".", state_path);
             return false;
         }
     }
@@ -6562,7 +6623,7 @@ bool resume_project_state(const char* state_path, const char* out_path,
             free_state_symbol_rows(&all_rows);
             free_state_symbol_rows(&selected_rows);
             free_project_state_manifest(&manifest);
-            fprintf(stderr, "Indexer Error: Missing embedded symbol ledger in state file \"%s\".\n", state_path);
+            indexer_error("VIX030", "Missing embedded symbol ledger in state file \"%s\".", state_path);
             return false;
         }
     } else {
@@ -6575,7 +6636,7 @@ bool resume_project_state(const char* state_path, const char* out_path,
             free_state_symbol_rows(&all_rows);
             free_state_symbol_rows(&selected_rows);
             free_project_state_manifest(&manifest);
-            fprintf(stderr, "Indexer Error: Could not emit brief state resume for \"%s\".\n", state_path);
+            indexer_error("VIX031", "Could not emit brief state resume for \"%s\".", state_path);
             return false;
         }
     }
@@ -6588,7 +6649,7 @@ bool resume_project_state(const char* state_path, const char* out_path,
         free_state_symbol_rows(&all_rows);
         free_state_symbol_rows(&selected_rows);
         free_project_state_manifest(&manifest);
-        fprintf(stderr, "Indexer Error: Could not emit linked tests for \"%s\".\n", state_path);
+        indexer_error("VIX032", "Could not emit linked tests for \"%s\".", state_path);
         return false;
     }
 
@@ -6609,7 +6670,7 @@ bool query_project_state(const char* state_path, const char* out_path,
     if ((!name_filter || name_filter[0] == '\0') &&
         (!effect_filter || effect_filter[0] == '\0') &&
         (!call_filter || call_filter[0] == '\0')) {
-        fprintf(stderr, "Indexer Error: state query requires at least one filter.\n");
+        indexer_error("VIX033", "State query requires at least one filter.");
         return false;
     }
 
@@ -6637,7 +6698,7 @@ bool query_project_state(const char* state_path, const char* out_path,
         free_state_symbol_rows(&all_rows);
         free_state_symbol_rows(&selected_rows);
         free_project_state_manifest(&manifest);
-        fprintf(stderr, "Indexer Error: Could not query state file \"%s\".\n", state_path);
+        indexer_error("VIX034", "Could not query state file \"%s\".", state_path);
         return false;
     }
     if (stale_count > 0 &&
@@ -6648,7 +6709,7 @@ bool query_project_state(const char* state_path, const char* out_path,
         free_state_symbol_rows(&all_rows);
         free_state_symbol_rows(&selected_rows);
         free_project_state_manifest(&manifest);
-        fprintf(stderr, "Indexer Error: Could not map stale modules in state file \"%s\".\n", state_path);
+        indexer_error("VIX035", "Could not map stale modules in state file \"%s\".", state_path);
         return false;
     }
     if (!load_state_symbol_rows_filtered(state_path, NULL, &all_rows) ||
@@ -6661,7 +6722,7 @@ bool query_project_state(const char* state_path, const char* out_path,
         free_state_symbol_rows(&all_rows);
         free_state_symbol_rows(&selected_rows);
         free_project_state_manifest(&manifest);
-        fprintf(stderr, "Indexer Error: Could not query symbol ledger in \"%s\".\n", state_path);
+        indexer_error("VIX036", "Could not query symbol ledger in \"%s\".", state_path);
         return false;
     }
 
@@ -6720,7 +6781,7 @@ bool query_project_state(const char* state_path, const char* out_path,
         free_state_symbol_rows(&all_rows);
         free_state_symbol_rows(&selected_rows);
         free_project_state_manifest(&manifest);
-        fprintf(stderr, "Indexer Error: Could not emit state verification summary for \"%s\".\n", state_path);
+        indexer_error("VIX028", "Could not emit state verification summary for \"%s\".", state_path);
         return false;
     }
     if (stale_count > 0) {
@@ -6736,7 +6797,7 @@ bool query_project_state(const char* state_path, const char* out_path,
             free_state_symbol_rows(&all_rows);
             free_state_symbol_rows(&selected_rows);
             free_project_state_manifest(&manifest);
-            fprintf(stderr, "Indexer Error: Could not emit stale module map for \"%s\".\n", state_path);
+            indexer_error("VIX037", "Could not emit stale module map for \"%s\".", state_path);
             return false;
         }
         fprintf(out, "stale_symbols:\n");
@@ -6755,7 +6816,7 @@ bool query_project_state(const char* state_path, const char* out_path,
         free_state_symbol_rows(&all_rows);
         free_state_symbol_rows(&selected_rows);
         free_project_state_manifest(&manifest);
-        fprintf(stderr, "Indexer Error: Could not emit query paths for \"%s\".\n", state_path);
+        indexer_error("VIX038", "Could not emit query paths for \"%s\".", state_path);
         return false;
     }
     if ((include_impact || include_dependencies) &&
@@ -6767,7 +6828,7 @@ bool query_project_state(const char* state_path, const char* out_path,
         free_state_symbol_rows(&all_rows);
         free_state_symbol_rows(&selected_rows);
         free_project_state_manifest(&manifest);
-        fprintf(stderr, "Indexer Error: Could not emit risk ranking for \"%s\".\n", state_path);
+        indexer_error("VIX039", "Could not emit risk ranking for \"%s\".", state_path);
         return false;
     }
     if (!brief_output) {
@@ -6779,7 +6840,7 @@ bool query_project_state(const char* state_path, const char* out_path,
             free_state_symbol_rows(&all_rows);
             free_state_symbol_rows(&selected_rows);
             free_project_state_manifest(&manifest);
-            fprintf(stderr, "Indexer Error: Could not emit state query for \"%s\".\n", state_path);
+            indexer_error("VIX040", "Could not emit state query for \"%s\".", state_path);
             return false;
         }
     } else {
@@ -6792,7 +6853,7 @@ bool query_project_state(const char* state_path, const char* out_path,
             free_state_symbol_rows(&all_rows);
             free_state_symbol_rows(&selected_rows);
             free_project_state_manifest(&manifest);
-            fprintf(stderr, "Indexer Error: Could not emit brief state query for \"%s\".\n", state_path);
+            indexer_error("VIX041", "Could not emit brief state query for \"%s\".", state_path);
             return false;
         }
     }
@@ -6804,7 +6865,7 @@ bool query_project_state(const char* state_path, const char* out_path,
         free_state_symbol_rows(&all_rows);
         free_state_symbol_rows(&selected_rows);
         free_project_state_manifest(&manifest);
-        fprintf(stderr, "Indexer Error: Could not emit linked tests for \"%s\".\n", state_path);
+        indexer_error("VIX032", "Could not emit linked tests for \"%s\".", state_path);
         return false;
     }
 
@@ -6826,7 +6887,7 @@ bool bench_project_state(const char* state_path, const char* out_path,
                       (effect_filter && effect_filter[0] != '\0') ||
                       (call_filter && call_filter[0] != '\0');
     if (!query_mode && include_dependencies) {
-        fprintf(stderr, "Indexer Error: state benchmark dependencies require a query filter.\n");
+        indexer_error("VIX042", "State benchmark dependencies require a query filter.");
         return false;
     }
 
@@ -6848,7 +6909,7 @@ bool bench_project_state(const char* state_path, const char* out_path,
         free_state_symbol_rows(&all_rows);
         free_state_symbol_rows(&selected_rows);
         free_project_state_manifest(&manifest);
-        fprintf(stderr, "Indexer Error: Could not load state benchmark inputs for \"%s\".\n", state_path);
+        indexer_error("VIX043", "Could not load state benchmark inputs for \"%s\".", state_path);
         return false;
     }
 
@@ -6868,7 +6929,7 @@ bool bench_project_state(const char* state_path, const char* out_path,
         free_state_symbol_rows(&all_rows);
         free_state_symbol_rows(&selected_rows);
         free_project_state_manifest(&manifest);
-        fprintf(stderr, "Indexer Error: Could not select state benchmark slice for \"%s\".\n", state_path);
+        indexer_error("VIX044", "Could not select state benchmark slice for \"%s\".", state_path);
         return false;
     }
 
@@ -6879,7 +6940,7 @@ bool bench_project_state(const char* state_path, const char* out_path,
         free_state_symbol_rows(&all_rows);
         free_state_symbol_rows(&selected_rows);
         free_project_state_manifest(&manifest);
-        fprintf(stderr, "Indexer Error: Could not compute state benchmark metrics for \"%s\".\n", state_path);
+        indexer_error("VIX045", "Could not compute state benchmark metrics for \"%s\".", state_path);
         return false;
     }
 
@@ -6966,7 +7027,7 @@ bool verify_project_state(const char* state_path, const char* out_path) {
         free_string_list(&stale_module_refs);
         free_string_list(&stale_module_paths);
         free_project_state_manifest(&manifest);
-        fprintf(stderr, "Indexer Error: Could not verify state file \"%s\".\n", state_path);
+        indexer_error("VIX046", "Could not verify state file \"%s\".", state_path);
         return false;
     }
     if (stale_count > 0 &&
@@ -6975,7 +7036,7 @@ bool verify_project_state(const char* state_path, const char* out_path) {
         free_string_list(&stale_module_refs);
         free_string_list(&stale_module_paths);
         free_project_state_manifest(&manifest);
-        fprintf(stderr, "Indexer Error: Could not map stale modules in state file \"%s\".\n", state_path);
+        indexer_error("VIX047", "Could not map stale modules in state file \"%s\".", state_path);
         return false;
     }
 
@@ -7018,7 +7079,7 @@ bool verify_project_state(const char* state_path, const char* out_path) {
         free_string_list(&stale_module_refs);
         free_string_list(&stale_module_paths);
         free_project_state_manifest(&manifest);
-        fprintf(stderr, "Indexer Error: Could not emit state verification summary for \"%s\".\n", state_path);
+        indexer_error("VIX028", "Could not emit state verification summary for \"%s\".", state_path);
         return false;
     }
     if (stale_count > 0) {
@@ -7033,7 +7094,7 @@ bool verify_project_state(const char* state_path, const char* out_path) {
             free_string_list(&stale_module_refs);
             free_string_list(&stale_module_paths);
             free_project_state_manifest(&manifest);
-            fprintf(stderr, "Indexer Error: Could not emit stale symbol map for \"%s\".\n", state_path);
+            indexer_error("VIX029", "Could not emit stale symbol map for \"%s\".", state_path);
             return false;
         }
     }
@@ -7070,7 +7131,7 @@ bool refresh_project_state(const char* state_path, const char* out_path) {
         free_string_list(&refreshed_module_refs);
         free_string_list(&refreshed_module_paths);
         free_project_state_manifest(&manifest);
-        fprintf(stderr, "Indexer Error: Could not refresh state file \"%s\".\n", state_path);
+        indexer_error("VIX048", "Could not refresh state file \"%s\".", state_path);
         return false;
     }
     if (stale_count > 0 &&
@@ -7081,7 +7142,7 @@ bool refresh_project_state(const char* state_path, const char* out_path) {
         free_string_list(&refreshed_module_refs);
         free_string_list(&refreshed_module_paths);
         free_project_state_manifest(&manifest);
-        fprintf(stderr, "Indexer Error: Could not map stale modules in state file \"%s\".\n", state_path);
+        indexer_error("VIX047", "Could not map stale modules in state file \"%s\".", state_path);
         return false;
     }
     if (!load_state_proof_summary(state_path, &existing_proof)) {
@@ -7091,7 +7152,7 @@ bool refresh_project_state(const char* state_path, const char* out_path) {
         free_string_list(&refreshed_module_refs);
         free_string_list(&refreshed_module_paths);
         free_project_state_manifest(&manifest);
-        fprintf(stderr, "Indexer Error: Could not load state proof for \"%s\".\n", state_path);
+        indexer_error("VIX049", "Could not load state proof for \"%s\".", state_path);
         return false;
     }
 
@@ -7137,7 +7198,7 @@ bool refresh_project_state(const char* state_path, const char* out_path) {
             free_string_list(&refreshed_module_refs);
             free_string_list(&refreshed_module_paths);
             free_project_state_manifest(&manifest);
-            fprintf(stderr, "Indexer Error: Could not allocate temp state path for \"%s\".\n", state_path);
+            indexer_error("VIX050", "Could not allocate temp state path for \"%s\".", state_path);
             return false;
         }
         unlink(temp_state_path);
@@ -7170,7 +7231,7 @@ bool refresh_project_state(const char* state_path, const char* out_path) {
             free_string_list(&tracked_module_paths);
             free_project(&refreshed_project);
             free_project_state_manifest(&manifest);
-            fprintf(stderr, "Indexer Error: Could not reload refreshed state for \"%s\".\n", state_path);
+            indexer_error("VIX051", "Could not reload refreshed state for \"%s\".", state_path);
             return false;
         }
         semantic_changed = manifest.semantic_item_count != refreshed_manifest.semantic_item_count ||
@@ -7190,7 +7251,7 @@ bool refresh_project_state(const char* state_path, const char* out_path) {
             free_project(&refreshed_project);
             free_project_state_manifest(&refreshed_manifest);
             free_project_state_manifest(&manifest);
-            fprintf(stderr, "Indexer Error: Could not map refreshed modules in state file \"%s\".\n", state_path);
+            indexer_error("VIX052", "Could not map refreshed modules in state file \"%s\".", state_path);
             return false;
         }
 
@@ -7212,7 +7273,7 @@ bool refresh_project_state(const char* state_path, const char* out_path) {
                 free_project(&refreshed_project);
                 free_project_state_manifest(&refreshed_manifest);
                 free_project_state_manifest(&manifest);
-                fprintf(stderr, "Indexer Error: Could not allocate state proof path for \"%s\".\n", state_path);
+                indexer_error("VIX053", "Could not allocate state proof path for \"%s\".", state_path);
                 return false;
             }
             unlink(temp_proof_path);
@@ -7230,7 +7291,7 @@ bool refresh_project_state(const char* state_path, const char* out_path) {
                 free_project(&refreshed_project);
                 free_project_state_manifest(&refreshed_manifest);
                 free_project_state_manifest(&manifest);
-                fprintf(stderr, "Indexer Error: Could not refresh state proof for \"%s\".\n", state_path);
+                indexer_error("VIX054", "Could not refresh state proof for \"%s\".", state_path);
                 return false;
             }
             proof_refreshed = true;
@@ -7277,7 +7338,7 @@ bool refresh_project_state(const char* state_path, const char* out_path) {
         free_project(&refreshed_project);
         free_project_state_manifest(&refreshed_manifest);
         free_project_state_manifest(&manifest);
-        fprintf(stderr, "Indexer Error: Could not emit state verification summary for \"%s\".\n", state_path);
+        indexer_error("VIX028", "Could not emit state verification summary for \"%s\".", state_path);
         return false;
     }
     fprintf(out, "proof: %s\n",
@@ -7305,7 +7366,7 @@ bool refresh_project_state(const char* state_path, const char* out_path) {
                 free_string_list(&refreshed_module_paths);
                 free_project_state_manifest(&refreshed_manifest);
                 free_project_state_manifest(&manifest);
-                fprintf(stderr, "Indexer Error: Could not emit refresh patch for \"%s\".\n", state_path);
+                indexer_error("VIX055", "Could not emit refresh patch for \"%s\".", state_path);
                 return false;
             }
         }
@@ -7327,7 +7388,7 @@ bool refresh_project_state(const char* state_path, const char* out_path) {
             free_project(&refreshed_project);
             free_project_state_manifest(&refreshed_manifest);
             free_project_state_manifest(&manifest);
-            fprintf(stderr, "Indexer Error: Could not replace state file \"%s\".\n", state_path);
+            indexer_error("VIX056", "Could not replace state file \"%s\".", state_path);
             return false;
         }
         if (proof_refreshed && rename(temp_proof_path, final_proof_path) != 0) {
@@ -7342,7 +7403,7 @@ bool refresh_project_state(const char* state_path, const char* out_path) {
             free_project(&refreshed_project);
             free_project_state_manifest(&refreshed_manifest);
             free_project_state_manifest(&manifest);
-            fprintf(stderr, "Indexer Error: Could not replace state proof file \"%s\".\n", final_proof_path);
+            indexer_error("VIX057", "Could not replace state proof file \"%s\".", final_proof_path);
             return false;
         }
     }
@@ -7501,7 +7562,7 @@ bool emit_project_state(const char* entry_file, const char* out_path,
 
 bool emit_state_plan(const char* before_state, const char* after_state, const char* out_path) {
     if (!before_state || !after_state) {
-        fprintf(stderr, "Indexer Error: state plan requires before and after state files.\n");
+        indexer_error("VIX058", "State plan requires before and after state files.");
         return false;
     }
 
@@ -7531,7 +7592,7 @@ bool emit_state_plan(const char* before_state, const char* after_state, const ch
         free_semantic_items(&after_items);
         free_state_symbol_rows(&before_rows);
         free_state_symbol_rows(&after_rows);
-        fprintf(stderr, "Indexer Error: Could not load state plan inputs.\n");
+        indexer_error("VIX059", "Could not load state plan inputs.");
         return false;
     }
 
@@ -7543,7 +7604,7 @@ bool emit_state_plan(const char* before_state, const char* after_state, const ch
         free_semantic_items(&after_items);
         free_state_symbol_rows(&before_rows);
         free_state_symbol_rows(&after_rows);
-        fprintf(stderr, "Indexer Error: state plan requires matching focus and impact settings.\n");
+        indexer_error("VIX060", "State plan requires matching focus and impact settings.");
         return false;
     }
 
@@ -7703,7 +7764,7 @@ static bool write_state_linked_proof(const char* before_state, const char* after
 
 bool run_state_plan(const char* before_state, const char* after_state, const char* out_path) {
     if (!before_state || !after_state) {
-        fprintf(stderr, "Indexer Error: state test run requires before and after state files.\n");
+        indexer_error("VIX061", "State test run requires before and after state files.");
         return false;
     }
 
@@ -7739,7 +7800,7 @@ bool run_state_plan(const char* before_state, const char* after_state, const cha
         free_state_symbol_rows(&before_rows);
         free_state_symbol_rows(&after_rows);
         free_state_plan_test_candidates(&candidates);
-        fprintf(stderr, "Indexer Error: Could not build state test run inputs.\n");
+        indexer_error("VIX062", "Could not build state test run inputs.");
         return false;
     }
 
@@ -7752,7 +7813,7 @@ bool run_state_plan(const char* before_state, const char* after_state, const cha
         free_state_symbol_rows(&before_rows);
         free_state_symbol_rows(&after_rows);
         free_state_plan_test_candidates(&candidates);
-        fprintf(stderr, "Indexer Error: state test run requires matching focus and impact settings.\n");
+        indexer_error("VIX063", "State test run requires matching focus and impact settings.");
         return false;
     }
 
@@ -7767,7 +7828,7 @@ bool run_state_plan(const char* before_state, const char* after_state, const cha
         free_state_symbol_rows(&before_rows);
         free_state_symbol_rows(&after_rows);
         free_state_plan_test_candidates(&candidates);
-        fprintf(stderr, "Indexer Error: Could not prepare state test runner.\n");
+        indexer_error("VIX064", "Could not prepare state test runner.");
         return false;
     }
 
@@ -7801,7 +7862,7 @@ bool run_state_plan(const char* before_state, const char* after_state, const cha
 bool emit_semantic_diff(const char* before_entry, const char* after_entry, const char* out_path,
                         const char* focus_symbol, bool include_impact) {
     if (!before_entry || !after_entry || !focus_symbol || focus_symbol[0] == '\0') {
-        fprintf(stderr, "Indexer Error: semantic diff requires before, after, and focus symbol.\n");
+        indexer_error("VIX065", "Semantic diff requires before, after, and focus symbol.");
         return false;
     }
 
@@ -7837,7 +7898,7 @@ bool emit_semantic_diff(const char* before_entry, const char* after_entry, const
     }
 
     if (before_focus.seed_count == 0 && after_focus.seed_count == 0) {
-        fprintf(stderr, "Indexer Error: Focus symbol \"%s\" not found in either diff input.\n", focus_symbol);
+        indexer_error("VIX066", "Focus symbol \"%s\" not found in either diff input.", focus_symbol);
         free_focus_slice(&before_focus);
         free_focus_slice(&after_focus);
         free_project(&before_project);
@@ -7874,7 +7935,7 @@ bool emit_semantic_diff(const char* before_entry, const char* after_entry, const
              collect_impact_semantic_items(&after_project, &after_impact, &after_items);
     }
     if (!ok) {
-        fprintf(stderr, "Indexer Error: Could not build semantic diff items.\n");
+        indexer_error("VIX067", "Could not build semantic diff items.");
         free_semantic_items(&before_items);
         free_semantic_items(&after_items);
         free_state_symbol_rows(&before_rows);
@@ -7889,7 +7950,7 @@ bool emit_semantic_diff(const char* before_entry, const char* after_entry, const
     }
     if (!collect_symbol_rows_from_semantic_items(&before_items, &before_rows) ||
         !collect_symbol_rows_from_semantic_items(&after_items, &after_rows)) {
-        fprintf(stderr, "Indexer Error: Could not build semantic diff rows.\n");
+        indexer_error("VIX068", "Could not build semantic diff rows.");
         free_semantic_items(&before_items);
         free_semantic_items(&after_items);
         free_state_symbol_rows(&before_rows);
@@ -7959,7 +8020,7 @@ bool emit_semantic_diff(const char* before_entry, const char* after_entry, const
             free_focus_slice(&after_focus);
             free_project(&before_project);
             free_project(&after_project);
-            fprintf(stderr, "Indexer Error: Could not emit semantic change plan.\n");
+            indexer_error("VIX069", "Could not emit semantic change plan.");
             return false;
         }
         if (!emit_semantic_test_plan(out, &before_items, &after_items, &before_rows, &after_rows)) {
@@ -7974,7 +8035,7 @@ bool emit_semantic_diff(const char* before_entry, const char* after_entry, const
             free_focus_slice(&after_focus);
             free_project(&before_project);
             free_project(&after_project);
-            fprintf(stderr, "Indexer Error: Could not emit semantic test plan.\n");
+            indexer_error("VIX070", "Could not emit semantic test plan.");
             return false;
         }
         if (removed_count > 0) {

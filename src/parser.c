@@ -12,6 +12,7 @@ typedef struct {
 } Parser;
 
 Parser parser;
+static int synthetic_loop_counter = 0;
 
 static void parser_fatal_oom() {
     printf("Parser Error: Out of memory.\n");
@@ -27,6 +28,39 @@ static bool ensure_capacity(void** ptr, int* cap, int needed, size_t elem_size) 
     *ptr = grown;
     *cap = next;
     return true;
+}
+
+static char* parser_dup_text(const char* src) {
+    size_t n = strlen(src);
+    char* out = (char*)malloc(n + 1);
+    if (!out) return NULL;
+    memcpy(out, src, n + 1);
+    return out;
+}
+
+static Token make_generated_ident(const char* prefix, int id, int line) {
+    char buffer[64];
+    int written = snprintf(buffer, sizeof(buffer), "%s%d", prefix, id);
+    if (written < 0 || (size_t)written >= sizeof(buffer)) parser_fatal_oom();
+    char* owned = parser_dup_text(buffer);
+    if (!owned) parser_fatal_oom();
+    Token token;
+    token.type = TOKEN_IDENTIFIER;
+    token.start = owned;
+    token.length = written;
+    token.line = line;
+    return token;
+}
+
+static Token make_literal_ident(const char* text, int line) {
+    char* owned = parser_dup_text(text);
+    if (!owned) parser_fatal_oom();
+    Token token;
+    token.type = TOKEN_IDENTIFIER;
+    token.start = owned;
+    token.length = (int)strlen(text);
+    token.line = line;
+    return token;
 }
 
 static void advance_parser() {
@@ -130,6 +164,26 @@ static bool consume_decl_name(Token* out_name, const char* message) {
     advance_parser();
     if (out_name) *out_name = parser.previous;
     return true;
+}
+
+static bool parse_type_annotation(Token* out_type, const char* message) {
+    if (!out_type) return false;
+    *out_type = (Token){0};
+    if (check(TOKEN_IDENTIFIER) ||
+        check(TOKEN_TYPE_I) ||
+        check(TOKEN_TYPE_F) ||
+        check(TOKEN_TYPE_B) ||
+        check(TOKEN_TYPE_S) ||
+        check(TOKEN_TYPE_C) ||
+        check(TOKEN_TYPE_U8) ||
+        check(TOKEN_TYPE_ANY)) {
+        advance_parser();
+        *out_type = parser.previous;
+        return true;
+    }
+    printf("Syntax Error on line %d: %s\n", parser.current.line, message);
+    parser.hadError = true;
+    return false;
 }
 
 static AstNode* if_statement() {
@@ -462,7 +516,8 @@ static AstNode* term() {
 static AstNode* comparison() {
     AstNode* expr = term();
     while (match_token(TOKEN_EQUAL_EQUAL) || match_token(TOKEN_BANG_EQUAL) ||
-           match_token(TOKEN_LESS) || match_token(TOKEN_GREATER) || 
+           match_token(TOKEN_LESS) || match_token(TOKEN_LESS_EQUAL) ||
+           match_token(TOKEN_GREATER) || match_token(TOKEN_GREATER_EQUAL) ||
            match_token(TOKEN_MATCH)) {
         Token op = parser.previous;
         AstNode* right = term();
@@ -494,17 +549,7 @@ static AstNode* var_declaration() {
     (void)consume_decl_name(&name, "Expected variable name.");
     Token type_annot = {0};
     if (match_token(TOKEN_COLON)) {
-        if (check(TOKEN_IDENTIFIER) ||
-            check(TOKEN_TYPE_I) ||
-            check(TOKEN_TYPE_F) ||
-            check(TOKEN_TYPE_B) ||
-            check(TOKEN_TYPE_S) ||
-            check(TOKEN_TYPE_C) ||
-            check(TOKEN_TYPE_U8) ||
-            check(TOKEN_TYPE_ANY)) {
-            advance_parser();
-            type_annot = parser.previous;
-        }
+        (void)parse_type_annotation(&type_annot, "Expected type annotation after ':'.");
     }
     consume(TOKEN_EQUAL, "Expected '=' after variable name.");
     AstNode* initializer = expression();
@@ -526,6 +571,49 @@ static AstNode* while_statement() {
     consume(TOKEN_LEFT_BRACE, "Expected '{' after loop condition.");
     AstNode* body = block();
     return ast_new_while_stmt(condition, body);
+}
+
+static AstNode* for_in_statement() {
+    int line = parser.previous.line;
+    int loop_id = synthetic_loop_counter++;
+
+    Token item_name = {0};
+    (void)consume_decl_name(&item_name, "Expected loop variable name after 'for'.");
+    consume(TOKEN_IN, "Expected 'in' after loop variable.");
+
+    AstNode* iterable = expression();
+    consume(TOKEN_LEFT_BRACE, "Expected '{' after for-in iterable.");
+    AstNode* body = block();
+
+    Token empty = (Token){0};
+    Token iter_name = make_generated_ident("__for_iter_", loop_id, line);
+    Token len_name = make_generated_ident("__for_len_", loop_id, line);
+    Token idx_name = make_generated_ident("__for_idx_", loop_id, line);
+    Token arr_len_name = make_literal_ident("arr_len", line);
+    Token less_op = (Token){TOKEN_LESS, "<", 1, line};
+    Token plus_op = (Token){TOKEN_PLUS, "+", 1, line};
+
+    AstNode* outer_block = ast_new_block_stmt();
+    ast_program_add(outer_block, ast_new_var_decl(iter_name, empty, iterable));
+
+    AstNode** len_args = (AstNode**)malloc(sizeof(AstNode*));
+    if (!len_args) parser_fatal_oom();
+    len_args[0] = ast_new_identifier(iter_name);
+    AstNode* len_call = ast_new_call_expr(ast_new_identifier(arr_len_name), arr_len_name, len_args, 1);
+    ast_program_add(outer_block, ast_new_var_decl(len_name, empty, len_call));
+    ast_program_add(outer_block, ast_new_var_decl(idx_name, empty, ast_new_number(0)));
+
+    AstNode* while_body = ast_new_block_stmt();
+    AstNode* item_value = ast_new_index_expr(ast_new_identifier(iter_name), ast_new_identifier(idx_name));
+    ast_program_add(while_body, ast_new_var_decl(item_name, empty, item_value));
+    ast_program_add(while_body, body);
+
+    AstNode* next_index = ast_new_binary(ast_new_identifier(idx_name), plus_op, ast_new_number(1));
+    ast_program_add(while_body, ast_new_expr_stmt(ast_new_assign(idx_name, next_index)));
+
+    AstNode* condition = ast_new_binary(ast_new_identifier(idx_name), less_op, ast_new_identifier(len_name));
+    ast_program_add(outer_block, ast_new_while_stmt(condition, while_body));
+    return outer_block;
 }
 
 static bool parse_effect_decorators(Token** out_effects, int* out_count) {
@@ -577,17 +665,30 @@ static AstNode* func_declaration_with_effects(Token* effects, int effect_count) 
     (void)consume_decl_name(&name, "Expected function name.");
     consume(TOKEN_LEFT_PAREN, "Expected '(' after function name.");
     Token* params = NULL;
+    Token* param_types = NULL;
     int param_count = 0;
     int param_cap = 0;
+    int param_type_cap = 0;
     if (!check(TOKEN_RIGHT_PAREN)) {
         do {
             Token param = {0};
+            Token type_annot = {0};
             (void)consume_decl_name(&param, "Expected parameter name.");
             if (!ensure_capacity((void**)&params, &param_cap, param_count + 1, sizeof(Token))) {
                 free(params);
+                free(param_types);
                 parser_fatal_oom();
             }
+            if (!ensure_capacity((void**)&param_types, &param_type_cap, param_count + 1, sizeof(Token))) {
+                free(params);
+                free(param_types);
+                parser_fatal_oom();
+            }
+            if (match_token(TOKEN_COLON)) {
+                (void)parse_type_annotation(&type_annot, "Expected parameter type after ':'.");
+            }
             params[param_count++] = param;
+            param_types[param_count - 1] = type_annot;
         } while (match_token(TOKEN_COMMA));
     }
     consume(TOKEN_RIGHT_PAREN, "Expected ')' after parameters.");
@@ -596,22 +697,12 @@ static AstNode* func_declaration_with_effects(Token* effects, int effect_count) 
     Token return_type = {0};
     if (match_token(TOKEN_MINUS)) {
         consume(TOKEN_GREATER, "Expected '>' after '-' for return type annotation (->).");
-        if (check(TOKEN_IDENTIFIER) ||
-            check(TOKEN_TYPE_I) || check(TOKEN_TYPE_F) ||
-            check(TOKEN_TYPE_B) || check(TOKEN_TYPE_S) ||
-            check(TOKEN_TYPE_C) || check(TOKEN_TYPE_U8) ||
-            check(TOKEN_TYPE_ANY)) {
-            advance_parser();
-            return_type = parser.previous;
-        } else {
-            printf("Syntax Error on line %d: Expected return type after '->'.\n", parser.current.line);
-            parser.hadError = true;
-        }
+        (void)parse_type_annotation(&return_type, "Expected return type after '->'.");
     }
     
     consume(TOKEN_LEFT_BRACE, "Expected '{' before function body.");
     AstNode* body = block();
-    return ast_new_func_decl(name, params, param_count, effects, effect_count, return_type, body);
+    return ast_new_func_decl(name, params, param_types, param_count, effects, effect_count, return_type, body);
 }
 
 static AstNode* func_declaration() {
@@ -626,13 +717,24 @@ static AstNode* struct_declaration() {
     int field_count = 0;
     int field_cap = 0;
     while (!check(TOKEN_RIGHT_BRACE) && !check(TOKEN_EOF)) {
+        while (match_token(TOKEN_SEMICOLON) || match_token(TOKEN_COMMA)) {
+        }
+        if (check(TOKEN_RIGHT_BRACE) || check(TOKEN_EOF)) break;
+
         Token field = {0};
-        (void)consume_decl_name(&field, "Expected field name.");
+        if (!consume_decl_name(&field, "Expected field name.")) {
+            if (!check(TOKEN_RIGHT_BRACE) && !check(TOKEN_EOF)) {
+                advance_parser();
+            }
+            continue;
+        }
         if (!ensure_capacity((void**)&fields, &field_cap, field_count + 1, sizeof(Token))) {
             free(fields);
             parser_fatal_oom();
         }
         fields[field_count++] = field;
+        while (match_token(TOKEN_SEMICOLON) || match_token(TOKEN_COMMA)) {
+        }
     }
     consume(TOKEN_RIGHT_BRACE, "Expected '}' at end of struct declaration.");
     return ast_new_struct_decl(name, fields, field_count);
@@ -689,6 +791,9 @@ static AstNode* statement() {
     }
     if (match_token(TOKEN_M)) {
         return while_statement();
+    }
+    if (match_token(TOKEN_F)) {
+        return for_in_statement();
     }
     if (match_token(TOKEN_TYPEOF)) {
         return ast_new_typeof_expr(expression());

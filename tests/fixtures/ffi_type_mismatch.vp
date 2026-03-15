@@ -1,0 +1,8 @@
+@effect(ffi)
+fn bad() {
+    var libc = load_dl("libc.so.6")
+    var puts_i = libc.get_fn("puts", "i->i")
+    puts_i("hello")
+}
+
+bad()
